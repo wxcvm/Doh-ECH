@@ -19,11 +19,27 @@
  * *  - mandatory 指定浏览器必须理解的HTTPS参数，否则忽略整条记录
  */
 // ===================== 全局配置 =====================
-const UPSTREAM_DNS_GOOGLE = 'https://dns.google/dns-query';
-const UPSTREAM_JSON_GOOGLE = 'https://dns.google/resolve';
-const UPSTREAM_DNS_CUSTOM = 'https://dns11.quad9.net/dns-query';//自行更换
-const UPSTREAM_JSON_CUSTOM = 'https://dns11.quad9.net/dns-query';
-const UPSTREAM_CN_JSON = 'https://dns.alidns.com/resolve';// 国内上游 DNS（阿里 DNS JSON API，仅用于国内域名）
+// ---------- 上游 DNS 配置（竞速取最快响应） ----------
+// 国际上游 JSON 列表：用于境外域名的 A/AAAA/HTTPS 等结构化查询。
+// 可自行替换为其他 DoH 服务商（如带去广告规则的 nextDNS、AdGuard DNS 等），
+// 只要端点支持 Google JSON API 风格（?name=&type=，Accept: application/dns-json）即可。
+const UPSTREAM_JSON_LIST = [
+    'https://dns.google/resolve',              // Google Public DNS
+    'https://cloudflare-dns.com/dns-query',    // Cloudflare 1.1.1.1
+    'https://dns11.quad9.net/dns-query',       // Quad9（安全过滤）
+    'https://doh.pub/dns-query',               // DNSPod（腾讯，海外亦有节点）
+];
+// 国际上游二进制 DoH 列表：/doh 纯净转发端点使用，竞速取最快。
+const UPSTREAM_DNS_LIST = [
+    'https://dns.google/dns-query',            // Google Public DNS
+    'https://cloudflare-dns.com/dns-query',    // Cloudflare 1.1.1.1
+    'https://dns11.quad9.net/dns-query',       // Quad9
+];
+// 国内上游 JSON 列表：仅用于国内域名分流（避免境外 DNS 对国内域名返回次优结果）。
+const UPSTREAM_CN_JSON_LIST = [
+    'https://dns.alidns.com/resolve',          // 阿里 DNS
+    'https://doh.pub/dns-query',               // DNSPod（腾讯）
+];
 const SVC_PARAM_IDS = { mandatory: 0, alpn: 1, "no-default-alpn": 2, port: 3, ipv4hint: 4, ech: 5, ipv6hint: 6};// SVC PARAMS构造
 const IPV4_ONLY_DOMAINS = ["twitter.com", "x.com", "t.co", "twimg.com"];//只支持ipv4的CF/META域名列表：不返回AAAA记录和ipv6hint
 //Cloudflare 配置
@@ -457,8 +473,8 @@ async function handleCNDomain(domain, type, config, clientIP) {
         }
     }
 
-    // 3. 未匹配规则或无IP，走国内兜底（查询上游返回原始记录）
-    return await resolveFallbackRecord(domain, type, clientIP, UPSTREAM_CN_JSON);
+    // 3. 未匹配规则或无IP，走国内兜底（查询国内上游返回原始记录）
+    return await resolveFallbackRecord(domain, type, clientIP, UPSTREAM_CN_JSON_LIST);
 }
 
 //=====================公共 HTTPS 记录构建函数=====================    
@@ -1094,10 +1110,11 @@ async function queryUpstreamDNS(name, type, clientIP = '',upstreamUrl = null) {
         }
     } catch (e) {}
 
-       // 上游 URL 列表：国内域名仅阿里，国外域名保持 Google + 您的自定义 DNS 竞速
-    const urls = upstreamUrl
-        ? [upstreamUrl + '?' + params.toString()]
-        : [UPSTREAM_JSON_GOOGLE + '?' + params.toString(), UPSTREAM_JSON_CUSTOM + '?' + params.toString()]; 
+       // 上游 URL 列表：国内域名仅用国内上游，国外域名用国际上游列表竞速
+    const upstreamList = upstreamUrl
+        ? (Array.isArray(upstreamUrl) ? upstreamUrl : [upstreamUrl])
+        : UPSTREAM_JSON_LIST;
+    const urls = upstreamList.map(u => u + '?' + params.toString());
     const promises = urls.map(url =>
         fetch(url, { headers: { 'Accept': 'application/dns-json' } })
             .then(res => res.ok ? res.json() : Promise.reject())
@@ -1390,9 +1407,11 @@ async function forwardQuery(body) {
         headers: { 'Content-Type': 'application/dns-message', 'Accept': 'application/dns-message' },
         body
     };
-    const pGoogle = fetch(UPSTREAM_DNS_GOOGLE, reqInit).then(res => res.ok ? res : Promise.reject());
-    const pAli = fetch(UPSTREAM_DNS_CUSTOM, reqInit).then(res => res.ok ? res : Promise.reject());
-    try { return await Promise.any([pGoogle, pAli]); } catch { return fetch(UPSTREAM_DNS_GOOGLE, reqInit); }
+    // 多上游二进制 DoH 竞速，取最快响应
+    const promises = UPSTREAM_DNS_LIST.map(url =>
+        fetch(url, reqInit).then(res => res.ok ? res : Promise.reject())
+    );
+    try { return await Promise.any(promises); } catch { return fetch(UPSTREAM_DNS_LIST[0], reqInit); }
 }
 
 /**

@@ -110,7 +110,7 @@ hosts文件支持两种格式：
 | `clientip` |  自定义ECS,就近解析最佳结果 |默认自动获取（`/24`/ `::/26` ） |`自动获取`|
 | `sub` | CF优选订阅链接 |格式（`ip-https://ip.txt`/ `cf-https://domain.txt` ） |``|
 | `exclude` | 返回记录排除指定ip/domain |（`1.1.1.1`/ `cf.cf` ） |``|
-| `shuffle` |  乱序返回记录 |默认`false`（`false`/ `true` ） |`false`|
+| `shuffle` |  乱序返回记录 |默认`true`（`false`/`true` ） |`false`|
 | `area` |  指定ip区域 |留空`不过滤`（`area=hk,sg,jp` ） |``|
 | `enhance` |  增强模式 |可选`off` `rule` `full`  默认`rule`  |``|
 | `rules` |  增强模式域名ip匹配规则 |格式`*.domain1,*.domain2:ip1,ip2-noA-noAAAA`（`-noA/AAAA`屏蔽且不返回A/AAAA记录 ） |``|
@@ -162,14 +162,14 @@ Cloudflare Worker
 ## 注意事项
 - **子请求上限**：免费计划每日 10 万次子请求，已通过缓存降低使用量，正常个人使用一般不会超出。
 - **ECH 有效性**：Meta 的 ECH 为固定配置（可能会过期），Cloudflare 的 ECH 从指定域名动态获取，可自定义 `ech` 参数。
-- **隐私与安全**：上游查询使用 Google 和Quad9的公共 DNS JSON API，注意数据隐私（ **可自行替换为其他 DoH 服务**）。
+- **隐私与安全**：上游查询使用 Google、Cloudflare、Quad9、DNSPod 等多家公共 DNS（JSON API）竞速取最快响应，国内域名分流至阿里 DNS/DNSPod 解析（ **可自行替换为其他 DoH 服务**，如带去广告规则的 nextDNS、AdGuard DNS 等，见 `_worker.js` 顶部 `UPSTREAM_JSON_LIST` / `UPSTREAM_CN_JSON_LIST` 配置）。
   
 ## 项目特性
 
 - ✅ **DoH 服务**  
   提供 `/ech`（注入 ECH和enhance mode）和 `/doh`（纯净转发）两个标准 DoH 端点，支持 GET/POST。
-- ✅ **双上游竞速**  
-  同时查询 Google DNS 和自选 DNS，取最快响应，提高解析速度。
+- ✅ **多上游竞速**  
+  同时查询 Google / Cloudflare / Quad9 / DNSPod 多家上游，取最快响应；国内域名走阿里 / DNSPod 国内上游，提高解析速度与准确性。
 - ✅ **全球边缘缓存**  
   利用 Cloudflare Cache API 缓存上游 DNS 结果（A/AAAA 300s，HTTPS 600s），大幅减少上游请求次数。
 - ✅ **ECS就近解析**  

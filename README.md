@@ -141,10 +141,23 @@ Cloudflare Worker
 ---
 ## 部署步骤
 
-### 1. 部署到 Cloudflare Pages
-- 进入 [Cloudflare Dashboard](https://dash.cloudflare.com/) → **Workers & Pages** → **Pages** → **创建项目**。
-- 上传资产或连接 Git 仓库，上传 `_worker.js` 至项目根目录。
-- 部署完成后，访问分配的域名/绑定的自定义域名 即可。
+> ⚠️ 本项目是**纯 Worker 项目**（无静态文件），**不要**把 Pages 构建命令设置为 `npx wrangler deploy`，否则会报错 `Could not detect a directory containing static files`。
+
+### 方式一：部署到 Cloudflare Workers（推荐）
+- 本地安装 wrangler 后执行（`wrangler.toml` 已配置好 `main = "_worker.js"`）：
+  ```bash
+  npm i -g wrangler
+  wrangler login
+  wrangler deploy
+  ```
+- 或在 [Cloudflare Dashboard](https://dash.cloudflare.com/) → **Workers & Pages** → **创建 Worker** → 粘贴 `_worker.js` 全部内容 → 部署。
+
+### 方式二：部署到 Cloudflare Pages（连接 Git 仓库）
+- 进入 [Cloudflare Dashboard](https://dash.cloudflare.com/) → **Workers & Pages** → **Pages** → **创建项目** → 连接本仓库。
+- 项目设置关键点（根目录存在 `_worker.js` 时会自动启用 **Advanced Mode 单 Worker 模式**）：
+  - **构建命令（Build command）：留空**（不要填 `npx wrangler deploy`）
+  - **构建输出目录（Build output directory）：留空**
+- 部署完成后，访问分配的域名/绑定的自定义域名即可。
 
 ### 2. 使用方法
 - **前端网页测试查询**：直接访问首页（`/`），输入域名、选择类型，可展开高级选项填入自定义参数后查询。

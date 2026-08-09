@@ -1121,14 +1121,20 @@ async function queryUpstreamDNS(name, type, clientIP = '',upstreamUrl = null) {
     );
 
     let result;
-    try {
-        result = await Promise.any(promises);
-    } catch {
+    if (type === 65) {
+        // HTTPS(65) 类型：校验式竞速——只接受包含该类型记录的响应，
+        // 避免部分上游(如 DNSPod)返回"成功但空 Answer"导致 ECH/HTTPS 记录丢失
+        result = await firstWithType(promises, 65);
+    } else {
         try {
-            const res = await fetch(urls[0], { headers: { 'Accept': 'application/dns-json' } });
-            if (res.ok) result = await res.json();
-            else return null;
-        } catch { return null; }
+            result = await Promise.any(promises);
+        } catch {
+            try {
+                const res = await fetch(urls[0], { headers: { 'Accept': 'application/dns-json' } });
+                if (res.ok) result = await res.json();
+                else return null;
+            } catch { return null; }
+        }
     }
 
     if (result && typeof caches !== 'undefined' && caches.default) {
@@ -1141,6 +1147,37 @@ async function queryUpstreamDNS(name, type, clientIP = '',upstreamUrl = null) {
         } catch (e) {}
     }
     return result;
+}
+
+/**
+ * 校验式竞速：并发请求所有上游，优先返回包含指定 DNS 类型记录的响应；
+ * 若所有上游均无该类型记录，则返回第一个成功响应（保持兜底行为）。
+ */
+function firstWithType(promises, type) {
+    return new Promise((resolve, reject) => {
+        let settled = 0;
+        let firstOk = null;
+        const total = promises.length;
+        const checkDone = () => {
+            if (settled === total) {
+                if (firstOk) resolve(firstOk);
+                else reject(new Error('all upstreams failed'));
+            }
+        };
+        for (const p of promises) {
+            p.then(data => {
+                settled++;
+                if (!firstOk) firstOk = data;
+                if (data && Array.isArray(data.Answer) && data.Answer.some(a => a.type === type)) {
+                    return resolve(data);
+                }
+                checkDone();
+            }).catch(() => {
+                settled++;
+                checkDone();
+            });
+        }
+    });
 }
 
 /**
@@ -1163,12 +1200,12 @@ async function fetchRealEch(echDomain, clientIP) {
             }
         }
     } catch (e) {}
-    // 3. 上游查询（原有逻辑）
+    // 3. 上游查询（原有逻辑，ECH 源固定使用 dns.google，保证返回可读格式的 HTTPS 记录）
     try {
-        let data = await queryUpstreamDNS(echDomain, 65, clientIP);
+        let data = await queryUpstreamDNS(echDomain, 65, clientIP, 'https://dns.google/resolve');
         if (!data) {
             await new Promise(r => setTimeout(r, 500));
-            data = await queryUpstreamDNS(echDomain, 65, clientIP);
+            data = await queryUpstreamDNS(echDomain, 65, clientIP, 'https://dns.google/resolve');
         }
         if (data && data.Answer) {
             const rec = data.Answer.find(r => r.type === 65);
@@ -1187,18 +1224,91 @@ async function fetchRealEch(echDomain, clientIP) {
 }
 
 /**
- * 简单解析 HTTPS 记录，提取 ech 字段
+ * 通用 HTTPS 记录解析（支持两种格式）：
+ * 1. 可读格式："1 . alpn=h3,h2 ech=xxx ipv4hint=1.2.3.4"
+ * 2. RFC3597 格式："\# 136 00 01 00 00 ..."（部分上游如 Quad9/Cloudflare 返回）
+ * 返回参数数组 [{key, val}, ...]
+ */
+function parseSvcParamsFromData(dataStr) {
+    const parts = dataStr.split(/\s+/);
+    if (parts.length < 3) return [];
+    // RFC3597 十六进制格式
+    if (parts[0] === '\\#' || parts[0] === '#') {
+        try {
+            const hex = parts.slice(2).join('');
+            const bytes = new Uint8Array(Math.floor(hex.length / 2));
+            for (let i = 0; i < bytes.length; i++) bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
+            if (bytes.length < 3) return [];
+            const dv = new DataView(bytes.buffer);
+            let off = 2;
+            // 跳过 TargetName（0=根，或标签序列）
+            while (off < bytes.length) {
+                const len = bytes[off];
+                if (len === 0) { off++; break; }
+                if (len > 63) break;
+                off += 1 + len;
+            }
+            const params = [];
+            while (off + 4 <= bytes.length) {
+                const key = dv.getUint16(off);
+                const len = dv.getUint16(off + 2);
+                off += 4;
+                if (off + len > bytes.length) break;
+                const valBytes = bytes.slice(off, off + len);
+                off += len;
+                const keyName = Object.keys(SVC_PARAM_IDS).find(k => SVC_PARAM_IDS[k] === key) || ('key' + key);
+                let val;
+                if (keyName === 'alpn') {
+                    const ids = [];
+                    let o = 0;
+                    while (o < valBytes.length) {
+                        const l = valBytes[o];
+                        ids.push(new TextDecoder().decode(valBytes.slice(o + 1, o + 1 + l)));
+                        o += 1 + l;
+                    }
+                    val = ids.join(',');
+                } else if (keyName === 'ipv4hint') {
+                    const ips = [];
+                    for (let i = 0; i + 4 <= valBytes.length; i += 4) ips.push(Array.from(valBytes.slice(i, i + 4)).join('.'));
+                    val = ips.join(',');
+                } else if (keyName === 'ipv6hint') {
+                    const ips = [];
+                    for (let i = 0; i + 16 <= valBytes.length; i += 16) ips.push(formatIPv6(valBytes.slice(i, i + 16)));
+                    val = ips.join(',');
+                } else {
+                    // ech 等二进制字段 → base64url（Workers 环境无 Buffer，用 btoa）
+                    let bin = '';
+                    for (let i = 0; i < valBytes.length; i++) bin += String.fromCharCode(valBytes[i]);
+                    val = btoa(bin).replace(/=+$/, '').replace(/\+/g, '-').replace(/\//g, '_');
+                }
+                params.push({ key: keyName, val });
+            }
+            return params;
+        } catch (e) {
+            return [];
+        }
+    }
+    // 可读格式
+    const params = [];
+    for (let i = 2; i < parts.length; i++) {
+        const eqIdx = parts[i].indexOf('=');
+        if (eqIdx === -1) continue;
+        params.push({ key: parts[i].substring(0, eqIdx), val: parts[i].substring(eqIdx + 1) });
+    }
+    return params;
+}
+
+/**
+ * 简单解析 HTTPS 记录，提取 ech/alpn 字段
  */
 function parseHttpsRecord(dataStr) {
-    const parts = dataStr.split(/\s+/);
-    if (parts.length < 3) return null;
+    const params = parseSvcParamsFromData(dataStr);
     const result = {};
-    for (let i = 2; i < parts.length; i++) {
-        const [k, v] = parts[i].split('=');
-        if (k === 'ech') result.ech = v;
-        else if (k === 'alpn') result.alpn = v;
+    for (const p of params) {
+        if (p.key === 'ech') result.ech = p.val;
+        else if (p.key === 'alpn') result.alpn = p.val;
     }
-    return result;
+    return Object.keys(result).length ? result : null;
 }
 
 /**
@@ -1466,6 +1576,11 @@ async function resolveFallbackRecord(domain, type, clientIP, upstreamUrl = null)
  */
 async function ensureCNDomainSet() {
     const now = Date.now();
+    // 同步兜底：确保首次调用后 cnDomainSet 永不为 null（避免冷启动竞态崩溃）
+    if (!cnDomainSet) {
+        cnDomainSet = new Set(CN_DOMAIN_SUFFIXES);
+        cnDomainLastFetch = 0;
+    }
     // 已有有效缓存，直接返回
     if (cnDomainSet && ( now - cnDomainLastFetch) < CN_DOMAIN_CACHE_TTL) {
         return;
@@ -1518,6 +1633,8 @@ async function ensureCNDomainSet() {
  * 匹配规则：完整域名在集合中，或域名以集合中某个 '.' 开头的后缀结尾。
  */
 function isCNDomain(domain) {
+    // cnDomainSet 理论上已被 ensureCNDomainSet 同步初始化，此处兜底防御
+    if (!cnDomainSet) return false;
     // cnDomainSet 在 ensureCNDomainSet 中已保证非空，直接使用
     if (cnDomainSet.has(domain)) return true;
     for (const item of cnDomainSet) {
@@ -1959,33 +2076,22 @@ async function resolveRealHints(domain, type, clientIP) {
  * 解析原始 HTTPS 记录（用于增强模式）
  */
 function parseRawHttpsRecord(dataStr) {
-    const parts = dataStr.split(/\s+/);
-    if (parts.length < 3) return [];
-    const params = [];
-    for (let i = 2; i < parts.length; i++) {
-        const eqIdx = parts[i].indexOf('=');
-        if (eqIdx === -1) continue;
-        params.push({ key: parts[i].substring(0, eqIdx), val: parts[i].substring(eqIdx + 1) });
-    }
-    return params;
+    return parseSvcParamsFromData(dataStr);
 }
 
 /**
  * 完整解析 HTTPS 记录（用于 JSON API 返回）
  */
 function parseHttpsRecordFull(dataStr) {
-    const parts = dataStr.split(/\s+/);
-    if (parts.length < 3) return null;
+    const params = parseSvcParamsFromData(dataStr);
     const result = {};
-    for (let i = 2; i < parts.length; i++) {
-        const [k, v] = parts[i].split('=');
-        if (!k || !v) continue;
-        if (k === 'ech') result.ech = v;
-        else if (k === 'alpn') result.alpn = v;
-        else if (k === 'ipv4hint') result.ipv4hints = v.split(',').map(s => s.trim());
-        else if (k === 'ipv6hint') result.ipv6hints = v.split(',').map(s => s.trim());
+    for (const p of params) {
+        if (p.key === 'ech') result.ech = p.val;
+        else if (p.key === 'alpn') result.alpn = p.val;
+        else if (p.key === 'ipv4hint') result.ipv4hints = p.val.split(',').map(s => s.trim());
+        else if (p.key === 'ipv6hint') result.ipv6hints = p.val.split(',').map(s => s.trim());
     }
-    return result;
+    return Object.keys(result).length ? result : null;
 }
 
 /**

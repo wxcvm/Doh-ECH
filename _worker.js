@@ -24,15 +24,15 @@
 // 可自行替换为其他 DoH 服务商（如带去广告规则的 nextDNS、AdGuard DNS 等），
 // 只要端点支持 Google JSON API 风格（?name=&type=，Accept: application/dns-json）即可。
 const UPSTREAM_JSON_LIST = [
+    'https://cloudflare-dns.com/dns-query',    // Cloudflare 1.1.1.1（自家里程最短，兜底最稳，放首位）
     'https://dns.google/resolve',              // Google Public DNS
-    'https://cloudflare-dns.com/dns-query',    // Cloudflare 1.1.1.1
     'https://dns11.quad9.net/dns-query',       // Quad9（安全过滤）
     'https://doh.pub/dns-query',               // DNSPod（腾讯，海外亦有节点）
 ];
 // 国际上游二进制 DoH 列表：/doh 纯净转发端点使用，竞速取最快。
 const UPSTREAM_DNS_LIST = [
+    'https://cloudflare-dns.com/dns-query',    // Cloudflare 1.1.1.1（自家里程最短，放首位）
     'https://dns.google/dns-query',            // Google Public DNS
-    'https://cloudflare-dns.com/dns-query',    // Cloudflare 1.1.1.1
     'https://dns11.quad9.net/dns-query',       // Quad9
 ];
 // 国内上游 JSON 列表：仅用于国内域名分流（避免境外 DNS 对国内域名返回次优结果）。
@@ -1084,6 +1084,19 @@ async function resolveDomainToIp(domain, type = 1, clientIP) {
 }
 
 /**
+ * 带超时的 fetch：避免单个上游挂起拖垮竞速（超时视为失败，交给 Promise.any 切换）
+ */
+async function fetchWithTimeout(url, init = {}, timeoutMs = 4000) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        return await fetch(url, { ...init, signal: controller.signal });
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+/**
  * 上游 DNS 查询（带 ECS 支持与 Edge 缓存）
  */
 async function queryUpstreamDNS(name, type, clientIP = '',upstreamUrl = null) {
@@ -1116,7 +1129,7 @@ async function queryUpstreamDNS(name, type, clientIP = '',upstreamUrl = null) {
         : UPSTREAM_JSON_LIST;
     const urls = upstreamList.map(u => u + '?' + params.toString());
     const promises = urls.map(url =>
-        fetch(url, { headers: { 'Accept': 'application/dns-json' } })
+        fetchWithTimeout(url, { headers: { 'Accept': 'application/dns-json' } }, 4000)
             .then(res => res.ok ? res.json() : Promise.reject())
     );
 
@@ -1130,7 +1143,7 @@ async function queryUpstreamDNS(name, type, clientIP = '',upstreamUrl = null) {
             result = await Promise.any(promises);
         } catch {
             try {
-                const res = await fetch(urls[0], { headers: { 'Accept': 'application/dns-json' } });
+                const res = await fetchWithTimeout(urls[0], { headers: { 'Accept': 'application/dns-json' } }, 4000);
                 if (res.ok) result = await res.json();
                 else return null;
             } catch { return null; }
@@ -1200,12 +1213,13 @@ async function fetchRealEch(echDomain, clientIP) {
             }
         }
     } catch (e) {}
-    // 3. 上游查询（原有逻辑，ECH 源固定使用 dns.google，保证返回可读格式的 HTTPS 记录）
+    // 3. 上游查询（多上游校验式竞速：优先取含 ECH 的 HTTPS 记录，
+    //    不再单点依赖 dns.google；RFC3597 格式已由 parseSvcParamsFromData 兼容）
     try {
-        let data = await queryUpstreamDNS(echDomain, 65, clientIP, 'https://dns.google/resolve');
+        let data = await queryUpstreamDNS(echDomain, 65, clientIP);
         if (!data) {
-            await new Promise(r => setTimeout(r, 500));
-            data = await queryUpstreamDNS(echDomain, 65, clientIP, 'https://dns.google/resolve');
+            await new Promise(r => setTimeout(r, 300));
+            data = await queryUpstreamDNS(echDomain, 65, clientIP);
         }
         if (data && data.Answer) {
             const rec = data.Answer.find(r => r.type === 65);
@@ -1509,7 +1523,7 @@ function createMultiAnsResponse(id, qn, qt, rds, ttl = 3600) {
 }
 
 /**
- * 转发二进制 DNS 查询（双上游竞速）
+ * 转发二进制 DNS 查询（多上游竞速，带超时）
  */
 async function forwardQuery(body) {
     const reqInit = {
@@ -1517,11 +1531,11 @@ async function forwardQuery(body) {
         headers: { 'Content-Type': 'application/dns-message', 'Accept': 'application/dns-message' },
         body
     };
-    // 多上游二进制 DoH 竞速，取最快响应
+    // 多上游二进制 DoH 竞速，取最快响应（4s 超时防止挂起）
     const promises = UPSTREAM_DNS_LIST.map(url =>
-        fetch(url, reqInit).then(res => res.ok ? res : Promise.reject())
+        fetchWithTimeout(url, reqInit, 4000).then(res => res.ok ? res : Promise.reject())
     );
-    try { return await Promise.any(promises); } catch { return fetch(UPSTREAM_DNS_LIST[0], reqInit); }
+    try { return await Promise.any(promises); } catch { return fetchWithTimeout(UPSTREAM_DNS_LIST[0], reqInit, 4000); }
 }
 
 /**

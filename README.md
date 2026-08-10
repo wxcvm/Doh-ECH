@@ -162,6 +162,12 @@ Cloudflare Worker
 ### 2. 使用方法
 - **前端网页测试查询**：直接访问首页（`/`），输入域名、选择类型，可展开高级选项填入自定义参数后查询。
 
+- **内置直连站点（返回优选 IP + 自动 ECH 注入）**：
+  - **CF 系**：Twitter/X（twitter.com/x.com/t.co/twimg.com）、Cloudflare 全家（cloudflare.com/pages.dev/workers.dev）、**OpenAI（chatgpt.com/openai.com/oaistatic.com/oaiusercontent.com）**、**Discord（discord.com/discordapp.com）**
+  - **Meta 系**：facebook.com/instagram.com/whatsapp.com/messenger.com/fb.com/meta.com（固定 ECH 注入）
+  - **增强规则（enhance=rule/full）**：Google 系（google.com/youtube.com/googleapis.com/gstatic.com 等 → Google IPv6 直连）、Meta 全家桶 IPv6、Medium、Pinterest
+  - **best=true 全局跟随**：任意 CF 托管的网站（自动归属探测）都使用优选 IP + ECH 注入
+- **优选 IP 订阅**：`https://你的域名/sub.txt`（配合 `sub=ip-https://你的域名/sub.txt` 使用）
 - **DOH地址(完整参数示例)**：  
   ```
    "https://your-domain.pages.dev/ech?sub=ip-https://bestcf.pages.dev/gslege/Cfxyz.txt&best=true"

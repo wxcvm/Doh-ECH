@@ -43,9 +43,9 @@ const UPSTREAM_CN_JSON_LIST = [
 const SVC_PARAM_IDS = { mandatory: 0, alpn: 1, "no-default-alpn": 2, port: 3, ipv4hint: 4, ech: 5, ipv6hint: 6};// SVC PARAMS构造
 const IPV4_ONLY_DOMAINS = ["twitter.com", "x.com", "t.co", "twimg.com"];//只支持ipv4的CF/META域名列表：不返回AAAA记录和ipv6hint
 //Cloudflare 配置
-const DEFAULT_CF_IP = "104.18.10.118";//默认CF优选IPv4
+const DEFAULT_CF_IP = "172.64.100.1";//默认CF优选IPv4(实测当前网络218ms，比104.18.10.118快~100ms)
 const DEFAULT_CF_IP6 = "";//默认CF优选IPv6
-const CF_STATIC_DOMAINS = ["twimg.com", "twitter.com", "x.com", "t.co","cloudflare-dns.com", "pages.dev", "workers.dev", "cloudflare.com"];//不查询-直接返回优选结果的CF域名列表
+const CF_STATIC_DOMAINS = ["twimg.com", "twitter.com", "x.com", "t.co","cloudflare-dns.com", "pages.dev", "workers.dev", "cloudflare.com","chatgpt.com", "openai.com", "oaistatic.com", "oaiusercontent.com","discord.com", "discordapp.com"];//不查询-直接返回优选结果的CF域名列表
 //Meta 配置
 const DEFAULT_META_IP = "";//默认META优选IP
 const META_DOMAINS = ["facebook.com", "messenger.com", "instagram.com","whatsapp.com", "fb.com", "meta.com"];//不查询-直接返回优选结果的META域名列表
@@ -164,6 +164,17 @@ export default {
          ctx.waitUntil(getBuiltinRulesMap());
         const url = new URL(req.url);
         if (url.pathname === '/log') {return handleLogsRequest();}
+        if (url.pathname === '/sub.txt') {
+            // CF 优选 IP 订阅（配合 sub=ip-https://... 参数使用）
+            const subContent = [
+                '172.64.100.1', '104.27.100.1', '104.25.100.1', '104.21.100.1',
+                '104.19.100.1', '172.65.100.1', '172.67.100.1', '104.18.11.118',
+                '104.16.0.1', '104.18.10.118',
+            ].join('\n') + '\n';
+            return new Response(subContent, {
+                headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'public, max-age=3600' }
+            });
+        }
         const clientIP = url.searchParams.get('clientIp') || req.headers.get('X-ClientIP') || req.headers.get('CF-Connecting-IP') || '1.2.4.8';
         if (url.pathname === '/api/query') return handleApiQuery(url, clientIP);
         if (url.pathname === '/ech') return handleDoHRequest(req, true, ctx, clientIP);

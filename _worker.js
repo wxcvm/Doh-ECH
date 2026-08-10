@@ -43,7 +43,7 @@ const UPSTREAM_CN_JSON_LIST = [
 const SVC_PARAM_IDS = { mandatory: 0, alpn: 1, "no-default-alpn": 2, port: 3, ipv4hint: 4, ech: 5, ipv6hint: 6};// SVC PARAMS构造
 const IPV4_ONLY_DOMAINS = ["twitter.com", "x.com", "t.co", "twimg.com"];//只支持ipv4的CF/META域名列表：不返回AAAA记录和ipv6hint
 //Cloudflare 配置
-const DEFAULT_CF_IP = "172.64.100.1";//默认CF优选IPv4(实测当前网络218ms，比104.18.10.118快~100ms)
+const DEFAULT_CF_IP = "172.64.100.1,104.27.100.1,104.25.100.1,104.21.100.1,172.67.100.1,104.18.10.118";//默认CF优选IPv4(首选实测218ms;多IP返回,客户端自动容错切换)
 const DEFAULT_CF_IP6 = "";//默认CF优选IPv6
 const CF_STATIC_DOMAINS = ["twimg.com", "twitter.com", "x.com", "t.co","cloudflare-dns.com", "pages.dev", "workers.dev", "cloudflare.com","chatgpt.com", "openai.com", "oaistatic.com", "oaiusercontent.com","discord.com", "discordapp.com","shopify.com", "linear.app", "perplexity.ai", "midjourney.com", "cloudinary.com"];//不查询-直接返回优选结果的CF域名列表(均为实测归属CF且支持ECH)
 //Meta 配置

@@ -45,7 +45,7 @@ const IPV4_ONLY_DOMAINS = ["twitter.com", "x.com", "t.co", "twimg.com"];//只支
 //Cloudflare 配置
 const DEFAULT_CF_IP = "172.64.100.1";//默认CF优选IPv4(实测当前网络218ms，比104.18.10.118快~100ms)
 const DEFAULT_CF_IP6 = "";//默认CF优选IPv6
-const CF_STATIC_DOMAINS = ["twimg.com", "twitter.com", "x.com", "t.co","cloudflare-dns.com", "pages.dev", "workers.dev", "cloudflare.com","chatgpt.com", "openai.com", "oaistatic.com", "oaiusercontent.com","discord.com", "discordapp.com"];//不查询-直接返回优选结果的CF域名列表
+const CF_STATIC_DOMAINS = ["twimg.com", "twitter.com", "x.com", "t.co","cloudflare-dns.com", "pages.dev", "workers.dev", "cloudflare.com","chatgpt.com", "openai.com", "oaistatic.com", "oaiusercontent.com","discord.com", "discordapp.com","shopify.com", "linear.app", "perplexity.ai", "midjourney.com", "cloudinary.com"];//不查询-直接返回优选结果的CF域名列表(均为实测归属CF且支持ECH)
 //Meta 配置
 const DEFAULT_META_IP = "";//默认META优选IP
 const META_DOMAINS = ["facebook.com", "messenger.com", "instagram.com","whatsapp.com", "fb.com", "meta.com"];//不查询-直接返回优选结果的META域名列表
@@ -154,7 +154,6 @@ function buildConfig(url, headers = null) {
     config.ip6 = prescreenIpList(config.ip6);
     return config;
 }
-
 // ===================== Worker 入口 =====================
 export default {
     async fetch(req, env, ctx) {
@@ -180,6 +179,21 @@ export default {
         if (url.pathname === '/ech') return handleDoHRequest(req, true, ctx, clientIP);
         if (url.pathname === '/doh') return handleDoHRequest(req, false, ctx, clientIP);
         return new Response(getHtml(), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+    },
+    // Cron 定时预热：保持缓存热状态（国内域名库/ECH/规则），避免冷启动首请求降速
+    async scheduled(controller, env, ctx) {
+        ctx.waitUntil(ensureCNDomainSet());
+        ctx.waitUntil(fetchRealEch('cloudflare-ech.com', ''));
+        ctx.waitUntil(getBuiltinRulesMap());
+        // 预热 Edge 缓存（国际+国内示例查询各一，写入 Cache API）
+        try {
+            const base = `https://dohech.dpdns.org/api/query`;
+            await Promise.allSettled([
+                fetch(`${base}?domain=example.com&type=A&clientIp=1.2.4.8`),
+                fetch(`${base}?domain=taobao.com&type=A&clientIp=1.2.4.8`),
+                fetch(`${base}?domain=twitter.com&type=HTTPS&clientIp=1.2.4.8`),
+            ]);
+        } catch (e) {}
     }
 };
 

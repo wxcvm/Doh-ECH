@@ -24,16 +24,16 @@
 // 可自行替换为其他 DoH 服务商（如带去广告规则的 nextDNS、AdGuard DNS 等），
 // 只要端点支持 Google JSON API 风格（?name=&type=，Accept: application/dns-json）即可。
 const UPSTREAM_JSON_LIST = [
-    'https://cloudflare-dns.com/dns-query',    // Cloudflare 1.1.1.1（自家里程最短，兜底最稳，放首位）
-    'https://dns.google/resolve',              // Google Public DNS
-    'https://dns11.quad9.net/dns-query',       // Quad9（安全过滤）
-    'https://doh.pub/dns-query',               // DNSPod（腾讯，海外亦有节点）
+    'https://cloudflare-dns.com/dns-query',    // Cloudflare 1.1.1.1（自家里程最短，放首位）
+    'https://doh.pub/dns-query',               // DNSPod（腾讯，国内稳）
+    'https://dns.alidns.com/resolve',          // 阿里 DNS（国内稳）
+    'https://dns.google/resolve',              // Google（兜底，放最后）
 ];
 // 国际上游二进制 DoH 列表：/doh 纯净转发端点使用，竞速取最快。
 const UPSTREAM_DNS_LIST = [
-    'https://cloudflare-dns.com/dns-query',    // Cloudflare 1.1.1.1（自家里程最短，放首位）
-    'https://dns.google/dns-query',            // Google Public DNS
-    'https://dns11.quad9.net/dns-query',       // Quad9
+    'https://cloudflare-dns.com/dns-query',    // Cloudflare 1.1.1.1（放首位）
+    'https://doh.pub/dns-query',               // DNSPod（国内稳）
+    'https://dns.alidns.com/dns-query',        // 阿里 DNS
 ];
 // 国内上游 JSON 列表：仅用于国内域名分流（避免境外 DNS 对国内域名返回次优结果）。
 const UPSTREAM_CN_JSON_LIST = [

@@ -112,7 +112,7 @@ hosts文件支持两种格式：
 | `exclude` | 返回记录排除指定ip/domain |（`1.1.1.1`/ `cf.cf` ） |``|
 | `shuffle` |  乱序返回记录 |默认`true`（`false`/`true` ） |`false`|
 | `area` |  指定ip区域 |留空`不过滤`（`area=hk,sg,jp` ） |``|
-| `enhance` |  增强模式 |可选`off` `rule` `full`  默认`rule`  |``|
+| `enhance` |  增强模式 |可选`off` `rule` `full`  默认`off`  |``|
 | `rules` |  增强模式域名ip匹配规则 |格式`*.domain1,*.domain2:ip1,ip2-noA-noAAAA`（`-noA/AAAA`屏蔽且不返回A/AAAA记录 ） |``|
 | `alpn` |  alpn列表 |默认 `h3,h2`     |``|
 | `no6` |  全局屏蔽AAAA记录 |默认 `false`     |``|

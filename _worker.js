@@ -24,16 +24,17 @@
 // 可自行替换为其他 DoH 服务商（如带去广告规则的 nextDNS、AdGuard DNS 等），
 // 只要端点支持 Google JSON API 风格（?name=&type=，Accept: application/dns-json）即可。
 const UPSTREAM_JSON_LIST = [
-    'https://cloudflare-dns.com/dns-query',    // Cloudflare 1.1.1.1（自家里程最短，放首位）
-    'https://doh.pub/dns-query',               // DNSPod（腾讯，国内稳）
-    'https://dns.alidns.com/resolve',          // 阿里 DNS（国内稳）
-    'https://dns.google/resolve',              // Google（兜底，放最后）
+    'https://dns.alidns.com/resolve',          // 阿里DNS（最快148ms，国内首选）
+    'https://doh.pub/dns-query',               // DNSPod（287ms，腾讯）
+    'https://cloudflare-dns.com/dns-query',    // Cloudflare 1.1.1.1（526ms，国际）
+    'https://dns.google/resolve',              // Google（兜底，可能超时）
 ];
 // 国际上游二进制 DoH 列表：/doh 纯净转发端点使用，竞速取最快。
 const UPSTREAM_DNS_LIST = [
-    'https://cloudflare-dns.com/dns-query',    // Cloudflare 1.1.1.1（放首位）
-    'https://doh.pub/dns-query',               // DNSPod（国内稳）
-    'https://dns.alidns.com/dns-query',        // 阿里 DNS
+    'https://dns.alidns.com/dns-query',        // 阿里DNS（最快）
+    'https://doh.pub/dns-query',               // DNSPod
+    'https://cloudflare-dns.com/dns-query',    // Cloudflare
+    'https://dns.google/dns-query',            // Google（兜底）
 ];
 // 国内上游 JSON 列表：仅用于国内域名分流（避免境外 DNS 对国内域名返回次优结果）。
 const UPSTREAM_CN_JSON_LIST = [
@@ -45,7 +46,7 @@ const IPV4_ONLY_DOMAINS = ["twitter.com", "x.com", "t.co", "twimg.com"];//只支
 //Cloudflare 配置
 const DEFAULT_CF_IP = "172.64.100.1,104.27.100.1,104.25.100.1,104.21.100.1,172.67.100.1,104.18.10.118";//默认CF优选IPv4(首选实测218ms;多IP返回,客户端自动容错切换)
 const DEFAULT_CF_IP6 = "";//默认CF优选IPv6
-const CF_STATIC_DOMAINS = ["twimg.com", "twitter.com", "x.com", "t.co","cloudflare-dns.com", "pages.dev", "workers.dev", "cloudflare.com","chatgpt.com", "openai.com", "oaistatic.com", "oaiusercontent.com","discord.com", "discordapp.com","shopify.com", "linear.app", "perplexity.ai", "midjourney.com", "cloudinary.com","github.com", "www.github.com", "api.github.com", "raw.githubusercontent.com"];//不查询-直接返回优选结果的CF域名列表(均为实测归属CF且支持ECH)
+const CF_STATIC_DOMAINS = ["twimg.com", "twitter.com", "x.com", "t.co","cloudflare-dns.com", "pages.dev", "workers.dev", "cloudflare.com","chatgpt.com", "openai.com", "oaistatic.com", "oaiusercontent.com","discord.com", "discordapp.com","shopify.com", "linear.app", "perplexity.ai", "midjourney.com", "cloudinary.com","github.com", "www.github.com", "api.github.com", "raw.githubusercontent.com","netflix.com", "spotify.com", "youtube.com", "google.com"];//不查询-直接返回优选结果的CF域名列表(均为实测归属CF且支持ECH)
 //Meta 配置
 const DEFAULT_META_IP = "";//默认META优选IP
 const META_DOMAINS = ["facebook.com", "messenger.com", "instagram.com","whatsapp.com", "fb.com", "meta.com"];//不查询-直接返回优选结果的META域名列表
@@ -1111,7 +1112,7 @@ async function resolveDomainToIp(domain, type = 1, clientIP) {
 /**
  * 带超时的 fetch：避免单个上游挂起拖垮竞速（超时视为失败，交给 Promise.any 切换）
  */
-async function fetchWithTimeout(url, init = {}, timeoutMs = 4000) {
+async function fetchWithTimeout(url, init = {}, timeoutMs = 3000) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
@@ -1148,13 +1149,13 @@ async function queryUpstreamDNS(name, type, clientIP = '',upstreamUrl = null) {
         }
     } catch (e) {}
 
-       // 上游 URL 列表：国内域名仅用国内上游，国外域名用国际上游列表竞速
+    // 上游 URL 列表：国内域名仅用国内上游，国外域名用国际上游列表竞速
     const upstreamList = upstreamUrl
         ? (Array.isArray(upstreamUrl) ? upstreamUrl : [upstreamUrl])
         : UPSTREAM_JSON_LIST;
     const urls = upstreamList.map(u => u + '?' + params.toString());
     const promises = urls.map(url =>
-        fetchWithTimeout(url, { headers: { 'Accept': 'application/dns-json' } }, 4000)
+        fetchWithTimeout(url, { headers: { 'Accept': 'application/dns-json' } }, 3000)
             .then(res => res.ok ? res.json() : Promise.reject())
     );
 
@@ -1556,11 +1557,11 @@ async function forwardQuery(body) {
         headers: { 'Content-Type': 'application/dns-message', 'Accept': 'application/dns-message' },
         body
     };
-    // 多上游二进制 DoH 竞速，取最快响应（4s 超时防止挂起）
+    // 多上游二进制 DoH 竞速，取最快响应（3s 超时防止挂起）
     const promises = UPSTREAM_DNS_LIST.map(url =>
-        fetchWithTimeout(url, reqInit, 4000).then(res => res.ok ? res : Promise.reject())
+        fetchWithTimeout(url, reqInit, 3000).then(res => res.ok ? res : Promise.reject())
     );
-    try { return await Promise.any(promises); } catch { return fetchWithTimeout(UPSTREAM_DNS_LIST[0], reqInit, 4000); }
+    try { return await Promise.any(promises); } catch { return fetchWithTimeout(UPSTREAM_DNS_LIST[0], reqInit, 3000); }
 }
 
 /**

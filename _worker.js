@@ -190,10 +190,11 @@ export default {
                 fetch(`${base}?domain=example.com&type=A&clientIp=1.2.4.8`),
                 fetch(`${base}?domain=taobao.com&type=A&clientIp=1.2.4.8`),
                 fetch(`${base}?domain=twitter.com&type=HTTPS&clientIp=1.2.4.8`),
-                fetch(`${base}?domain=chatgpt.com&type=A&clientIp=1.2.4.8`),
-                fetch(`${base}?domain=github.com&type=A&clientIp=1.2.4.8`),
+                fetch(`${base}?domain=chatgpt.com&type=HTTPS&clientIp=1.2.4.8`),
+                fetch(`${base}?domain=github.com&type=HTTPS&clientIp=1.2.4.8`),
                 fetch(`${base}?domain=discord.com&type=A&clientIp=1.2.4.8`),
-                fetch(`${base}?domain=netflix.com&type=A&clientIp=1.2.4.8`),
+                fetch(`${base}?domain=netflix.com&type=HTTPS&clientIp=1.2.4.8`),
+                fetch(`${base}?domain=spotify.com&type=A&clientIp=1.2.4.8`),
             ]);
         } catch (e) {}
     }
@@ -1193,27 +1194,32 @@ async function queryUpstreamDNS(name, type, clientIP = '',upstreamUrl = null) {
 /**
  * 校验式竞速：并发请求所有上游，优先返回包含指定 DNS 类型记录的响应；
  * 若所有上游均无该类型记录，则返回第一个成功响应（保持兜底行为）。
+ * 优化：找到有效响应立即 resolve，不等待其他上游。
  */
 function firstWithType(promises, type) {
     return new Promise((resolve, reject) => {
         let settled = 0;
         let firstOk = null;
         const total = promises.length;
+        let resolved = false;
         const checkDone = () => {
-            if (settled === total) {
+            if (settled === total && !resolved) {
                 if (firstOk) resolve(firstOk);
                 else reject(new Error('all upstreams failed'));
             }
         };
         for (const p of promises) {
             p.then(data => {
+                if (resolved) return;
                 settled++;
                 if (!firstOk) firstOk = data;
                 if (data && Array.isArray(data.Answer) && data.Answer.some(a => a.type === type)) {
+                    resolved = true;
                     return resolve(data);
                 }
                 checkDone();
             }).catch(() => {
+                if (resolved) return;
                 settled++;
                 checkDone();
             });
@@ -1246,7 +1252,7 @@ async function fetchRealEch(echDomain, clientIP) {
     try {
         let data = await queryUpstreamDNS(echDomain, 65, clientIP);
         if (!data) {
-            await new Promise(r => setTimeout(r, 300));
+            await new Promise(r => setTimeout(r, 100));
             data = await queryUpstreamDNS(echDomain, 65, clientIP);
         }
         if (data && data.Answer) {

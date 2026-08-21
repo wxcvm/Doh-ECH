@@ -21,20 +21,17 @@
 // ===================== 全局配置 =====================
 // ---------- 上游 DNS 配置（竞速取最快响应） ----------
 // 国际上游 JSON 列表：用于境外域名的 A/AAAA/HTTPS 等结构化查询。
-// 可自行替换为其他 DoH 服务商（如带去广告规则的 nextDNS、AdGuard DNS 等），
-// 只要端点支持 Google JSON API 风格（?name=&type=，Accept: application/dns-json）即可。
+// 优化：仅保留稳定且快速的上游，移除不可靠的 Google
 const UPSTREAM_JSON_LIST = [
-    'https://dns.alidns.com/resolve',          // 阿里DNS（最快148ms，国内首选）
-    'https://doh.pub/dns-query',               // DNSPod（287ms，腾讯）
-    'https://cloudflare-dns.com/dns-query',    // Cloudflare 1.1.1.1（526ms，国际）
-    'https://dns.google/resolve',              // Google（兜底，可能超时）
+    'https://dns.alidns.com/resolve',          // 阿里DNS（最快 ~200ms，国内首选）
+    'https://doh.pub/dns-query',               // DNSPod（~300ms，腾讯）
+    'https://cloudflare-dns.com/dns-query',    // Cloudflare 1.1.1.1（~500ms，国际）
 ];
 // 国际上游二进制 DoH 列表：/doh 纯净转发端点使用，竞速取最快。
 const UPSTREAM_DNS_LIST = [
     'https://dns.alidns.com/dns-query',        // 阿里DNS（最快）
     'https://doh.pub/dns-query',               // DNSPod
     'https://cloudflare-dns.com/dns-query',    // Cloudflare
-    'https://dns.google/dns-query',            // Google（兜底）
 ];
 // 国内上游 JSON 列表：仅用于国内域名分流（避免境外 DNS 对国内域名返回次优结果）。
 const UPSTREAM_CN_JSON_LIST = [
@@ -84,12 +81,12 @@ const BUILTIN_HINTS = [
         noA: true, noAAAA: false
     },
     {
-        // Wikipedia 维基百科(实验性支持 HTTP/3 )
+        // Wikipedia 维基百科(禁用ipv4)（全球最大的百科知识库，其通用任播边缘全面部署了支持 HTTP/3 的 ATS 架构）
         domains: ["*.wikipedia.org", "*.wikimedia.org", "*.wikibooks.org", "*.wikidata.org"],
         ips: [],  noA: true, noAAAA: false
     },
    //Others(禁用ipv4)
-    { domains: ["*.docker.com","*.onlyfans.com", "*.docker.io", "*.production.cloudflare.docker.com"], ips: [], noA: true, noAAAA: false },       
+    { domains: ["*.docker.com", "*.docker.io", "*.production.cloudflare.docker.com"], ips: [], noA: true, noAAAA: false },       
     //FastlyCDN优化(禁用ipv6)
     { domains: ["*.reddit.com", "*.redd.it", "*.redditmedia.com", "*.redditstatic.com"], ips: ["151.101.1.140", "151.101.65.140", "151.101.129.140", "151.101.193.140"], noA: false, noAAAA: true },
     { domains: ["*.imgur.com", "*.i.imgur.com", "*.api.imgur.com", "*.s.imgur.com"], ips: ["151.101.1.193", "151.101.65.193", "151.101.129.193", "151.101.193.193"], noA: false, noAAAA: true },
@@ -193,6 +190,10 @@ export default {
                 fetch(`${base}?domain=example.com&type=A&clientIp=1.2.4.8`),
                 fetch(`${base}?domain=taobao.com&type=A&clientIp=1.2.4.8`),
                 fetch(`${base}?domain=twitter.com&type=HTTPS&clientIp=1.2.4.8`),
+                fetch(`${base}?domain=chatgpt.com&type=A&clientIp=1.2.4.8`),
+                fetch(`${base}?domain=github.com&type=A&clientIp=1.2.4.8`),
+                fetch(`${base}?domain=discord.com&type=A&clientIp=1.2.4.8`),
+                fetch(`${base}?domain=netflix.com&type=A&clientIp=1.2.4.8`),
             ]);
         } catch (e) {}
     }
@@ -1111,8 +1112,9 @@ async function resolveDomainToIp(domain, type = 1, clientIP) {
 
 /**
  * 带超时的 fetch：避免单个上游挂起拖垮竞速（超时视为失败，交给 Promise.any 切换）
+ * 优化：2s 快速超时，减少等待时间
  */
-async function fetchWithTimeout(url, init = {}, timeoutMs = 3000) {
+async function fetchWithTimeout(url, init = {}, timeoutMs = 2000) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
@@ -1155,7 +1157,7 @@ async function queryUpstreamDNS(name, type, clientIP = '',upstreamUrl = null) {
         : UPSTREAM_JSON_LIST;
     const urls = upstreamList.map(u => u + '?' + params.toString());
     const promises = urls.map(url =>
-        fetchWithTimeout(url, { headers: { 'Accept': 'application/dns-json' } }, 3000)
+        fetchWithTimeout(url, { headers: { 'Accept': 'application/dns-json' } }, 2000)
             .then(res => res.ok ? res.json() : Promise.reject())
     );
 
@@ -1169,7 +1171,7 @@ async function queryUpstreamDNS(name, type, clientIP = '',upstreamUrl = null) {
             result = await Promise.any(promises);
         } catch {
             try {
-                const res = await fetchWithTimeout(urls[0], { headers: { 'Accept': 'application/dns-json' } }, 4000);
+                const res = await fetchWithTimeout(urls[0], { headers: { 'Accept': 'application/dns-json' } }, 2000);
                 if (res.ok) result = await res.json();
                 else return null;
             } catch { return null; }
@@ -1557,11 +1559,11 @@ async function forwardQuery(body) {
         headers: { 'Content-Type': 'application/dns-message', 'Accept': 'application/dns-message' },
         body
     };
-    // 多上游二进制 DoH 竞速，取最快响应（3s 超时防止挂起）
+    // 多上游二进制 DoH 竞速，取最快响应（2s 快速超时）
     const promises = UPSTREAM_DNS_LIST.map(url =>
-        fetchWithTimeout(url, reqInit, 3000).then(res => res.ok ? res : Promise.reject())
+        fetchWithTimeout(url, reqInit, 2000).then(res => res.ok ? res : Promise.reject())
     );
-    try { return await Promise.any(promises); } catch { return fetchWithTimeout(UPSTREAM_DNS_LIST[0], reqInit, 3000); }
+    try { return await Promise.any(promises); } catch { return fetchWithTimeout(UPSTREAM_DNS_LIST[0], reqInit, 2000); }
 }
 
 /**

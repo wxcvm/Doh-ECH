@@ -288,7 +288,16 @@ async function handleApiQuery(url, clientIP) {
     try {
         const result = await resolveDNS(domain, type, config, config.clientIp);
         if (result.httpsRecord) delete result.httpsRecord;
-        return json(result);
+        // 添加 Cache-Control 头部，让 Cloudflare Edge 缓存生效
+        const maxAge = (type === 'HTTPS') ? 600 : 300;
+        return new Response(JSON.stringify(result), {
+            status: 200,
+            headers: {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*',
+                'Cache-Control': `public, max-age=${maxAge}`
+            }
+        });
     } catch (e) {
         return json({ error: e.message }, 500);
     }
@@ -1577,7 +1586,11 @@ async function forwardQuery(body) {
  */
 function dnsResponse(buffer) {
     return new Response(buffer, {
-        headers: { 'Content-Type': 'application/dns-message', 'Access-Control-Allow-Origin': '*' }
+        headers: { 
+            'Content-Type': 'application/dns-message', 
+            'Access-Control-Allow-Origin': '*',
+            'Cache-Control': 'public, max-age=300'
+        }
     });
 }
 /**

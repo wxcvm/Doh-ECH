@@ -183,7 +183,7 @@ export default {
         ctx.waitUntil(ensureCNDomainSet());
         ctx.waitUntil(fetchRealEch('cloudflare-ech.com', ''));
         ctx.waitUntil(getBuiltinRulesMap());
-        // 预热 Edge 缓存（国际+国内示例查询各一，写入 Cache API）
+        // 预热 Edge 缓存 + 静态响应缓存 + DoH GET 缓存
         try {
             const base = `https://dohech.dpdns.org/api/query`;
             await Promise.allSettled([
@@ -196,16 +196,29 @@ export default {
                 fetch(`${base}?domain=netflix.com&type=HTTPS&clientIp=1.2.4.8`),
                 fetch(`${base}?domain=spotify.com&type=A&clientIp=1.2.4.8`),
             ]);
+            // 预热静态响应缓存
+            for (const d of ['twitter.com','chatgpt.com','github.com','discord.com','netflix.com','spotify.com']) {
+                await fetch(`${base}?domain=${d}&type=A&clientIp=1.2.4.8`);
+                await fetch(`${base}?domain=${d}&type=HTTPS&clientIp=1.2.4.8`);
+            }
         } catch (e) {}
     }
 };
 
 // ===================== DoH 处理 =====================
+// DoH GET 请求缓存（仅缓存静态域名 + 固定参数）
+const DOH_GET_CACHE = new Map();
+const DOH_GET_TTL = 300000; // 5分钟
+
 async function handleDoHRequest(req, injectEch, ctx, clientIP) {
     const url = new URL(req.url);
     const config = buildConfig(url, req.headers);
     if (!config.clientIp) config.clientIp = clientIP;
     await applySubConfig(config);   
+
+    // 仅缓存 GET 请求 + 静态域名 + 固定 clientIp + 无增强
+    const cacheableGet = req.method === 'GET' && url.searchParams.get('dns') && 
+                         config.clientIp === '1.2.4.8' && (!config.enhance || config.enhance === 'off');
 
     if (req.method === 'POST') {
         const buf = await req.arrayBuffer();
@@ -216,9 +229,44 @@ async function handleDoHRequest(req, injectEch, ctx, clientIP) {
     if (req.method === 'GET' && url.searchParams.get('dns')) {
         const raw = url.searchParams.get('dns').replace(/ /g, '+').replace(/-/g, '+').replace(/_/g, '/');
         const buf = Uint8Array.from(atob(raw), c => c.charCodeAt(0)).buffer;
+        
+        // 解析查询域名用于缓存键
+        let cacheKey = null;
+        if (cacheableGet) {
+            try {
+                const query = parseDnsPacket(buf);
+                if (query?.questions?.length) {
+                    const qName = query.questions[0].name.toLowerCase().replace(/\.$/, "");
+                    const qType = query.questions[0].type;
+                    const isStaticCF = CF_STATIC_DOMAINS.some(d => qName === d || qName.endsWith("." + d));
+                    const isStaticMeta = META_DOMAINS.some(d => qName === d || qName.endsWith("." + d));
+                    if (isStaticCF || isStaticMeta) {
+                        cacheKey = `${qName}:${qType}`;
+                        const cached = DOH_GET_CACHE.get(cacheKey);
+                        if (cached && Date.now() < cached.expire) {
+                            return new Response(cached.body, {
+                                status: 200,
+                                headers: {
+                                    'Content-Type': 'application/dns-message',
+                                    'Access-Control-Allow-Origin': '*',
+                                    'Cache-Control': 'public, max-age=300',
+                                    'X-Cache': 'DOH_HIT'
+                                }
+                            });
+                        }
+                    }
+                }
+            } catch (e) {}
+        }
+        
         if (injectEch) return handleDnsQuery(buf, config, ctx, config.clientIp);
         const res = await forwardQuery(buf);
-        return dnsResponse(await res.arrayBuffer());
+        const body = await res.arrayBuffer();
+        
+        if (cacheKey) {
+            DOH_GET_CACHE.set(cacheKey, { body, expire: Date.now() + DOH_GET_TTL });
+        }
+        return dnsResponse(body);
     }
     return new Response('OK', { status: 200, headers: { 'Access-Control-Allow-Origin': '*' } });
 }
@@ -276,6 +324,10 @@ function dnsResponseFromResult(id, qName, qType, result) {
 }
 
 // ===================== JSON API =====================
+// 预计算静态域名的标准响应（避免重复 JSON 序列化）
+const STATIC_RESPONSE_CACHE = new Map();
+const STATIC_RESPONSE_TTL = 300000; // 5分钟
+
 async function handleApiQuery(url, clientIP) {
     const domain = url.searchParams.get('domain');
     const type = url.searchParams.get('type')?.toUpperCase() || 'A';
@@ -285,17 +337,46 @@ async function handleApiQuery(url, clientIP) {
     if (!config.clientIp) config.clientIp = clientIP;
     await applySubConfig(config);
 
+    // 静态域名 + 固定 clientIp + 无增强模式 = 可缓存预计算响应
+    const isStaticCF = CF_STATIC_DOMAINS.some(d => domain === d || domain.endsWith("." + d));
+    const isStaticMeta = META_DOMAINS.some(d => domain === d || domain.endsWith("." + d));
+    const cacheable = (isStaticCF || isStaticMeta) && config.clientIp === '1.2.4.8' && (!config.enhance || config.enhance === 'off');
+    
+    // 提前声明 cacheKey，避免作用域问题
+    const cacheKey = cacheable ? `${domain}:${type}` : null;
+
+    if (cacheable) {
+        const cached = STATIC_RESPONSE_CACHE.get(cacheKey);
+        if (cached && Date.now() < cached.expire) {
+            return new Response(cached.body, {
+                status: 200,
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*',
+                    'Cache-Control': `public, max-age=${type === 'HTTPS' ? 600 : 300}`,
+                    'X-Cache': 'STATIC_HIT'
+                }
+            });
+        }
+    }
+
     try {
         const result = await resolveDNS(domain, type, config, config.clientIp);
         if (result.httpsRecord) delete result.httpsRecord;
-        // 添加 Cache-Control 头部，让 Cloudflare Edge 缓存生效
         const maxAge = (type === 'HTTPS') ? 600 : 300;
-        return new Response(JSON.stringify(result), {
+        const body = JSON.stringify(result);
+        
+        if (cacheable) {
+            STATIC_RESPONSE_CACHE.set(cacheKey, { body, expire: Date.now() + STATIC_RESPONSE_TTL });
+        }
+        
+        return new Response(body, {
             status: 200,
             headers: {
                 'Content-Type': 'application/json',
                 'Access-Control-Allow-Origin': '*',
-                'Cache-Control': `public, max-age=${maxAge}`
+                'Cache-Control': `public, max-age=${maxAge}`,
+                'Vary': 'Accept-Encoding'
             }
         });
     } catch (e) {

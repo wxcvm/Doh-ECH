@@ -169,14 +169,14 @@ export default {
                 '104.16.0.1', '104.18.10.118',
             ].join('\n') + '\n';
             return new Response(subContent, {
-                headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'public, max-age=3600' }
+                headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'public, max-age=3600, s-maxage=3600' }
             });
         }
         const clientIP = url.searchParams.get('clientIp') || req.headers.get('X-ClientIP') || req.headers.get('CF-Connecting-IP') || '1.2.4.8';
         if (url.pathname === '/api/query') return handleApiQuery(url, clientIP);
         if (url.pathname === '/ech') return handleDoHRequest(req, true, ctx, clientIP);
         if (url.pathname === '/doh') return handleDoHRequest(req, false, ctx, clientIP);
-        return new Response(getHtml(), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+        return new Response(getHtml(), { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'public, max-age=3600, s-maxage=3600' } });
     },
     // Cron 定时预热：保持缓存热状态（国内域名库/ECH/规则），避免冷启动首请求降速
     async scheduled(controller, env, ctx) {
@@ -249,7 +249,7 @@ async function handleDoHRequest(req, injectEch, ctx, clientIP) {
                                 headers: {
                                     'Content-Type': 'application/dns-message',
                                     'Access-Control-Allow-Origin': '*',
-                                    'Cache-Control': 'public, max-age=300',
+                                    'Cache-Control': 'public, max-age=300, s-maxage=300',
                                     'X-Cache': 'DOH_HIT'
                                 }
                             });
@@ -353,7 +353,8 @@ async function handleApiQuery(url, clientIP) {
                 headers: {
                     'Content-Type': 'application/json',
                     'Access-Control-Allow-Origin': '*',
-                    'Cache-Control': `public, max-age=${type === 'HTTPS' ? 600 : 300}`,
+                    'Cache-Control': `public, max-age=${type === 'HTTPS' ? 600 : 300}, s-maxage=${type === 'HTTPS' ? 600 : 300}`,
+                    'Vary': 'Accept-Encoding',
                     'X-Cache': 'STATIC_HIT'
                 }
             });
@@ -375,7 +376,7 @@ async function handleApiQuery(url, clientIP) {
             headers: {
                 'Content-Type': 'application/json',
                 'Access-Control-Allow-Origin': '*',
-                'Cache-Control': `public, max-age=${maxAge}`,
+                'Cache-Control': `public, max-age=${maxAge}, s-maxage=${maxAge}`,
                 'Vary': 'Accept-Encoding'
             }
         });
@@ -1033,7 +1034,7 @@ async function readCache(cacheKey) {
 async function writeCache(cacheKey, text, ttlSeconds) {
     try {
         const response = new Response(text, {
-            headers: { 'Cache-Control': `public, max-age=${ttlSeconds}` }
+            headers: { 'Cache-Control': `public, max-age=${ttlSeconds}, s-maxage=${ttlSeconds}` }
         });
         await caches.default.put(cacheKey, response);
     } catch (e) {}
@@ -1273,7 +1274,7 @@ async function queryUpstreamDNS(name, type, clientIP = '',upstreamUrl = null) {
         try {
             const maxAge = (type === 65) ? 600 : 300;
             const resToCache = new Response(JSON.stringify(result), {
-                headers: { 'Cache-Control': `public, max-age=${maxAge}` }
+                headers: { 'Cache-Control': `public, max-age=${maxAge}, s-maxage=${maxAge}` }
             });
             caches.default.put(cacheKey, resToCache).catch(() => {});
         } catch (e) {}
@@ -1670,7 +1671,7 @@ function dnsResponse(buffer) {
         headers: { 
             'Content-Type': 'application/dns-message', 
             'Access-Control-Allow-Origin': '*',
-            'Cache-Control': 'public, max-age=300'
+            'Cache-Control': 'public, max-age=300, s-maxage=300'
         }
     });
 }

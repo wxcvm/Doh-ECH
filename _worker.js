@@ -251,6 +251,23 @@ async function handleDoHRequest(req, injectEch, ctx, clientIP) {
                                 }
                             });
                         }
+                        // 二级回退：跨 isolate 共享缓存 (Cache API)
+                        try {
+                            const sharedRes = await caches.default.match(`https://dns-cache/doh/${cacheKey}`);
+                            if (sharedRes) {
+                                const sharedBody = await sharedRes.arrayBuffer();
+                                DOH_GET_CACHE.set(cacheKey, { body: sharedBody, expire: Date.now() + DOH_GET_TTL });
+                                return new Response(sharedBody, {
+                                    status: 200,
+                                    headers: {
+                                        'Content-Type': 'application/dns-message',
+                                        'Access-Control-Allow-Origin': '*',
+                                        'Cache-Control': 'public, max-age=300, s-maxage=300',
+                                        'X-Cache': 'DOH_HIT'
+                                    }
+                                });
+                            }
+                        } catch (e) {}
                     }
                 }
             } catch (e) {}
@@ -262,6 +279,11 @@ async function handleDoHRequest(req, injectEch, ctx, clientIP) {
         
         if (cacheKey) {
             DOH_GET_CACHE.set(cacheKey, { body, expire: Date.now() + DOH_GET_TTL });
+            try {
+                await caches.default.put(`https://dns-cache/doh/${cacheKey}`, new Response(body, {
+                    headers: { 'Cache-Control': 'public, max-age=300, s-maxage=300' }
+                }));
+            } catch (e) {}
         }
         return dnsResponse(body);
     }
@@ -291,8 +313,28 @@ async function handleDnsQuery(rawBuffer, config, ctx, clientIP) {
         const isStaticMeta = META_DOMAINS.some(d => qName === d || qName.endsWith("." + d));
 
         if (isStaticCF || isStaticMeta) {
+            // 静态域名：读缓存（Map + Cache API 二级），miss 则计算并写回
+            const cKey = `${qName}:${qType}`;
+            const cachedIt = DOH_GET_CACHE.get(cKey);
+            if (cachedIt && Date.now() < cachedIt.expire) return dnsResponse(cachedIt.body);
+            try {
+                const sharedRes = await caches.default.match(`https://dns-cache/doh/${cKey}`);
+                if (sharedRes) {
+                    const sBody = await sharedRes.arrayBuffer();
+                    DOH_GET_CACHE.set(cKey, { body: sBody, expire: Date.now() + DOH_GET_TTL });
+                    return dnsResponse(sBody);
+                }
+            } catch (e) {}
             const result = await resolveDNS(qName, qType === 28 ? 'AAAA' : (qType === 65 ? 'HTTPS' : 'A'), config, clientIP);
-            return dnsResponseFromResult(id, qName, qType, result);
+            const outResp = dnsResponseFromResult(id, qName, qType, result);
+            const outBody = await outResp.clone().arrayBuffer();
+            DOH_GET_CACHE.set(cKey, { body: outBody, expire: Date.now() + DOH_GET_TTL });
+            try {
+                await caches.default.put(`https://dns-cache/doh/${cKey}`, new Response(outBody, {
+                    headers: { 'Cache-Control': 'public, max-age=300, s-maxage=300' }
+                }));
+            } catch (e) {}
+            return outResp;
         }
 
         // 非静态域名 + HTTPS + 无增强 → 透明转发
@@ -373,6 +415,24 @@ async function handleApiQuery(url, clientIP) {
                 }
             });
         }
+        // 二级回退：跨 isolate 共享缓存 (Cache API)，其他 isolate 已算过则直接复用
+        try {
+            const sharedRes = await caches.default.match(`https://dns-cache/static/${cacheKey}`);
+            if (sharedRes) {
+                const sharedBody = await sharedRes.text();
+                STATIC_RESPONSE_CACHE.set(cacheKey, { body: sharedBody, expire: Date.now() + STATIC_RESPONSE_TTL });
+                return new Response(sharedBody, {
+                    status: 200,
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': '*',
+                        'Cache-Control': `public, max-age=${type === 'HTTPS' ? 600 : 300}, s-maxage=${type === 'HTTPS' ? 600 : 300}`,
+                        'Vary': 'Accept-Encoding',
+                        'X-Cache': 'STATIC_HIT'
+                    }
+                });
+            }
+        } catch (e) {}
     }
 
     try {
@@ -383,6 +443,11 @@ async function handleApiQuery(url, clientIP) {
         
         if (cacheable) {
             STATIC_RESPONSE_CACHE.set(cacheKey, { body, expire: Date.now() + STATIC_RESPONSE_TTL });
+            try {
+                await caches.default.put(`https://dns-cache/static/${cacheKey}`, new Response(body, {
+                    headers: { 'Cache-Control': `public, max-age=${maxAge}, s-maxage=${maxAge}` }
+                }));
+            } catch (e) {}
         }
         
         return new Response(body, {

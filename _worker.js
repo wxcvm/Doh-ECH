@@ -174,7 +174,7 @@ export default {
         }
         const clientIP = url.searchParams.get('clientIp') || req.headers.get('X-ClientIP') || req.headers.get('CF-Connecting-IP') || '1.2.4.8';
         if (url.pathname === '/api/query') return handleApiQuery(url, clientIP);
-        if (url.pathname === '/ech') return handleDoHRequest(req, true, ctx, clientIP);
+        if (url.pathname === '/ech' || url.pathname === '/dns-query') return handleDoHRequest(req, true, ctx, clientIP);
         if (url.pathname === '/doh') return handleDoHRequest(req, false, ctx, clientIP);
         return new Response(getHtml(), { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'public, max-age=3600, s-maxage=3600' } });
     },
@@ -216,9 +216,8 @@ async function handleDoHRequest(req, injectEch, ctx, clientIP) {
     if (!config.clientIp) config.clientIp = clientIP;
     await applySubConfig(config);   
 
-    // 仅缓存 GET 请求 + 静态域名 + 固定 clientIp + 无增强
-    const cacheableGet = req.method === 'GET' && url.searchParams.get('dns') && 
-                         config.clientIp === '1.2.4.8' && (!config.enhance || config.enhance === 'off');
+    // GET + dns 参数即可尝试缓存（静态域名判定在解析包后执行）
+    const cacheableGet = req.method === 'GET' && !!url.searchParams.get('dns');
 
     if (req.method === 'POST') {
         const buf = await req.arrayBuffer();
@@ -238,9 +237,7 @@ async function handleDoHRequest(req, injectEch, ctx, clientIP) {
                 if (query?.questions?.length) {
                     const qName = query.questions[0].name.toLowerCase().replace(/\.$/, "");
                     const qType = query.questions[0].type;
-                    const isStaticCF = CF_STATIC_DOMAINS.some(d => qName === d || qName.endsWith("." + d));
-                    const isStaticMeta = META_DOMAINS.some(d => qName === d || qName.endsWith("." + d));
-                    if (isStaticCF || isStaticMeta) {
+                    if (isCacheableStaticRequest(qName, config)) {
                         cacheKey = `${qName}:${qType}`;
                         const cached = DOH_GET_CACHE.get(cacheKey);
                         if (cached && Date.now() < cached.expire) {
@@ -328,6 +325,25 @@ function dnsResponseFromResult(id, qName, qType, result) {
 const STATIC_RESPONSE_CACHE = new Map();
 const STATIC_RESPONSE_TTL = 300000; // 5分钟
 
+// 判定是否可安全缓存：静态域名(CF/META)返回固定优选IP，不依赖客户端位置(ECS)，
+// 因此无需 clientIp 参与；但任何自定义覆盖参数都会改变响应内容，必须排除。
+function isCacheableStaticRequest(domain, config) {
+    const isStaticCF = CF_STATIC_DOMAINS.some(d => domain === d || domain.endsWith("." + d));
+    const isStaticMeta = META_DOMAINS.some(d => domain === d || domain.endsWith("." + d));
+    if (!isStaticCF && !isStaticMeta) return false;
+    if (config.enhance && config.enhance !== 'off') return false;
+    // 以下自定义参数会改变响应内容 → 不缓存（避免缓存键碰撞）
+    if (config.ip4 || config.ip6 || config.metaIp4 || config.metaIp6) return false;
+    if (config.cfDomain || config.metaDomain || config.sub) return false;
+    if (config.area || config.exclude) return false;
+    if (config.best === 'true') return false;
+    if (config.no6 === 'true') return false;          // no6=true 屏蔽AAAA
+    if (config.nocf6 === 'false') return false;       // nocf6=false 放行CF IPv6
+    if (config.alpn !== 'h3,h2') return false;        // alpn 影响 HTTPS 记录
+    if (config.mandatory !== 'alpn') return false;    // mandatory 影响 HTTPS 记录
+    return true;
+}
+
 async function handleApiQuery(url, clientIP) {
     const domain = url.searchParams.get('domain');
     const type = url.searchParams.get('type')?.toUpperCase() || 'A';
@@ -337,10 +353,8 @@ async function handleApiQuery(url, clientIP) {
     if (!config.clientIp) config.clientIp = clientIP;
     await applySubConfig(config);
 
-    // 静态域名 + 固定 clientIp + 无增强模式 = 可缓存预计算响应
-    const isStaticCF = CF_STATIC_DOMAINS.some(d => domain === d || domain.endsWith("." + d));
-    const isStaticMeta = META_DOMAINS.some(d => domain === d || domain.endsWith("." + d));
-    const cacheable = (isStaticCF || isStaticMeta) && config.clientIp === '1.2.4.8' && (!config.enhance || config.enhance === 'off');
+    // 静态域名 + 默认参数 = 可缓存预计算响应（结果不依赖 clientIp/ECS）
+    const cacheable = isCacheableStaticRequest(domain, config);
     
     // 提前声明 cacheKey，避免作用域问题
     const cacheKey = cacheable ? `${domain}:${type}` : null;

@@ -160,6 +160,18 @@ export default {
         ctx.waitUntil(fetchRealEch('cloudflare-ech.com', ''));
          ctx.waitUntil(getBuiltinRulesMap());
         const url = new URL(req.url);
+        // 浏览器端 JS 客户端跨域 POST application/dns-message 会先发 OPTIONS 预检
+        if (req.method === 'OPTIONS') {
+            return new Response(null, {
+                status: 204,
+                headers: {
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                    'Access-Control-Allow-Headers': 'Content-Type, Accept, X-Ip4, X-Ip6, X-MetaIp4, X-MetaIp6, X-CF, X-Meta, X-ECH, X-Best, X-Sub, X-Exclude, X-Shuffle, X-Area, X-Enhance, X-Rules, X-Alpn, X-ClientIP, X-No6, X-Mandatory, X-NoCF6',
+                    'Access-Control-Max-Age': '86400'
+                }
+            });
+        }
         if (url.pathname === '/log') {return handleLogsRequest();}
         if (url.pathname === '/sub.txt') {
             // CF 优选 IP 订阅（配合 sub=ip-https://... 参数使用）
@@ -176,7 +188,24 @@ export default {
         if (url.pathname === '/api/query') return handleApiQuery(url, clientIP);
         if (url.pathname === '/ech' || url.pathname === '/dns-query') return handleDoHRequest(req, true, ctx, clientIP);
         if (url.pathname === '/doh') return handleDoHRequest(req, false, ctx, clientIP);
-        return new Response(getHtml(), { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'public, max-age=3600, s-maxage=3600' } });
+        if (url.pathname === '/' || url.pathname === '/index.html') {
+            return new Response(getHtml(), { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'public, max-age=3600, s-maxage=3600' } });
+        }
+        // 兼容：客户端把 DoH 地址误配成站点根或任意路径（Chrome/dnsproxy 常见）。
+        // 只要具备标准 DoH 请求特征就按 /ech 语义处理，避免误配后收到 404 或 HTML。
+        const ct = (req.headers.get('Content-Type') || '').toLowerCase();
+        if ((req.method === 'POST' && ct.includes('application/dns-message')) ||
+            (req.method === 'GET' && url.searchParams.get('dns'))) {
+            return handleDoHRequest(req, true, ctx, clientIP);
+        }
+        return new Response(JSON.stringify({
+            error: 'Not Found',
+            path: url.pathname,
+            endpoints: ['/', '/ech', '/doh', '/dns-query', '/api/query', '/sub.txt', '/log']
+        }, null, 2), {
+            status: 404,
+            headers: { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*' }
+        });
     },
     // Cron 定时预热：保持缓存热状态（国内域名库/ECH/规则），避免冷启动首请求降速
     async scheduled(controller, env, ctx) {
@@ -216,56 +245,63 @@ async function handleDoHRequest(req, injectEch, ctx, clientIP) {
     if (!config.clientIp) config.clientIp = clientIP;
     await applySubConfig(config);   
 
+    // 缓存命名空间：/ech(注入构造) 与 /doh(纯净转发) 结果语义不同，绝不共用缓存键
+    const ns = injectEch ? 'ech' : 'doh';
+
     // GET + dns 参数即可尝试缓存（静态域名判定在解析包后执行）
     const cacheableGet = req.method === 'GET' && !!url.searchParams.get('dns');
 
     if (req.method === 'POST') {
         const buf = await req.arrayBuffer();
-        if (injectEch) return handleDnsQuery(buf, config, ctx, config.clientIp);
+        if (injectEch) return handleDnsQuery(buf, config, ctx, config.clientIp, ns);
         const res = await forwardQuery(buf);
         return dnsResponse(await res.arrayBuffer());
     }
     if (req.method === 'GET' && url.searchParams.get('dns')) {
         const raw = url.searchParams.get('dns').replace(/ /g, '+').replace(/-/g, '+').replace(/_/g, '/');
-        const buf = Uint8Array.from(atob(raw), c => c.charCodeAt(0)).buffer;
+        // 非法字符 / 超长参数必须在解码前拦住：否则 atob 抛错会变成 Cloudflare 500 文本页
+        // （无 CORS 头，也不是 RFC8484 错误响应），配置错误的客户端还会照常重试。
+        let buf;
+        try {
+            if (raw.length > 8192) throw new Error('too long');
+            buf = Uint8Array.from(atob(raw), c => c.charCodeAt(0)).buffer;
+        } catch (e) {
+            return new Response(JSON.stringify({ error: 'Invalid ?dns= parameter', hint: 'RFC8484 base64url 编码的 DNS 报文，长度上限 8192' }, null, 2), {
+                status: 400,
+                headers: { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*' }
+            });
+        }
         
-        // 解析查询域名用于缓存键
+        // 解析查询域名用于缓存键（qName/qType 只在此块内可见，缓存 URL 必须在这里算好带出去，
+        // 否则 286 行附近的写入会引用越界变量抛 ReferenceError，被空 catch 吞掉后缓存永远写不进）
         let cacheKey = null;
+        let cacheUrl = null;
+        let queryId = null;
+        let queryHasEdns = false;
         if (cacheableGet) {
             try {
                 const query = parseDnsPacket(buf);
+                queryId = query?.id ?? null;
+                queryHasEdns = !!query?.hasEdns;
                 if (query?.questions?.length) {
                     const qName = query.questions[0].name.toLowerCase().replace(/\.$/, "");
                     const qType = query.questions[0].type;
-                    if (isCacheableStaticRequest(qName, config)) {
-                        cacheKey = `${qName}:${qType}`;
+                    if (query.questions[0].name.replace(/\.$/, "") === qName && isCacheableStaticRequest(qName, config)) {
+                        cacheKey = `${ns}:${qName}:${qType}`;
+                        cacheUrl = `https://dns-cache/${ns}/${qName}:${qType}`;
                         const cached = DOH_GET_CACHE.get(cacheKey);
                         if (cached && Date.now() < cached.expire) {
-                            return new Response(cached.body, {
-                                status: 200,
-                                headers: {
-                                    'Content-Type': 'application/dns-message',
-                                    'Access-Control-Allow-Origin': '*',
-                                    'Cache-Control': 'public, max-age=300, s-maxage=300',
-                                    'X-Cache': 'DOH_HIT'
-                                }
-                            });
+                            const hitBody = withDnsId(cached.body, queryId);
+                            return dnsResponse(queryHasEdns ? appendOpt(hitBody) : hitBody, { 'X-Cache': 'DOH_HIT' });
                         }
                         // 二级回退：跨 isolate 共享缓存 (Cache API)
                         try {
-                            const sharedRes = await caches.default.match(`https://dns-cache/doh/${cacheKey}`);
+                            const sharedRes = await caches.default.match(cacheUrl);
                             if (sharedRes) {
                                 const sharedBody = await sharedRes.arrayBuffer();
                                 DOH_GET_CACHE.set(cacheKey, { body: sharedBody, expire: Date.now() + DOH_GET_TTL });
-                                return new Response(sharedBody, {
-                                    status: 200,
-                                    headers: {
-                                        'Content-Type': 'application/dns-message',
-                                        'Access-Control-Allow-Origin': '*',
-                                        'Cache-Control': 'public, max-age=300, s-maxage=300',
-                                        'X-Cache': 'DOH_HIT'
-                                    }
-                                });
+                                const hitBody = withDnsId(sharedBody, queryId);
+                                return dnsResponse(queryHasEdns ? appendOpt(hitBody) : hitBody, { 'X-Cache': 'DOH_HIT' });
                             }
                         } catch (e) {}
                     }
@@ -273,68 +309,108 @@ async function handleDoHRequest(req, injectEch, ctx, clientIP) {
             } catch (e) {}
         }
         
-        if (injectEch) return handleDnsQuery(buf, config, ctx, config.clientIp);
+        if (injectEch) return handleDnsQuery(buf, config, ctx, config.clientIp, ns);
         const res = await forwardQuery(buf);
         const body = await res.arrayBuffer();
         
-        if (cacheKey) {
-            DOH_GET_CACHE.set(cacheKey, { body, expire: Date.now() + DOH_GET_TTL });
+        // 只缓存「客户端未携带 EDNS」的转发结果：此时上游响应必然不含 OPT，
+        // 缓存体与事务 ID/OPT 均无关，读取时再按当前请求回写 ID、按需追加 OPT。
+        // 携带 EDNS 时转发体会回显该客户端的 OPT（可能含 COOKIE），不写入共享缓存。
+        if (cacheKey && !queryHasEdns) {
+            const neutral = withDnsId(body, 0);
+            DOH_GET_CACHE.set(cacheKey, { body: neutral, expire: Date.now() + DOH_GET_TTL });
             try {
-                await caches.default.put(`https://dns-cache/doh/${cacheKey}`, new Response(body, {
+                await caches.default.put(cacheUrl, new Response(neutral, {
                     headers: { 'Cache-Control': 'public, max-age=300, s-maxage=300' }
                 }));
             } catch (e) {}
         }
         return dnsResponse(body);
     }
-    return new Response('OK', { status: 200, headers: { 'Access-Control-Allow-Origin': '*' } });
+    // 既非 POST 线格式、也无 ?dns= 参数：这不是一个合法的 RFC8484 DoH 请求。
+    // 早期版本返回 200 "OK"，会让配置错误的客户端把空响应当作有效结果并缓存，必须显式报错。
+    return new Response(JSON.stringify({
+        error: 'Invalid DoH request',
+        hint: '本端点是 RFC8484 DoH：请使用 POST + Content-Type: application/dns-message，或 GET ?dns=<base64url>',
+        node: '若需要 JSON 查询请使用 /api/query?domain=example.com&type=A'
+    }, null, 2), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*' }
+    });
 }
 
 // ===================== DNS 查询入口 =====================
-async function handleDnsQuery(rawBuffer, config, ctx, clientIP) {
+// ns：缓存命名空间。'ech' = 注入构造端点，'doh' = 纯净转发端点；两者结果语义不同，绝不共用缓存键。
+async function handleDnsQuery(rawBuffer, config, ctx, clientIP, ns = 'ech') {
     try {
         const query = parseDnsPacket(rawBuffer);
         if (!query?.questions?.length) return forwardQuery(rawBuffer);
         const { id, questions } = query;
+        const echoEdns = !!query.hasEdns;
         const qType = questions[0].type;
         const qName = questions[0].name.toLowerCase().replace(/\.$/, "");
+        // 原样保留客户端发来的大小写：使用 DNS-0x20 随机化的客户端/解析器会校验
+        // 响应 question 与请求逐字节一致，统一转小写会导致其丢弃响应。
+        const rawQName = questions[0].name.replace(/\.$/, "");
+        // 但缓存体是跨客户端共享的，无法同时承载多种大小写；因此只缓存全小写(常规)查询。
+        const caseNeutral = rawQName === rawQName.toLowerCase();
 
         // 假名处理
         if (qName === "cf.ech" || qName === "fb.ech") {
             if (qType === 65) {
                 const randomTtl = Math.floor(Math.random() * (10800 - 7200 + 1)) + 7200;
                 const echRdata = await buildFakeEchResponse(config, qName, clientIP, qName === "cf.ech");
-                return dnsResponse(createMultiAnsResponse(id, qName, 65, echRdata ? [echRdata] : [], echRdata ? randomTtl : 60));
+                return dnsResponse(createMultiAnsResponse(id, qName, 65, echRdata ? [echRdata] : [], echRdata ? randomTtl : 60, echoEdns));
             }
-            return dnsResponse(createMultiAnsResponse(id, qName, qType, [], 3600));
+            return dnsResponse(createMultiAnsResponse(id, qName, qType, [], 3600, echoEdns));
+        }
+
+        // 本端点只会合成 A(1)/AAAA(28)/HTTPS(65) 三类记录。
+        // 其余类型（TXT/MX/NS/SRV/CAA/SOA/PTR…）必须原样转发：否则会被当作 A 解析，
+        // 再按请求方的 qType 打包，产出「类型是 TXT、内容是 4 字节 IPv4」的畸形记录。
+        if (qType !== 1 && qType !== 28 && qType !== 65) {
+            const res = await forwardQuery(rawBuffer);
+            return dnsResponse(await res.arrayBuffer());
         }
 
         const isStaticCF = CF_STATIC_DOMAINS.some(d => qName === d || qName.endsWith("." + d));
         const isStaticMeta = META_DOMAINS.some(d => qName === d || qName.endsWith("." + d));
 
         if (isStaticCF || isStaticMeta) {
-            // 静态域名：读缓存（Map + Cache API 二级），miss 则计算并写回
-            const cKey = `${qName}:${qType}`;
-            const cachedIt = DOH_GET_CACHE.get(cKey);
-            if (cachedIt && Date.now() < cachedIt.expire) return dnsResponse(cachedIt.body);
-            try {
-                const sharedRes = await caches.default.match(`https://dns-cache/doh/${cKey}`);
-                if (sharedRes) {
-                    const sBody = await sharedRes.arrayBuffer();
-                    DOH_GET_CACHE.set(cKey, { body: sBody, expire: Date.now() + DOH_GET_TTL });
-                    return dnsResponse(sBody);
+            // 静态域名：读缓存（Map + Cache API 二级），miss 则计算并写回。
+            // 关键：缓存键不含任何参数维度，因此只有"结果与参数无关"的请求才允许读写缓存，
+            // 否则带 ip4/ip6/no6/enhance/rules/alpn 的请求会污染全站缓存（或反过来被默认结果屏蔽）。
+            // 缓存体固定为 ID=0、不含 OPT 的规范形式：读取时再回写事务 ID、按需追加 OPT。
+            const cacheable = caseNeutral && isCacheableStaticRequest(qName, config);
+            const cKey = cacheable ? `${ns}:${qName}:${qType}` : null;
+            if (cKey) {
+                const cachedIt = DOH_GET_CACHE.get(cKey);
+                if (cachedIt && Date.now() < cachedIt.expire) {
+                    const body = withDnsId(cachedIt.body, id);
+                    return dnsResponse(echoEdns ? appendOpt(body) : body, { 'X-Cache': 'DOH_HIT' });
                 }
-            } catch (e) {}
+                try {
+                    const sharedRes = await caches.default.match(`https://dns-cache/${ns}/${qName}:${qType}`);
+                    if (sharedRes) {
+                        const sBody = await sharedRes.arrayBuffer();
+                        DOH_GET_CACHE.set(cKey, { body: sBody, expire: Date.now() + DOH_GET_TTL });
+                        const body = withDnsId(sBody, id);
+                        return dnsResponse(echoEdns ? appendOpt(body) : body, { 'X-Cache': 'DOH_HIT' });
+                    }
+                } catch (e) {}
+            }
             const result = await resolveDNS(qName, qType === 28 ? 'AAAA' : (qType === 65 ? 'HTTPS' : 'A'), config, clientIP);
-            const outResp = dnsResponseFromResult(id, qName, qType, result);
-            const outBody = await outResp.clone().arrayBuffer();
-            DOH_GET_CACHE.set(cKey, { body: outBody, expire: Date.now() + DOH_GET_TTL });
-            try {
-                await caches.default.put(`https://dns-cache/doh/${cKey}`, new Response(outBody, {
-                    headers: { 'Cache-Control': 'public, max-age=300, s-maxage=300' }
-                }));
-            } catch (e) {}
-            return outResp;
+            const canonical = buildDnsResponseBody(0, rawQName, qType, result, false);
+            if (cKey) {
+                DOH_GET_CACHE.set(cKey, { body: canonical, expire: Date.now() + DOH_GET_TTL });
+                try {
+                    await caches.default.put(`https://dns-cache/${ns}/${qName}:${qType}`, new Response(canonical, {
+                        headers: { 'Cache-Control': 'public, max-age=300, s-maxage=300' }
+                    }));
+                } catch (e) {}
+            }
+            const outBody = withDnsId(canonical, id);
+            return dnsResponse(echoEdns ? appendOpt(outBody) : outBody, cacheable ? { 'X-Cache': 'DOH_MISS' } : null);
         }
 
         // 非静态域名 + HTTPS + 无增强 → 透明转发
@@ -345,21 +421,25 @@ async function handleDnsQuery(rawBuffer, config, ctx, clientIP) {
 
         const resolved = await resolveDNS(qName, qType === 28 ? 'AAAA' : (qType === 65 ? 'HTTPS' : 'A'), config, clientIP);
         if (resolved.error) return forwardQuery(rawBuffer);
-        return dnsResponseFromResult(id, qName, qType, resolved);
+        return dnsResponseFromResult(id, rawQName, qType, resolved, echoEdns);
     } catch (e) {
         console.error(e);
         return forwardQuery(rawBuffer);
     }
 }
 
-function dnsResponseFromResult(id, qName, qType, result) {
+function buildDnsResponseBody(id, qName, qType, result, echoEdns = false) {
     if (qType === 65) {
         const rdata = result.httpsRecord ? [result.httpsRecord] : [];
-        return dnsResponse(createMultiAnsResponse(id, qName, 65, rdata, rdata.length ? 300 : 60));
+        return createMultiAnsResponse(id, qName, 65, rdata, rdata.length ? 300 : 60, echoEdns);
     }
     const bytes = qType === 28 ? ipv6ToBytes : ipToBytes;
-    const answers = (result.answers || []).map(bytes);
-    return dnsResponse(createMultiAnsResponse(id, qName, qType, answers, 300));
+    const answers = (result.answers || []).map(bytes).filter(Boolean);
+    return createMultiAnsResponse(id, qName, qType, answers, 300, echoEdns, result.rcode || 0);
+}
+
+function dnsResponseFromResult(id, qName, qType, result, echoEdns = false) {
+    return dnsResponse(buildDnsResponseBody(id, qName, qType, result, echoEdns));
 }
 
 // ===================== JSON API =====================
@@ -383,6 +463,13 @@ function isCacheableStaticRequest(domain, config) {
     if (config.nocf6 === 'false') return false;       // nocf6=false 放行CF IPv6
     if (config.alpn !== 'h3,h2') return false;        // alpn 影响 HTTPS 记录
     if (config.mandatory !== 'alpn') return false;    // mandatory 影响 HTTPS 记录
+    // ech 决定注入哪份 ECHConfig（buildHttpsRecord 使用 config.echDomain）。
+    // 若漏判，任意人可用 ?ech=<自己的域名> 把自定义 ECH 写进静态域名的共享缓存，
+    // 之后所有用户拿到的 chatgpt.com/github.com 等 HTTPS RR 都会带攻击者的 ECH 配置。
+    if (config.echDomain !== 'cloudflare-ech.com') return false;
+    // 静态 META 域名未显式指定 metaIp4/metaIp6 时（DEFAULT_META_IP 为空），
+    // A/AAAA 与 HTTPS hints 来自带 ECS 的实时上游查询，结果与访问者网段相关，不可跨用户共享。
+    if (isStaticMeta && !config.metaIp4 && !config.metaIp6) return false;
     return true;
 }
 
@@ -543,7 +630,8 @@ async function resolveDNS(domain, type, config, clientIP) {
     const dnsType = type === 'AAAA' ? 28 : 1;
     const data = await queryUpstreamDNS(domain, dnsType, clientIP);
     const answers = data?.Answer?.filter(r => r.type === dnsType).map(r => r.data) || [];
-    return { domain, type, answers, ech: null };
+    // 透传上游 RCODE（3 = NXDOMAIN）；否则不存在的域名会被当成 NODATA 并缓存 300s
+    return { domain, type, answers, ech: null, rcode: data?.Status === 3 ? 3 : 0 };
     }
     // HTTPS 处理
     if (type === 'HTTPS') {
@@ -955,8 +1043,16 @@ async function getBuiltinRulesMap() {
 
 async function matchRule(domain, config) {
    
-    const merged = new Map(await getBuiltinRulesMap());
-    for(const[key,rule] of merged){  rule.ips = rule.ips.flatMap(ip => ip.includes('/') ? getPrefixIPs(ip) : [ip]); }
+    // 必须新建对象：getBuiltinRulesMap() 返回的是全局共享的规则表，
+    // 就地改写会把 CIDR 首次展开的随机结果永久固化，绕过 prefixCache 的 24h 轮换。
+    const merged = new Map();
+    for (const [key, rule] of await getBuiltinRulesMap()) {
+        merged.set(key, {
+            ips: rule.ips.flatMap(ip => ip.includes('/') ? getPrefixIPs(ip) : [ip]),
+            noA: rule.noA,
+            noAAAA: rule.noAAAA
+        });
+    }
     if (config.rules) {
         const user = parseRules(config.rules);
         for (const [k, v] of user) merged.set(k, v);
@@ -1124,17 +1220,31 @@ async function writeCache(cacheKey, text, ttlSeconds) {
  */
 function prescreenIpList(raw) {
     if (!raw) return '';
-    const ips = raw.split(',').map(s => s.trim()).filter(s => s);
+    // JSON 数组形式必须先解析再抽样，否则按逗号切分会残留引号与方括号，
+    // 后续 ipToBytes 得到 [0]，静默返回畸形 A 记录。
+    const isJson = raw.trim().startsWith('[') && raw.trim().endsWith(']');
+    let ips;
+    if (isJson) {
+        try { ips = JSON.parse(raw).map(String).map(s => s.trim()).filter(s => s); }
+        catch { ips = raw.split(',').map(s => s.trim().replace(/^[\s"']+|[\s"']+$/g, '')).filter(s => s); }
+    } else {
+        ips = raw.split(',').map(s => s.trim()).filter(s => s);
+    }
     if (ips.length <= MAX_PRESCREEN) return raw;
-    const shuffled = shuffle([...ips]);
-    return shuffled.slice(0, MAX_PRESCREEN).join(',');
+    const picked = shuffle([...ips]).slice(0, MAX_PRESCREEN);
+    return isJson ? JSON.stringify(picked) : picked.join(',');
 }
 /**
  * HTTPS RR 注入参数
  */
 function injectEnhanceDefaults(params, mandatoryValue) {
     const existingKeys = new Set(params.map(p => p.key));
-    if (!existingKeys.has('mandatory')) params.push({ key: 'mandatory', val: mandatoryValue || 'alpn' });
+    if (existingKeys.has('mandatory')) return;
+    // RFC9460 §8：mandatory 列出记录中不存在的键时，客户端必须忽略整条 HTTPS 记录。
+    // 必须与本记录实际存在的参数取交集（如 ?mandatory=port 但记录无 port 时不应写入）。
+    const val = (mandatoryValue || 'alpn')
+        .split(',').map(s => s.trim()).filter(k => k && existingKeys.has(k)).join(',');
+    if (val) params.push({ key: 'mandatory', val });
   //  if (!existingKeys.has('no-default-alpn')) params.push({ key: 'no-default-alpn', val: '' });
 }
 
@@ -1206,11 +1316,19 @@ async function handleLogsRequest() {
             }
         };
 
-        // 订阅缓存详情
+        // 订阅缓存详情（脱敏：订阅链接常内嵌 token/密钥，/log 是公开端点）
+        const maskUrl = (u) => {
+            try {
+                const x = new URL(u);
+                return x.origin + x.pathname + (x.search ? '?<redacted>' : '');
+            } catch {
+                return String(u).split('?')[0] + '?<redacted>';
+            }
+        };
         const subDetails = [];
         for (const [url, entry] of subCache.entries()) {
             subDetails.push({
-                url: url,
+                url: maskUrl(url),
                 cachedAt: toBeijingTime(entry.expire - SUB_CACHE_TTL),
                 expiresIn: Math.max(0, (entry.expire - now) / 1000).toFixed(0) + 's',
                 contentLength: entry.content ? entry.content.length : 0,
@@ -1229,11 +1347,8 @@ async function handleLogsRequest() {
         return json(payload);
     } catch (e) {
         // 捕获异常并返回错误信息，方便定位
-        return json({
-            error: e.message,
-            stack: e.stack,
-            note: 'Check top-level constants: workerStartTime, hostsCache, prefixCache, cnDomainSet, etc.'
-        }, 500);
+        // 公开端点不回显堆栈
+        return json({ error: 'log handler failed', detail: e.message }, 500);
     }
 }
 /**
@@ -1266,8 +1381,8 @@ async function resolveMultiDomainToIps(domainsStr, type, clientIP, doShuffle = t
     if(limit >0 && ipArray.length > limit){
         ipArray = ipArray.slice(0,limit);
     }
-    if (type === 1) return ipArray.map(ipToBytes);
-    else return ipArray.map(ipv6ToBytes);
+    if (type === 1) return ipArray.map(ipToBytes).filter(Boolean);
+    else return ipArray.map(ipv6ToBytes).filter(Boolean);
 }
 
 /**
@@ -1688,29 +1803,52 @@ function parseDnsPacket(buf) {
         labels.push(new TextDecoder().decode(buf.slice(offset, offset + len)));
         offset += len;
     }
+    if (offset + 4 > buf.byteLength) return null;
+    const qType = v.getUint16(offset);
+    offset += 4;
+    // 探测附加区是否携带 EDNS0 OPT（用于决定响应是否回显 OPT，RFC6891）
+    let hasEdns = false;
+    const arCount = v.getUint16(10);
+    for (let i = 0; i < arCount && offset < buf.byteLength; i++) {
+        while (offset < buf.byteLength) {
+            const l = v.getUint8(offset);
+            if (l === 0) { offset += 1; break; }
+            if ((l & 0xC0) === 0xC0) { offset += 2; break; }
+            offset += 1 + l;
+        }
+        if (offset + 10 > buf.byteLength) break;
+        const rtype = v.getUint16(offset);
+        const rdlen = v.getUint16(offset + 8);
+        offset += 10 + rdlen;
+        if (rtype === 41) { hasEdns = true; break; }
+    }
     return {
         id: v.getUint16(0),
-        questions: [{ name: labels.join('.'), type: v.getUint16(offset) }]
+        hasEdns,
+        questions: [{ name: labels.join('.'), type: qType }]
     };
 }
 
 /**
  * 构造多答案 DNS 响应报文
  */
-function createMultiAnsResponse(id, qn, qt, rds, ttl = 3600) {
+function createMultiAnsResponse(id, qn, qt, rds, ttl = 3600, echoEdns = false, rcode = 0) {
     const encodedName = encodeDnsName(qn);
     const questionLen = 12 + encodedName.length + 4;
     const pointer = 0xC000 | 12;
-    let totalLen = questionLen;
+    // 客户端带 EDNS0 时回显一条空 OPT（owner=root,type=41,class=1232,ttl=0,rdlen=0），共 11 字节。
+    // 不做 DNSSEC，因此 DO 位保持 0，不虚报 AD。
+    const OPT_LEN = echoEdns ? 11 : 0;
+    let totalLen = questionLen + OPT_LEN;
     for (const r of rds) totalLen += 2 + 2 + 2 + 4 + 2 + r.length;
     const buf = new Uint8Array(totalLen);
     const v = new DataView(buf.buffer);
     v.setUint16(0, id);
-    v.setUint16(2, 0x8180);
+    v.setUint16(2, 0x8180 | (rcode & 0x0F));   // QR=1,RD=1,RA=1 + RCODE
     v.setUint16(4, 1);
     v.setUint16(6, rds.length);
     v.setUint16(8, 0);
-    v.setUint16(10, 0);
+    v.setUint16(10, echoEdns ? 1 : 0);
     let offset = 12;
     buf.set(encodedName, offset); offset += encodedName.length;
     v.setUint16(offset, qt); offset += 2;
@@ -1722,6 +1860,13 @@ function createMultiAnsResponse(id, qn, qt, rds, ttl = 3600) {
         v.setUint32(offset, ttl); offset += 4;
         v.setUint16(offset, r.length); offset += 2;
         buf.set(r, offset); offset += r.length;
+    }
+    if (echoEdns) {
+        v.setUint8(offset, 0); offset += 1;        // root name
+        v.setUint16(offset, 41); offset += 2;      // TYPE=OPT
+        v.setUint16(offset, 1232); offset += 2;    // CLASS=UDP payload size
+        v.setUint32(offset, 0); offset += 4;       // ext-rcode/version/flags(DO=0)
+        v.setUint16(offset, 0); offset += 2;       // RDLEN=0
     }
     return buf.buffer;
 }
@@ -1743,16 +1888,53 @@ async function forwardQuery(body) {
 }
 
 /**
+ * 追加一条空 EDNS0 OPT（RFC6891）。
+ * 缓存体一律以"不含 OPT"的规范形式存储，响应时再按本次请求是否携带 EDNS 决定是否追加，
+ * 否则先到的 EDNS 客户端会让缓存把 OPT 带给从未请求它的客户端（且反向也会丢 OPT）。
+ */
+function appendOpt(buffer) {
+    const src = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+    if (src.byteLength < 12) return buffer;
+    const out = new Uint8Array(src.byteLength + 11);
+    out.set(src, 0);
+    let o = src.byteLength;
+    out[o++] = 0;                          // root name
+    out[o++] = 0; out[o++] = 41;           // TYPE = OPT
+    out[o++] = 0x04; out[o++] = 0xd0;      // CLASS = 1232 (UDP payload size)
+    out[o++] = 0; out[o++] = 0; out[o++] = 0; out[o++] = 0; // ext-rcode / version / flags(DO=0)
+    out[o++] = 0; out[o++] = 0;            // RDLEN = 0
+    const dv = new DataView(out.buffer);
+    dv.setUint16(10, dv.getUint16(10) + 1); // ARCOUNT++
+    return out;
+}
+
+/**
+ * 回写事务 ID。
+ * RFC 8484/RFC 1035 要求响应的事务 ID 与查询一致；缓存体是"首次请求"的字节，
+ * 直接复用会让后续客户端收到不匹配的 ID 而被判为无效响应（AdGuard Home/dnsproxy 等会丢弃）。
+ * 返回副本，绝不就地修改缓存体。
+ */
+function withDnsId(buffer, id) {
+    if (id === undefined || id === null) return buffer;
+    const src = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+    if (src.byteLength < 12) return buffer;
+    const out = src.slice();
+    out[0] = (id >>> 8) & 0xff;
+    out[1] = id & 0xff;
+    return out;
+}
+
+/**
  * 返回二进制 DNS 响应
  */
-function dnsResponse(buffer) {
-    return new Response(buffer, {
-        headers: { 
-            'Content-Type': 'application/dns-message', 
-            'Access-Control-Allow-Origin': '*',
-            'Cache-Control': 'public, max-age=300, s-maxage=300'
-        }
-    });
+function dnsResponse(buffer, extraHeaders = null) {
+    const headers = {
+        'Content-Type': 'application/dns-message',
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 'public, max-age=300, s-maxage=300'
+    };
+    if (extraHeaders) Object.assign(headers, extraHeaders);
+    return new Response(buffer, { headers });
 }
 /**
  * 兜底记录解析：直接查询上游并返回原始答案。
@@ -1857,14 +2039,39 @@ async function ensureCNDomainSet() {
 function isCNDomain(domain) {
     // cnDomainSet 理论上已被 ensureCNDomainSet 同步初始化，此处兜底防御
     if (!cnDomainSet) return false;
-    // cnDomainSet 在 ensureCNDomainSet 中已保证非空，直接使用
-    if (cnDomainSet.has(domain)) return true;
-    for (const item of cnDomainSet) {
-        if (item.startsWith('.') && domain.endsWith(item)) {
-            return true;
-        }
+    // 远端 direct-list.txt 是纯域名列表（不含前导点）。必须逐级剥离标签匹配后缀，
+    // 否则 www.taobao.com 这类子域名永不判为国内域名，分流形同虚设。
+    // 逐级查询同时把每次查询的 O(n) 全量扫描降为 O(标签数) 次哈希查找。
+    for (let d = domain; ; ) {
+        if (cnDomainSet.has(d) || cnDomainSet.has('.' + d)) return true;
+        const i = d.indexOf('.');
+        if (i === -1) return false;
+        d = d.slice(i + 1);
     }
-    return false;
+}
+
+/**
+ * 从 IPv4 CIDR 生成随机可用地址（排除网络号与广播地址）
+ * @param {string} prefixStr - 如 "1.2.3.0/24"
+ * @returns {string[]} 随机 IPv4 地址数组
+ */
+function generateRandomIPv4(prefixStr) {
+    const [addr, bitsStr] = prefixStr.split('/');
+    const bits = bitsStr === undefined ? 32 : parseInt(bitsStr, 10);
+    if (!ipToBytes(addr)) return [];          // 非法 IPv4 直接放弃
+    const base = ipToLong(addr);
+    if (isNaN(bits) || bits < 0 || bits > 32) return [];
+    const size = 2 ** (32 - bits);
+    if (size <= 2) return [];
+    const hostBits = 32 - bits;
+    const mask = hostBits >= 32 ? 0 : ((1 << hostBits) - 1) >>> 0;
+    const net = (base & ~mask) >>> 0;
+    const out = [];
+    for (let i = 0; i < RANDOM_IPV6_COUNT; i++) {
+        const n = (net + 1 + Math.floor(Math.random() * (size - 2))) >>> 0;
+        out.push(bytesToIp(new Uint8Array([n >>> 24, (n >>> 16) & 255, (n >>> 8) & 255, n & 255])));
+    }
+    return out;
 }
 
 /**
@@ -1964,7 +2171,9 @@ function getPrefixIPs(prefixStr) {
     if (cached && Date.now() < cached.expire) {
         return cached.ips;
     }
-    const ips = generateRandomIPv6(prefixStr);
+    // IPv4 CIDR：generateRandomIPv6 会把 "1.2.3.0" 按十六进制解析成 1n，
+    // 再当 IPv6 前缀随机出不可达地址，必须单独处理。
+    const ips = prefixStr.includes(':') ? generateRandomIPv6(prefixStr) : generateRandomIPv4(prefixStr);
     prefixCache.set(prefixStr, { ips, expire: Date.now() + PREFIX_CACHE_TTL });
     return ips;
 }
@@ -2046,7 +2255,18 @@ function ipv6ToBigInt(ip) {
     return p.reduce((a, b) => (a << 16n) + BigInt(parseInt(b || '0', 16)), 0n);
 }
 
-function ipToBytes(ip) { return new Uint8Array(ip.split('.').map(Number)); }
+// 返回 4 字节；非法输入返回 null（调用方需过滤），避免静默产出 rdlength 错误的畸形 rdata
+function ipToBytes(ip) {
+    const p = String(ip).split('.');
+    if (p.length !== 4) return null;
+    const b = new Uint8Array(4);
+    for (let i = 0; i < 4; i++) {
+        const n = Number(p[i]);
+        if (!Number.isInteger(n) || n < 0 || n > 255) return null;
+        b[i] = n;
+    }
+    return b;
+}
 
 function ipv6ToBytes(ip) {
     let p = ip.split(':');
@@ -2055,6 +2275,10 @@ function ipv6ToBytes(ip) {
         const lp = l ? l.split(':') : [];
         const rp = r ? r.split(':') : [];
         p = [...lp, ...Array(8 - lp.length - rp.length).fill('0'), ...rp];
+    }
+    if (p.length !== 8) return null;
+    for (const v of p) {
+        if (v !== '' && !/^[0-9a-fA-F]{1,4}$/.test(v)) return null;
     }
     const b = new Uint8Array(16);
     p.forEach((v, i) => {
@@ -2144,6 +2368,14 @@ async function activeProbeOwner(domain, ctx, clientIP) {
             }
         }
     } catch {}
+    // 归属探测缓存的键由请求域名决定，可被外部用随机域名构造；
+    // Map 保序，超限时按插入序淘汰最老的一批，避免 isolate 内存无界增长。
+    if (cacheMap.size > 20000) {
+        for (const k of cacheMap.keys()) {
+            cacheMap.delete(k);
+            if (cacheMap.size <= 15000) break;
+        }
+    }
     cacheMap.set(cacheKey, { value: null, expire: Date.now() + 60000 });
     return null;
 }

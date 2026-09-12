@@ -24,6 +24,14 @@
 | `/doh`        | DoH 端点，纯净上游转发，不作任何修改  |
 | `/log`           | 日志系统。  
 ---
+
+> **端点行为说明**
+> - `/ech`、`/doh`、`/dns-query` 均为标准 **RFC8484 DoH 端点**：只接受 `POST` + `Content-Type: application/dns-message`，或 `GET ?dns=<base64url>`。缺少 `?dns=` 的 GET 返回 **400**（旧版返回 200 `OK`，会让配置错误的客户端把空响应当成有效结果）。需要 JSON 查询请用 `/api/query`。
+> - `/ech` 只合成 **A / AAAA / HTTPS** 三类记录；其余类型（TXT/MX/NS/SRV/CAA/SOA…）原样转发上游，不会被按 A 解析成畸形记录。
+> - 未知路径返回 **404 JSON**（旧版会把任意路径都渲染成首页）；支持 `OPTIONS` CORS 预检。
+> - 事务 ID 与 EDNS0 OPT 一律在响应时按**当前请求**回写/追加，缓存体固定为「ID=0 且不含 OPT」的规范形式：不会把某个客户端的事务 ID、OPT（含 COOKIE）或 `ip4`/`ip6`/`no6`/`enhance`/`ech` 等参数的结果带给其他客户端。
+> - 缓存只用于「结果与参数无关」的静态域名请求；`/doh`(纯净转发) 与 `/ech`(注入构造) 使用各自独立的缓存命名空间。
+> - 上游返回 NXDOMAIN 时透传 RCODE=3，不再被吞成 NODATA。
 ## Enhance Mode 功能与使用
 增强模式是 DoH-ECH 的一项高级功能，允许您为网站主动注入连接优化参数，例如强制 QUIC (HTTP/3)、提供自定义 IP 提示 (IP hints) 以及精确屏蔽 A/AAAA 记录。这不仅能加速网站访问，还能解决某些浏览器因协议偏好导致的连接失败问题。
 

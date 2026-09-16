@@ -1,0 +1,59 @@
+name: Sync ADBlock update feed
+
+# Publishes the newest wxcvm/AdAway release (the signed APK + its manifest)
+# as an update-feed entry in THIS repository, using only the workflow token.
+# The app reads this feed (UpdateModel.RELEASES_API), so a missing or expired
+# DOH_ECH_TOKEN in the app repo can no longer freeze updates: this poller runs
+# hourly and can be triggered by hand.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 * * * *'
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish the newest ADBlock release into the feed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api 'repos/wxcvm/AdAway/releases?per_page=50' > /tmp/rels.json
+          read -r APP_TAG VER CODE < <(python3 - <<'PY'
+          import json, re, urllib.request
+          rels = json.load(open('/tmp/rels.json'))
+          def bn(tag):
+              m = re.search(r'(\d+)$', tag or '')
+              return int(m.group(1)) if m else -1
+          cands = [r for r in rels if not r['draft']
+                   and any(a['name'] == 'ADBlock-latest.apk' for a in r['assets'])]
+          if not cands:
+              raise SystemExit('no ADBlock release with an APK asset')
+          cands.sort(key=lambda r: bn(r['tag_name']))
+          best = cands[-1]
+          ver = best['tag_name'].lstrip('v')
+          code = 100000 + bn(best['tag_name'])
+          for a in best['assets']:
+              if a['name'] == 'manifest.json':
+                  req = urllib.request.Request(a['browser_download_url'], headers={'User-Agent': 'feed-sync'})
+                  m = json.load(urllib.request.urlopen(req))
+                  ver = m.get('version', ver)
+                  code = m.get('versionCode', code)
+          print(best['tag_name'], ver, code)
+          PY
+          )
+          echo "newest app release: $APP_TAG -> feed $VER (versionCode $CODE)"
+          if gh release view "$VER" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "feed already publishes $VER"
+            exit 0
+          fi
+          rm -rf /tmp/feed && mkdir -p /tmp/feed
+          gh release download "$APP_TAG" --repo wxcvm/AdAway --pattern ADBlock-latest.apk --dir /tmp/feed
+          printf '{"version":"%s","versionCode":%s,"changelog":"ADBlock %s"}' "$VER" "$CODE" "$VER" > /tmp/feed/manifest.json
+          gh release create "$VER" /tmp/feed/ADBlock-latest.apk /tmp/feed/manifest.json \
+            --repo "$GITHUB_REPOSITORY" --title "ADBlock $VER" --latest \
+            --notes "自动同步自 wxcvm/AdAway $APP_TAG（versionCode $CODE）"

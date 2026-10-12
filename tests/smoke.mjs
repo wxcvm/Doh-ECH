@@ -5,6 +5,7 @@ import worker from '../_worker.js';
 const calls = [];
 const cache = new Map();
 let simulateBinaryOutage = false;
+let binaryReplyOverride = null;
 globalThis.caches = {
   default: {
     async match(key) { return cache.get(key instanceof Request ? key.url : String(key))?.clone() || undefined; },
@@ -22,6 +23,11 @@ globalThis.fetch = async (input, init = {}) => {
   }
   if ((init.method || 'GET') === 'POST' && init.body) {
     if (simulateBinaryOutage) return new Response('temporarily unavailable', { status: 503 });
+    if (binaryReplyOverride) {
+      return new Response(binaryReplyOverride(Buffer.from(init.body)), {
+        headers: { 'Content-Type': 'application/dns-message' }
+      });
+    }
     if (url.hostname === 'dns.alidns.com') {
       return new Response('not a DNS response', { headers: { 'Content-Type': 'text/html' } });
     }
@@ -30,7 +36,6 @@ globalThis.fetch = async (input, init = {}) => {
     reply.writeUInt16BE(0x8180, 2);
     reply.writeUInt16BE(0, 6);
     reply.writeUInt16BE(0, 8);
-    reply.writeUInt16BE(0, 10);
     return new Response(reply, { headers: { 'Content-Type': 'application/dns-message' } });
   }
   if (url.searchParams.has('name') && url.searchParams.has('type')) {
@@ -133,4 +138,82 @@ assert.equal(servfail.readUInt16BE(0), 0x1234, 'SERVFAIL must preserve transacti
 assert.equal(servfail.readUInt16BE(2) & 0x000f, 2, 'outage must return DNS SERVFAIL, not HTTP error bytes');
 assert.equal(servfail.readUInt16BE(4), 1, 'SERVFAIL must preserve question count');
 
-console.log('Doh-ECH smoke tests passed');
+// EDNS/DNSSEC forwarding must retain valid section counts, including during outages.
+const ednsQuery = question('example.net', 1, { ednsDo: true });
+const ednsResponse = await request('/ech', {
+  method: 'POST', headers: { 'Content-Type': 'application/dns-message' }, body: ednsQuery
+});
+const ednsWire = Buffer.from(await ednsResponse.arrayBuffer());
+assert.equal(ednsWire.readUInt16BE(10), 1, 'valid upstream OPT must be preserved');
+assert.deepEqual(ednsWire.subarray(12), ednsQuery.subarray(12));
+simulateBinaryOutage = true;
+for (const endpoint of ['/doh', '/ech']) {
+  const response = await request(endpoint, {
+    method: 'POST', headers: { 'Content-Type': 'application/dns-message' }, body: ednsQuery
+  });
+  const packet = Buffer.from(await response.arrayBuffer());
+  assert.equal(packet.readUInt16BE(2) & 15, 2, 'EDNS outage must return SERVFAIL');
+  assert.equal(packet.readUInt16BE(0), 0x1234);
+  assert.equal(packet.readUInt16BE(4), 1);
+  assert.equal(packet.readUInt16BE(10), 0);
+  assert.equal(packet.length, question('example.net').length, 'no uncounted OPT bytes may follow question');
+  assert.deepEqual(packet.subarray(12), question('example.net').subarray(12));
+}
+simulateBinaryOutage = false;
+
+function answerPacket(query) {
+  const headerAndQuestion = Buffer.from(query);
+  headerAndQuestion.writeUInt16BE(0x8180, 2);
+  headerAndQuestion.writeUInt16BE(1, 6);
+  // Compressed owner name, A/IN, TTL 60, four-byte address.
+  return Buffer.concat([headerAndQuestion, Buffer.from([
+    0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 203, 0, 113, 17
+  ])]);
+}
+const forwardingOptions = {
+  method: 'POST', headers: { 'Content-Type': 'application/dns-message' }, body: question('example.net')
+};
+binaryReplyOverride = answerPacket;
+const validAnswer = Buffer.from(await (await request('/doh', forwardingOptions)).arrayBuffer());
+assert.equal(validAnswer.readUInt16BE(6), 1, 'valid compressed answer must not be rejected');
+assert.deepEqual(validAnswer.subarray(-4), Buffer.from([203, 0, 113, 17]));
+
+const malformedReplies = [
+  ['missing question', query => answerPacket(query).subarray(0, 12)],
+  ['truncated RR', query => answerPacket(query).subarray(0, -1)],
+  ['incorrect question count', query => {
+    const packet = answerPacket(query); packet.writeUInt16BE(2, 4); return packet;
+  }],
+  ['mismatched name', query => {
+    const packet = answerPacket(query); packet[13] = 120; return packet;
+  }],
+  ['mismatched type', query => {
+    const packet = answerPacket(query); packet.writeUInt16BE(28, query.length - 4); return packet;
+  }],
+  ['mismatched class', query => {
+    const packet = answerPacket(query); packet.writeUInt16BE(3, query.length - 2); return packet;
+  }],
+  ['mismatched transaction ID', query => {
+    const packet = answerPacket(query); packet.writeUInt16BE(0x4321, 0); return packet;
+  }],
+  ['mismatched opcode', query => {
+    const packet = answerPacket(query); packet.writeUInt16BE(0x8980, 2); return packet;
+  }],
+  ['compression loop', query => {
+    const packet = answerPacket(query); packet[query.length + 1] = query.length; return packet;
+  }],
+  ['out-of-bounds pointer', query => {
+    const packet = answerPacket(query); packet[query.length] = 255; packet[query.length + 1] = 255; return packet;
+  }],
+  ['unaccounted trailing bytes', query => Buffer.concat([answerPacket(query), Buffer.from([0])])]
+];
+for (const [description, makeReply] of malformedReplies) {
+  binaryReplyOverride = makeReply;
+  const response = await request('/doh', forwardingOptions);
+  const packet = Buffer.from(await response.arrayBuffer());
+  assert.equal(packet.readUInt16BE(2) & 15, 2, `${description} must be rejected with SERVFAIL`);
+  assert.equal(packet.length, question('example.net').length, `${description}: fallback must have complete question`);
+}
+binaryReplyOverride = null;
+
+console.log('Doh-ECH smoke tests passed (EDNS outage and 11 malformed upstream regressions included)');

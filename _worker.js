@@ -1878,6 +1878,7 @@ function parseDnsPacket(buf) {
     const qType = v.getUint16(offset);
     const qclass = v.getUint16(offset + 2);
     offset += 4;
+    const questionEnd = offset;
     // 探测附加区是否携带 EDNS0 OPT（用于决定响应是否回显 OPT，RFC6891）
     let hasEdns = false;
     let dnssecOk = false;
@@ -1904,7 +1905,7 @@ function parseDnsPacket(buf) {
         hasEdns,
         dnssecOk,
         questionCompressed,
-        questionEnd: offset,
+        questionEnd,
         questions: [{ name: labels.join('.'), type: qType, qclass }]
     };
 }
@@ -1954,6 +1955,63 @@ function createMultiAnsResponse(id, qn, qt, rds, ttl = 3600, echoEdns = false, r
 /**
  * 转发二进制 DNS 查询（多上游竞速，带超时）
  */
+// Validate section boundaries and compression before trusting upstream wire data.
+// RDATA remains opaque so unknown record types can still be forwarded unchanged.
+function inspectDnsWire(buffer) {
+    try {
+        const bytes = new Uint8Array(buffer);
+        const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+        if (bytes.length < 12 || bytes.length > 65535) return null;
+        function readName(start) {
+            let cursor = start, end = null, length = 1, compressed = false;
+            const labels = [], visited = new Set();
+            while (true) {
+                if (cursor >= bytes.length || visited.has(cursor)) throw new Error('invalid DNS name');
+                visited.add(cursor);
+                const size = bytes[cursor];
+                if ((size & 0xc0) === 0xc0) {
+                    if (cursor + 1 >= bytes.length) throw new Error('truncated DNS pointer');
+                    if (end === null) end = cursor + 2;
+                    compressed = true;
+                    cursor = ((size & 0x3f) << 8) | bytes[cursor + 1];
+                    continue;
+                }
+                if (size & 0xc0) throw new Error('invalid DNS label');
+                cursor++;
+                if (size === 0) return { end: end ?? cursor, key: JSON.stringify(labels), compressed };
+                length += size + 1;
+                if (length > 255 || cursor + size > bytes.length) throw new Error('truncated DNS label');
+                labels.push(String.fromCharCode(...bytes.subarray(cursor, cursor + size))
+                    .replace(/[A-Z]/g, c => c.toLowerCase()));
+                cursor += size;
+            }
+        }
+        let offset = 12;
+        const questions = [];
+        for (let i = 0; i < view.getUint16(4); i++) {
+            const name = readName(offset);
+            offset = name.end;
+            if (offset + 4 > bytes.length) return null;
+            questions.push({ key: name.key, compressed: name.compressed,
+                type: view.getUint16(offset), qclass: view.getUint16(offset + 2) });
+            offset += 4;
+        }
+        const questionEnd = offset;
+        const recordCount = view.getUint16(6) + view.getUint16(8) + view.getUint16(10);
+        for (let i = 0; i < recordCount; i++) {
+            offset = readName(offset).end;
+            if (offset + 10 > bytes.length) return null;
+            const rdlength = view.getUint16(offset + 8);
+            offset += 10 + rdlength;
+            if (offset > bytes.length) return null;
+        }
+        if (offset !== bytes.length) return null;
+        return { id: view.getUint16(0), flags: view.getUint16(2), questions, questionEnd };
+    } catch {
+        return null;
+    }
+}
+
 async function forwardQuery(body) {
     const reqInit = {
         method: 'POST',
@@ -1962,6 +2020,7 @@ async function forwardQuery(body) {
     };
     const query = new Uint8Array(body);
     const queryId = query.byteLength >= 2 ? new DataView(query.buffer, query.byteOffset, query.byteLength).getUint16(0) : 0;
+    const parsedQuery = inspectDnsWire(body);
     // Race valid complete DNS replies, not just the first HTTP-200 header.
     // A temporary DNS SERVFAIL is not a successful upstream resolution.
     const promises = UPSTREAM_DNS_LIST.map(url =>
@@ -1971,10 +2030,16 @@ async function forwardQuery(body) {
             }
             const packet = await res.arrayBuffer();
             if (packet.byteLength < 12 || packet.byteLength > 65535) throw new Error('bad DNS packet length');
-            const header = new DataView(packet);
-            const flags = header.getUint16(2);
-            if (header.getUint16(0) !== queryId || !(flags & 0x8000) ||
-                [2, 5].includes(flags & 0x0f)) throw new Error('invalid DNS reply or SERVFAIL');
+            const reply = inspectDnsWire(packet);
+            if (!parsedQuery || !reply || reply.id !== queryId || !(reply.flags & 0x8000) ||
+                (reply.flags & 0x7800) !== (parsedQuery.flags & 0x7800) ||
+                [2, 5].includes(reply.flags & 0x0f) ||
+                reply.questions.length !== parsedQuery.questions.length ||
+                reply.questions.some((question, i) => question.key !== parsedQuery.questions[i].key ||
+                    question.type !== parsedQuery.questions[i].type ||
+                    question.qclass !== parsedQuery.questions[i].qclass)) {
+                throw new Error('invalid DNS reply or SERVFAIL');
+            }
             return new Response(packet, {
                 headers: { 'Content-Type': 'application/dns-message' }
             });
@@ -1985,11 +2050,9 @@ async function forwardQuery(body) {
     } catch {
         // Do not turn a 503 HTML page into HTTP 200 application/dns-message.
         // Return a valid SERVFAIL packet with the original uncompressed question.
-        const parsed = (() => { try { return parseDnsPacket(body); } catch { return null; } })();
-        const qCount = query.byteLength >= 6 ? (query[4] << 8) | query[5] : 0;
-        const preserveQuestion = parsed && !parsed.questionCompressed && qCount === 1 &&
-            parsed.questionEnd <= query.byteLength;
-        const output = preserveQuestion ? query.slice(0, parsed.questionEnd) : new Uint8Array(12);
+        const preserveQuestion = parsedQuery && parsedQuery.questions.length === 1 &&
+            !parsedQuery.questions[0].compressed;
+        const output = preserveQuestion ? query.slice(0, parsedQuery.questionEnd) : new Uint8Array(12);
         if (!preserveQuestion) output.set(query.subarray(0, Math.min(2, query.byteLength)), 0);
         const view = new DataView(output.buffer);
         const requestedRd = query.byteLength > 3 && (query[2] & 1) ? 0x0100 : 0;

@@ -6,8 +6,8 @@ const calls = [];
 const cache = new Map();
 globalThis.caches = {
   default: {
-    async match(key) { return cache.get(String(key))?.clone() || undefined; },
-    async put(key, response) { cache.set(String(key), response.clone()); }
+    async match(key) { return cache.get(key instanceof Request ? key.url : String(key))?.clone() || undefined; },
+    async put(key, response) { cache.set(key instanceof Request ? key.url : String(key), response.clone()); }
   }
 };
 globalThis.fetch = async (input, init = {}) => {

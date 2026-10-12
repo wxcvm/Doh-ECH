@@ -1,0 +1,25 @@
+name: DoH security regression tests
+
+on:
+  pull_request:
+    paths:
+      - '_worker.js'
+      - 'tests/**'
+      - '.github/workflows/doh-tests.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Verify Worker JavaScript syntax
+        run: node --experimental-default-type=module --check _worker.js
+      - name: Run no-network DoH smoke tests
+        run: node --experimental-default-type=module tests/smoke.mjs

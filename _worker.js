@@ -43,7 +43,9 @@ const IPV4_ONLY_DOMAINS = ["twitter.com", "x.com", "t.co", "twimg.com"];//只支
 //Cloudflare 配置
 const DEFAULT_CF_IP = "172.64.100.1,104.27.100.1,104.25.100.1,104.21.100.1,172.67.100.1,104.18.10.118";//默认CF优选IPv4(首选实测218ms;多IP返回,客户端自动容错切换)
 const DEFAULT_CF_IP6 = "";//默认CF优选IPv6
-const CF_STATIC_DOMAINS = ["twimg.com", "twitter.com", "x.com", "t.co","cloudflare-dns.com", "pages.dev", "workers.dev", "cloudflare.com","chatgpt.com", "openai.com", "oaistatic.com", "oaiusercontent.com","discord.com", "discordapp.com","shopify.com", "linear.app", "perplexity.ai", "midjourney.com", "cloudinary.com","github.com", "www.github.com", "api.github.com", "raw.githubusercontent.com","netflix.com", "spotify.com"];//不查询-直接返回优选结果的CF域名列表(均为实测归属CF且支持ECH)
+// Only Cloudflare-operated domains are force-mapped by default. Other sites use real upstream DNS;
+// opt-in best=true may still select a preferred address after an ownership check.
+const CF_STATIC_DOMAINS = ["cloudflare-dns.com", "pages.dev", "workers.dev", "cloudflare.com"];
 //Meta 配置
 const DEFAULT_META_IP = "";//默认META优选IP
 const META_DOMAINS = ["facebook.com", "messenger.com", "instagram.com","whatsapp.com", "fb.com", "meta.com"];//不查询-直接返回优选结果的META域名列表
@@ -153,12 +155,21 @@ function buildConfig(url, headers = null) {
     return config;
 }
 // ===================== Worker 入口 =====================
+// Once-per-isolate warmup: avoid starting three independent tasks for every DNS query.
+let nextWarmupAt = 0;
+function scheduleRuntimeWarmup(ctx) {
+    const now = Date.now();
+    if (now < nextWarmupAt) return;
+    nextWarmupAt = now + 60_000;
+    ctx.waitUntil(Promise.allSettled([
+        ensureCNDomainSet(),
+        fetchRealEch('cloudflare-ech.com', ''),
+        getBuiltinRulesMap()
+    ]));
+}
 export default {
     async fetch(req, env, ctx) {
-        // 异步预热国内域名列表/CF ECH配置/hosts文件
-        ctx.waitUntil(ensureCNDomainSet());
-        ctx.waitUntil(fetchRealEch('cloudflare-ech.com', ''));
-         ctx.waitUntil(getBuiltinRulesMap());
+        scheduleRuntimeWarmup(ctx);
         const url = new URL(req.url);
         // 浏览器端 JS 客户端跨域 POST application/dns-message 会先发 OPTIONS 预检
         if (req.method === 'OPTIONS') {
@@ -172,7 +183,13 @@ export default {
                 }
             });
         }
-        if (url.pathname === '/log') {return handleLogsRequest();}
+        if (url.pathname === '/log') {
+            // Debug information is private: fail closed if no admin token is configured.
+            if (!env?.DOH_ADMIN_TOKEN || req.headers.get('Authorization') !== 'Bearer ' + env.DOH_ADMIN_TOKEN) {
+                return new Response('Not Found', { status: 404 });
+            }
+            return handleLogsRequest();
+        }
         if (url.pathname === '/sub.txt') {
             // CF 优选 IP 订阅（配合 sub=ip-https://... 参数使用）
             const subContent = [
@@ -185,9 +202,9 @@ export default {
             });
         }
         const clientIP = url.searchParams.get('clientIp') || req.headers.get('X-ClientIP') || req.headers.get('CF-Connecting-IP') || '1.2.4.8';
-        if (url.pathname === '/api/query') return handleApiQuery(url, clientIP);
-        if (url.pathname === '/ech' || url.pathname === '/dns-query') return handleDoHRequest(req, true, ctx, clientIP);
-        if (url.pathname === '/doh') return handleDoHRequest(req, false, ctx, clientIP);
+        if (url.pathname === '/api/query') return handleApiQuery(url, clientIP, env);
+        if (url.pathname === '/ech' || url.pathname === '/dns-query') return handleDoHRequest(req, true, ctx, clientIP, env);
+        if (url.pathname === '/doh') return handleDoHRequest(req, false, ctx, clientIP, env);
         if (url.pathname === '/' || url.pathname === '/index.html') {
             return new Response(getHtml(), { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'public, max-age=3600, s-maxage=3600' } });
         }
@@ -196,7 +213,7 @@ export default {
         const ct = (req.headers.get('Content-Type') || '').toLowerCase();
         if ((req.method === 'POST' && ct.includes('application/dns-message')) ||
             (req.method === 'GET' && url.searchParams.get('dns'))) {
-            return handleDoHRequest(req, true, ctx, clientIP);
+            return handleDoHRequest(req, true, ctx, clientIP, env);
         }
         return new Response(JSON.stringify({
             error: 'Not Found',
@@ -212,53 +229,82 @@ export default {
         ctx.waitUntil(ensureCNDomainSet());
         ctx.waitUntil(fetchRealEch('cloudflare-ech.com', ''));
         ctx.waitUntil(getBuiltinRulesMap());
-        // 预热 Edge 缓存 + 静态响应缓存 + DoH GET 缓存
-        try {
-            const base = `https://dohech.dpdns.org/api/query`;
-            await Promise.allSettled([
-                fetch(`${base}?domain=example.com&type=A&clientIp=1.2.4.8`),
-                fetch(`${base}?domain=taobao.com&type=A&clientIp=1.2.4.8`),
-                fetch(`${base}?domain=twitter.com&type=HTTPS&clientIp=1.2.4.8`),
-                fetch(`${base}?domain=chatgpt.com&type=HTTPS&clientIp=1.2.4.8`),
-                fetch(`${base}?domain=github.com&type=HTTPS&clientIp=1.2.4.8`),
-                fetch(`${base}?domain=discord.com&type=A&clientIp=1.2.4.8`),
-                fetch(`${base}?domain=netflix.com&type=HTTPS&clientIp=1.2.4.8`),
-                fetch(`${base}?domain=spotify.com&type=A&clientIp=1.2.4.8`),
-            ]);
-            // 预热静态响应缓存
-            for (const d of ['twitter.com','chatgpt.com','github.com','discord.com','netflix.com','spotify.com']) {
-                await fetch(`${base}?domain=${d}&type=A&clientIp=1.2.4.8`);
-                await fetch(`${base}?domain=${d}&type=HTTPS&clientIp=1.2.4.8`);
-            }
-        } catch (e) {}
+        // Warm this deployment's resolver caches, never a hardcoded third-party host.
+        ctx.waitUntil(Promise.allSettled([
+            queryUpstreamDNS('example.com', 1),
+            queryUpstreamDNS('cloudflare-ech.com', 65),
+            queryUpstreamDNS('taobao.com', 1)
+        ]));
     }
 };
 
 // ===================== DoH 处理 =====================
+// Limit the actual streaming bytes; Content-Length alone is not reliable.
+async function readLimitedDnsBody(req, maxBytes) {
+    if (Number(req.headers.get('Content-Length') || 0) > maxBytes) return null;
+    if (!req.body) return new ArrayBuffer(0);
+    const reader = req.body.getReader();
+    const chunks = [];
+    let total = 0;
+    try {
+        while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            total += value.byteLength;
+            if (total > maxBytes) {
+                await reader.cancel();
+                return null;
+            }
+            chunks.push(value);
+        }
+    } finally {
+        reader.releaseLock();
+    }
+    const result = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+        result.set(chunk, offset);
+        offset += chunk.byteLength;
+    }
+    return result.buffer;
+}
+
+
 // DoH GET 请求缓存（仅缓存静态域名 + 固定参数）
 const DOH_GET_CACHE = new Map();
 const DOH_GET_TTL = 300000; // 5分钟
 
-async function handleDoHRequest(req, injectEch, ctx, clientIP) {
+async function handleDoHRequest(req, injectEch, ctx, clientIP, env) {
     const url = new URL(req.url);
     const config = buildConfig(url, req.headers);
     if (!config.clientIp) config.clientIp = clientIP;
-    await applySubConfig(config);   
+    // Pure forwarding must not fetch user-provided subscription URLs.
+    if (injectEch) await applySubConfig(config, env);
 
     // 缓存命名空间：/ech(注入构造) 与 /doh(纯净转发) 结果语义不同，绝不共用缓存键
     const ns = injectEch ? 'ech' : 'doh';
 
     // GET + dns 参数即可尝试缓存（静态域名判定在解析包后执行）
-    const cacheableGet = req.method === 'GET' && !!url.searchParams.get('dns');
+    const cacheableGet = injectEch && req.method === 'GET' && !!url.searchParams.get('dns');
 
     if (req.method === 'POST') {
-        const buf = await req.arrayBuffer();
+        const contentType = (req.headers.get('Content-Type') || '').toLowerCase();
+        if (!/^application\/dns-message(?:\s*;|\s*$)/.test(contentType)) {
+            return json({ error: 'POST requires application/dns-message' }, 415);
+        }
+        const buf = await readLimitedDnsBody(req, 65535);
+        if (!buf) return json({ error: 'DNS request too large' }, 413);
+        if (buf.byteLength < 12) return json({ error: 'Malformed DNS wire message' }, 400);
         if (injectEch) return handleDnsQuery(buf, config, ctx, config.clientIp, ns);
         const res = await forwardQuery(buf);
         return dnsResponse(await res.arrayBuffer());
     }
     if (req.method === 'GET' && url.searchParams.get('dns')) {
-        const raw = url.searchParams.get('dns').replace(/ /g, '+').replace(/-/g, '+').replace(/_/g, '/');
+        const dnsParam = url.searchParams.get('dns');
+        if (!/^[A-Za-z0-9_-]+={0,2}$/.test(dnsParam) || dnsParam.length > 8192) {
+            return json({ error: 'Invalid base64url DNS query' }, 400);
+        }
+        const raw = dnsParam.replace(/-/g, '+').replace(/_/g, '/');
         // 非法字符 / 超长参数必须在解码前拦住：否则 atob 抛错会变成 Cloudflare 500 文本页
         // （无 CORS 头，也不是 RFC8484 错误响应），配置错误的客户端还会照常重试。
         let buf;
@@ -272,6 +318,8 @@ async function handleDoHRequest(req, injectEch, ctx, clientIP) {
             });
         }
         
+        if (buf.byteLength < 12) return json({ error: 'Malformed DNS wire message' }, 400);
+
         // 解析查询域名用于缓存键（qName/qType 只在此块内可见，缓存 URL 必须在这里算好带出去，
         // 否则 286 行附近的写入会引用越界变量抛 ReferenceError，被空 catch 吞掉后缓存永远写不进）
         let cacheKey = null;
@@ -283,7 +331,10 @@ async function handleDoHRequest(req, injectEch, ctx, clientIP) {
                 const query = parseDnsPacket(buf);
                 queryId = query?.id ?? null;
                 queryHasEdns = !!query?.hasEdns;
-                if (query?.questions?.length) {
+                if (query?.questions?.length === 1 && query.questions[0].qclass === 1 &&
+                    !query.dnssecOk && !query.questionCompressed &&
+                    new DataView(buf).getUint16(4) === 1 &&
+                    (new DataView(buf).getUint16(2) & 0x7800) === 0) {
                     const qName = query.questions[0].name.toLowerCase().replace(/\.$/, "");
                     const qType = query.questions[0].type;
                     if (query.questions[0].name.replace(/\.$/, "") === qName && isCacheableStaticRequest(qName, config)) {
@@ -352,6 +403,13 @@ async function handleDnsQuery(rawBuffer, config, ctx, clientIP, ns = 'ech') {
         // 原样保留客户端发来的大小写：使用 DNS-0x20 随机化的客户端/解析器会校验
         // 响应 question 与请求逐字节一致，统一转小写会导致其丢弃响应。
         const rawQName = questions[0].name.replace(/\.$/, "");
+        // Non-IN, multi-question, non-QUERY, or DNSSEC-sensitive packets must be forwarded untouched.
+        const header = new DataView(rawBuffer);
+        if (header.getUint16(4) !== 1 || (header.getUint16(2) & 0x7800) !== 0 ||
+            questions[0].qclass !== 1 || query.dnssecOk || query.questionCompressed) {
+            const res = await forwardQuery(rawBuffer);
+            return dnsResponse(await res.arrayBuffer());
+        }
         // 但缓存体是跨客户端共享的，无法同时承载多种大小写；因此只缓存全小写(常规)查询。
         const caseNeutral = rawQName === rawQName.toLowerCase();
 
@@ -473,14 +531,14 @@ function isCacheableStaticRequest(domain, config) {
     return true;
 }
 
-async function handleApiQuery(url, clientIP) {
+async function handleApiQuery(url, clientIP, env) {
     const domain = url.searchParams.get('domain');
     const type = url.searchParams.get('type')?.toUpperCase() || 'A';
     if (!domain) return json({ error: '缺少 domain' }, 400);
     if (!['A', 'AAAA', 'HTTPS', 'CNAME', 'TXT', 'MX', 'NS'].includes(type)) return json({ error: '类型不支持' }, 400);
     const config = buildConfig(url);
     if (!config.clientIp) config.clientIp = clientIP;
-    await applySubConfig(config);
+    await applySubConfig(config, env);
 
     // 静态域名 + 默认参数 = 可缓存预计算响应（结果不依赖 clientIp/ECS）
     const cacheable = isCacheableStaticRequest(domain, config);
@@ -629,6 +687,7 @@ async function resolveDNS(domain, type, config, clientIP) {
     // 普通域名上游查询
     const dnsType = type === 'AAAA' ? 28 : 1;
     const data = await queryUpstreamDNS(domain, dnsType, clientIP);
+    if (!data) return { domain, type, answers: [], ech: null, rcode: 2 };
     const answers = data?.Answer?.filter(r => r.type === dnsType).map(r => r.data) || [];
     // 透传上游 RCODE（3 = NXDOMAIN）；否则不存在的域名会被当成 NODATA 并缓存 300s
     return { domain, type, answers, ech: null, rcode: data?.Status === 3 ? 3 : 0 };
@@ -1320,9 +1379,9 @@ async function handleLogsRequest() {
         const maskUrl = (u) => {
             try {
                 const x = new URL(u);
-                return x.origin + x.pathname + (x.search ? '?<redacted>' : '');
+                return x.origin + '/<redacted>';
             } catch {
-                return String(u).split('?')[0] + '?<redacted>';
+                return '<redacted>';
             }
         };
         const subDetails = [];
@@ -1347,8 +1406,8 @@ async function handleLogsRequest() {
         return json(payload);
     } catch (e) {
         // 捕获异常并返回错误信息，方便定位
-        // 公开端点不回显堆栈
-        return json({ error: 'log handler failed', detail: e.message }, 500);
+        // Do not reveal internal error messages on the administrative endpoint.
+        return json({ error: 'log handler failed' }, 500);
     }
 }
 /**
@@ -1444,24 +1503,21 @@ async function queryUpstreamDNS(name, type, clientIP = '',upstreamUrl = null) {
     const urls = upstreamList.map(u => u + '?' + params.toString());
     const promises = urls.map(url =>
         fetchWithTimeout(url, { headers: { 'Accept': 'application/dns-json' } }, 2000)
-            .then(res => res.ok ? res.json() : Promise.reject())
+            .then(async res => {
+                if (!res.ok) throw new Error('upstream HTTP error');
+                const payload = await res.json();
+                if (!isUsableDnsJson(payload, type, name)) throw new Error('invalid upstream DNS answer');
+                return payload;
+            })
     );
 
     let result;
-    if (type === 65) {
-        // HTTPS(65) 类型：校验式竞速——只接受包含该类型记录的响应，
-        // 避免部分上游(如 DNSPod)返回"成功但空 Answer"导致 ECH/HTTPS 记录丢失
-        result = await firstWithType(promises, 65);
-    } else {
-        try {
-            result = await Promise.any(promises);
-        } catch {
-            try {
-                const res = await fetchWithTimeout(urls[0], { headers: { 'Accept': 'application/dns-json' } }, 2000);
-                if (res.ok) result = await res.json();
-                else return null;
-            } catch { return null; }
-        }
+    // Prefer a usable answer of the requested type; retain legitimate NODATA/NXDOMAIN
+    // only when all upstreams lack that type. Never accept an HTTP-200 SERVFAIL as success.
+    try {
+        result = await firstWithType(promises, type);
+    } catch {
+        return null;
     }
 
     if (result && typeof caches !== 'undefined' && caches.default) {
@@ -1474,6 +1530,20 @@ async function queryUpstreamDNS(name, type, clientIP = '',upstreamUrl = null) {
         } catch (e) {}
     }
     return result;
+}
+
+// DNS JSON status 0=NOERROR, 3=NXDOMAIN; transient errors are not cacheable answers.
+function isUsableDnsJson(data, type, requestedName) {
+    if (!data || typeof data !== 'object' || ![0, 3].includes(data.Status)) return false;
+    if (data.Answer !== undefined && !Array.isArray(data.Answer)) return false;
+    if (data.Question !== undefined && !Array.isArray(data.Question)) return false;
+    if (Array.isArray(data.Question) && data.Question.length) {
+        const question = data.Question[0];
+        if (!question || String(question.name || '').toLowerCase().replace(/\.$/, '') !==
+            requestedName.toLowerCase().replace(/\.$/, '') || Number(question.type) !== Number(type)) return false;
+    }
+    if (data.Answer?.some(a => !a || !Number.isInteger(a.type) || typeof a.data !== 'string')) return false;
+    return true;
 }
 
 /**
@@ -1795,19 +1865,23 @@ function parseDnsPacket(buf) {
     if (buf.byteLength < 12) return null;
     let offset = 12;
     const labels = [];
+    let questionCompressed = false;
     while (offset < buf.byteLength) {
         const len = v.getUint8(offset);
         if (len === 0) { offset++; break; }
-        if ((len & 0xC0) === 0xC0) { offset += 2; break; }
+        if ((len & 0xC0) === 0xC0) { questionCompressed = true; offset += 2; break; }
         offset++;
         labels.push(new TextDecoder().decode(buf.slice(offset, offset + len)));
         offset += len;
     }
     if (offset + 4 > buf.byteLength) return null;
     const qType = v.getUint16(offset);
+    const qclass = v.getUint16(offset + 2);
     offset += 4;
+    const questionEnd = offset;
     // 探测附加区是否携带 EDNS0 OPT（用于决定响应是否回显 OPT，RFC6891）
     let hasEdns = false;
+    let dnssecOk = false;
     const arCount = v.getUint16(10);
     for (let i = 0; i < arCount && offset < buf.byteLength; i++) {
         while (offset < buf.byteLength) {
@@ -1819,13 +1893,20 @@ function parseDnsPacket(buf) {
         if (offset + 10 > buf.byteLength) break;
         const rtype = v.getUint16(offset);
         const rdlen = v.getUint16(offset + 8);
+        if (rtype === 41) {
+            hasEdns = true;
+            dnssecOk = (v.getUint16(offset + 6) & 0x8000) !== 0;
+        }
         offset += 10 + rdlen;
-        if (rtype === 41) { hasEdns = true; break; }
+        if (rtype === 41) break;
     }
     return {
         id: v.getUint16(0),
         hasEdns,
-        questions: [{ name: labels.join('.'), type: qType }]
+        dnssecOk,
+        questionCompressed,
+        questionEnd,
+        questions: [{ name: labels.join('.'), type: qType, qclass }]
     };
 }
 
@@ -1874,17 +1955,114 @@ function createMultiAnsResponse(id, qn, qt, rds, ttl = 3600, echoEdns = false, r
 /**
  * 转发二进制 DNS 查询（多上游竞速，带超时）
  */
+// Validate section boundaries and compression before trusting upstream wire data.
+// RDATA remains opaque so unknown record types can still be forwarded unchanged.
+function inspectDnsWire(buffer) {
+    try {
+        const bytes = new Uint8Array(buffer);
+        const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+        if (bytes.length < 12 || bytes.length > 65535) return null;
+        function readName(start) {
+            let cursor = start, end = null, length = 1, compressed = false;
+            const labels = [], visited = new Set();
+            while (true) {
+                if (cursor >= bytes.length || visited.has(cursor)) throw new Error('invalid DNS name');
+                visited.add(cursor);
+                const size = bytes[cursor];
+                if ((size & 0xc0) === 0xc0) {
+                    if (cursor + 1 >= bytes.length) throw new Error('truncated DNS pointer');
+                    if (end === null) end = cursor + 2;
+                    compressed = true;
+                    cursor = ((size & 0x3f) << 8) | bytes[cursor + 1];
+                    continue;
+                }
+                if (size & 0xc0) throw new Error('invalid DNS label');
+                cursor++;
+                if (size === 0) return { end: end ?? cursor, key: JSON.stringify(labels), compressed };
+                length += size + 1;
+                if (length > 255 || cursor + size > bytes.length) throw new Error('truncated DNS label');
+                labels.push(String.fromCharCode(...bytes.subarray(cursor, cursor + size))
+                    .replace(/[A-Z]/g, c => c.toLowerCase()));
+                cursor += size;
+            }
+        }
+        let offset = 12;
+        const questions = [];
+        for (let i = 0; i < view.getUint16(4); i++) {
+            const name = readName(offset);
+            offset = name.end;
+            if (offset + 4 > bytes.length) return null;
+            questions.push({ key: name.key, compressed: name.compressed,
+                type: view.getUint16(offset), qclass: view.getUint16(offset + 2) });
+            offset += 4;
+        }
+        const questionEnd = offset;
+        const recordCount = view.getUint16(6) + view.getUint16(8) + view.getUint16(10);
+        for (let i = 0; i < recordCount; i++) {
+            offset = readName(offset).end;
+            if (offset + 10 > bytes.length) return null;
+            const rdlength = view.getUint16(offset + 8);
+            offset += 10 + rdlength;
+            if (offset > bytes.length) return null;
+        }
+        if (offset !== bytes.length) return null;
+        return { id: view.getUint16(0), flags: view.getUint16(2), questions, questionEnd };
+    } catch {
+        return null;
+    }
+}
+
 async function forwardQuery(body) {
     const reqInit = {
         method: 'POST',
         headers: { 'Content-Type': 'application/dns-message', 'Accept': 'application/dns-message' },
         body
     };
-    // 多上游二进制 DoH 竞速，取最快响应（2s 快速超时）
+    const query = new Uint8Array(body);
+    const queryId = query.byteLength >= 2 ? new DataView(query.buffer, query.byteOffset, query.byteLength).getUint16(0) : 0;
+    const parsedQuery = inspectDnsWire(body);
+    // Race valid complete DNS replies, not just the first HTTP-200 header.
+    // A temporary DNS SERVFAIL is not a successful upstream resolution.
     const promises = UPSTREAM_DNS_LIST.map(url =>
-        fetchWithTimeout(url, reqInit, 2000).then(res => res.ok ? res : Promise.reject())
+        fetchWithTimeout(url, reqInit, 2000).then(async res => {
+            if (!res.ok || !(res.headers.get('Content-Type') || '').toLowerCase().startsWith('application/dns-message')) {
+                throw new Error('upstream returned non-DNS response');
+            }
+            const packet = await res.arrayBuffer();
+            if (packet.byteLength < 12 || packet.byteLength > 65535) throw new Error('bad DNS packet length');
+            const reply = inspectDnsWire(packet);
+            if (!parsedQuery || !reply || reply.id !== queryId || !(reply.flags & 0x8000) ||
+                (reply.flags & 0x7800) !== (parsedQuery.flags & 0x7800) ||
+                [2, 5].includes(reply.flags & 0x0f) ||
+                reply.questions.length !== parsedQuery.questions.length ||
+                reply.questions.some((question, i) => question.key !== parsedQuery.questions[i].key ||
+                    question.type !== parsedQuery.questions[i].type ||
+                    question.qclass !== parsedQuery.questions[i].qclass)) {
+                throw new Error('invalid DNS reply or SERVFAIL');
+            }
+            return new Response(packet, {
+                headers: { 'Content-Type': 'application/dns-message' }
+            });
+        })
     );
-    try { return await Promise.any(promises); } catch { return fetchWithTimeout(UPSTREAM_DNS_LIST[0], reqInit, 2000); }
+    try {
+        return await Promise.any(promises);
+    } catch {
+        // Do not turn a 503 HTML page into HTTP 200 application/dns-message.
+        // Return a valid SERVFAIL packet with the original uncompressed question.
+        const preserveQuestion = parsedQuery && parsedQuery.questions.length === 1 &&
+            !parsedQuery.questions[0].compressed;
+        const output = preserveQuestion ? query.slice(0, parsedQuery.questionEnd) : new Uint8Array(12);
+        if (!preserveQuestion) output.set(query.subarray(0, Math.min(2, query.byteLength)), 0);
+        const view = new DataView(output.buffer);
+        const requestedRd = query.byteLength > 3 && (query[2] & 1) ? 0x0100 : 0;
+        view.setUint16(2, 0x8082 | requestedRd);
+        view.setUint16(4, preserveQuestion ? 1 : 0);
+        view.setUint16(6, 0); view.setUint16(8, 0); view.setUint16(10, 0);
+        return new Response(output.buffer, {
+            headers: { 'Content-Type': 'application/dns-message' }
+        });
+    }
 }
 
 /**
@@ -1931,7 +2109,8 @@ function dnsResponse(buffer, extraHeaders = null) {
     const headers = {
         'Content-Type': 'application/dns-message',
         'Access-Control-Allow-Origin': '*',
-        'Cache-Control': 'public, max-age=300, s-maxage=300'
+        // Do not let generic HTTP caches reuse personalized queries or override DNS TTLs.
+        'Cache-Control': 'no-store'
     };
     if (extraHeaders) Object.assign(headers, extraHeaders);
     return new Response(buffer, { headers });
@@ -2381,7 +2560,47 @@ async function activeProbeOwner(domain, ctx, clientIP) {
 }
 
 // ===================== 订阅处理 =====================
-async function applySubConfig(config) {
+// External fetch targets require an explicit exact-host allowlist from the operator.
+// Arbitrary URLs supplied by a caller must never be fetched by a public Worker.
+function safeSubscriptionUrl(raw, env) {
+    const allowed = String(env?.DOH_ALLOWED_SUB_HOSTS || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+    if (!allowed.length) return null;
+    try {
+        const url = new URL(raw);
+        if (url.protocol !== 'https:' || url.port && url.port !== '443' ||
+            url.username || url.password || !allowed.includes(url.hostname.toLowerCase())) return null;
+        return url.toString();
+    } catch {
+        return null;
+    }
+}
+
+async function limitedResponseText(response, maxBytes) {
+    const claimed = Number(response.headers.get('Content-Length') || 0);
+    if (!response.ok || claimed > maxBytes) throw new Error('subscription too large');
+    if (!response.body) return '';
+    const reader = response.body.getReader();
+    const parts = [];
+    let size = 0;
+    try {
+        while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            size += value.byteLength;
+            if (size > maxBytes) {
+                await reader.cancel();
+                throw new Error('subscription too large');
+            }
+            parts.push(value);
+        }
+    } finally { reader.releaseLock(); }
+    const bytes = new Uint8Array(size);
+    let pos = 0;
+    for (const p of parts) { bytes.set(p, pos); pos += p.byteLength; }
+    return new TextDecoder().decode(bytes);
+}
+
+async function applySubConfig(config, env) {
     const sub = config.sub;
     if (!sub) return;
     const excludeItems = new Set(
@@ -2407,13 +2626,15 @@ async function applySubConfig(config) {
         'pt': '葡萄牙','lis': '里斯本','gr': '希腊','ath': '雅典','il': '以色列','tlv': '特拉维夫',
         'tr': '土耳其','ist': '伊斯坦布尔'
     };
-    const entries = sub.split(',').map(s => s.trim()).filter(s => s);
+    const entries = sub.split(',').map(s => s.trim()).filter(s => s).slice(0, 4);
     const allIps = new Set();
     const allDomains = new Set();
     for (const entry of entries) {
         const match = entry.match(/^(ip|cf)-(.+)$/);
         if (!match) continue;
-        const [, type, url] = match;
+        const [, type, requestedUrl] = match;
+        const url = safeSubscriptionUrl(requestedUrl, env);
+        if (!url) continue;
         let content = null;
         const cacheKey = `https://dns-cache/sub/${encodeURIComponent(url)}`;
         const cached = subCache.get(url);
@@ -2431,10 +2652,13 @@ async function applySubConfig(config) {
                try {
                 const controller = new AbortController();
                 const timer = setTimeout(() => controller.abort(), 5000);
-                const res = await fetch(url, { signal: controller.signal });
-                clearTimeout(timer);
-                if (res.ok) {
-                    content = await res.text();
+                try {
+                    const res = await fetch(url, { signal: controller.signal, redirect: 'error' });
+                    content = await limitedResponseText(res, 128 * 1024);
+                } finally {
+                    clearTimeout(timer);
+                }
+                if (content !== null) {
                     subCache.set(url, { content, expire: Date.now() + SUB_CACHE_TTL });
                      // 异步写入 Cache API（新增）
                     writeCache(cacheKey, content, SUB_CACHE_TTL / 1000);
@@ -2451,7 +2675,7 @@ async function applySubConfig(config) {
               }
            }
         }
-        if (!content) continue;
+        if (!content || content.length > 128 * 1024) continue;
         const lines = content.split(/\r?\n/)
             .map(line => line.trim())
             .filter(line => line && !line.startsWith('#'))
@@ -2502,9 +2726,9 @@ async function applySubConfig(config) {
             else allDomains.add(line);
         }
     }
-    if (allIps.size > 0) config.ip4 = Array.from(allIps).join(',');
+    if (allIps.size > 0) config.ip4 = Array.from(allIps).slice(0, 256).join(',');
     if (config.ip4) config.ip4 = prescreenIpList(config.ip4);
-    if (allDomains.size > 0) config.cfDomain = Array.from(allDomains).join(',');
+    if (allDomains.size > 0) config.cfDomain = Array.from(allDomains).slice(0, 64).join(',');
   
 }
 

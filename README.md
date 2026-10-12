@@ -22,7 +22,7 @@
 | `/api/query`  | JSON API，通过 URL 参数查询并返回结构化结果（支持所有自定义参数）。    |
 | `/ech`        | DoH 端点，返回注入 ECH 配置/增强构造的HTTPS RR（支持参数与请求头传参）。          |
 | `/doh`        | DoH 端点，纯净上游转发，不作任何修改  |
-| `/log`           | 日志系统。  
+| `/log`           | 管理员状态接口（需要 `DOH_ADMIN_TOKEN` Bearer 认证）。  
 ---
 
 > **端点行为说明**
@@ -30,7 +30,7 @@
 > - `/ech` 只合成 **A / AAAA / HTTPS** 三类记录；其余类型（TXT/MX/NS/SRV/CAA/SOA…）原样转发上游，不会被按 A 解析成畸形记录。
 > - 未知路径返回 **404 JSON**（旧版会把任意路径都渲染成首页）；支持 `OPTIONS` CORS 预检。
 > - 事务 ID 与 EDNS0 OPT 一律在响应时按**当前请求**回写/追加，缓存体固定为「ID=0 且不含 OPT」的规范形式：不会把某个客户端的事务 ID、OPT（含 COOKIE）或 `ip4`/`ip6`/`no6`/`enhance`/`ech` 等参数的结果带给其他客户端。
-> - 缓存只用于「结果与参数无关」的静态域名请求；`/doh`(纯净转发) 与 `/ech`(注入构造) 使用各自独立的缓存命名空间。
+> - `/ech` 仅对结果与自定义参数无关的静态请求缓存合成的 DNS 结果；`/doh` 直接转发上游完整 DNS 响应，不复用仅由域名和类型决定的自定义缓存。对客户端的 DNS HTTP 响应使用 `Cache-Control: no-store`。
 > - 上游返回 NXDOMAIN 时透传 RCODE=3，不再被吞成 NODATA。
 ## Enhance Mode 功能与使用
 增强模式是 DoH-ECH 的一项高级功能，允许您为网站主动注入连接优化参数，例如强制 QUIC (HTTP/3)、提供自定义 IP 提示 (IP hints) 以及精确屏蔽 A/AAAA 记录。这不仅能加速网站访问，还能解决某些浏览器因协议偏好导致的连接失败问题。
@@ -147,6 +147,41 @@ Cloudflare Worker
 ```
 
 ---
+## 安全部署（2026-10 安全修复）
+
+本仓库的 `/ech` 是会修改 DNS 应答的实验性解析服务，**不要把它当作透明 DNSSEC 代理或所有网站都能使用的 ECH 加速器**。建议先用 `/doh` 验证兼容性，再按域名启用 `/ech` 和 `enhance=rule`。
+
+### 私有状态接口
+
+在 Cloudflare Workers 的密钥/环境变量中设置 `DOH_ADMIN_TOKEN`（请使用足够长的随机值；不要写入 Git 仓库）：
+
+```sh
+npx wrangler secret put DOH_ADMIN_TOKEN
+curl -H 'Authorization: Bearer <YOUR_TOKEN>' https://YOUR_WORKER_DOMAIN/log
+```
+
+未配置密钥、未附带 Bearer 令牌，均返回 404。公开运行状态不应该暴露订阅地址路径，因为密钥可能出现在路径中。
+
+### 开放远程优选 IP 订阅（显式允许）
+
+出于安全原因，`sub=ip-https://...` 和对应的 `X-Sub` 自定义 URL **默认禁用**。如确需使用，在 Worker 配置 `DOH_ALLOWED_SUB_HOSTS`，其值为你信任的、逗号分隔的**精确域名**，例如 `feeds.example.com,raw.githubusercontent.com`。只允许 HTTPS（默认 443 端口）、拒绝重定向，并对订阅数量及响应大小设上限。该白名单**不是**针对订阅文件路径的权限控制：允许的主机仍可以提供不同路径的内容，请仅信任真正可信的源。
+
+```toml
+[vars]
+DOH_ALLOWED_SUB_HOSTS = "feeds.example.com"
+```
+
+可将该配置放入你的 Wrangler 配置，也可在 Workers 控制台配置环境变量。不要随意将开放的用户内容平台加入允许列表。此前已部署的 `sub` 参数若没有配置此变量，将不会加载外部订阅；默认值是刻意选择的安全回退。
+
+### 其他部署提醒
+
+- 对公网端点配置 Cloudflare WAF 的速率限制、防滥用措施和告警；Worker 内的内存 Map 并不是可靠的跨边缘节点速率限制方案。
+- POST 必须使用 `Content-Type: application/dns-message`，请求体最多 65,535 字节；GET `dns` 参数必须符合 base64url 格式。
+- 对非 Cloudflare 自有域名，默认保留上游地址记录；`best=true`、`rules`、`ip4` 等显式增强选项仍可能改写连接地址，启用前须验证端到端连通性。
+- DNSSEC DO 位、非 IN 类别及多问题查询会尽量以原始二进制查询转发上游，避免自构造结果丢失 DNSSEC 语义。
+- 使用 `node --experimental-default-type=module tests/smoke.mjs` 运行基本回归测试。GitHub PR 自动触发 `doh-tests.yml`；通过测试不代表 DNSSEC/ECH 的所有边界情况均已覆盖。
+- 不要把其他项目的 APK Release 当成 DoH Worker 发行版；此仓库的 Release 目前还被用于同步 `wxcvm/AdAway` 的更新源。
+
 ## 部署步骤
 
 > ⚠️ 本项目是**纯 Worker 项目**（无静态文件），**不要**把 Pages 构建命令设置为 `npx wrangler deploy`，否则会报错 `Could not detect a directory containing static files`。
@@ -170,12 +205,11 @@ Cloudflare Worker
 ### 2. 使用方法
 - **前端网页测试查询**：直接访问首页（`/`），输入域名、选择类型，可展开高级选项填入自定义参数后查询。
 
-- **内置直连站点（返回优选 IP + 自动 ECH 注入）**：
-  - **CF 系**：Twitter/X（twitter.com/x.com/t.co/twimg.com）、Cloudflare 全家（cloudflare.com/pages.dev/workers.dev）、**OpenAI（chatgpt.com/openai.com/oaistatic.com/oaiusercontent.com）**、**Discord（discord.com/discordapp.com）**
+- **CF 静态映射范围（默认强制优选 IP）**：仅 Cloudflare 自有域名（cloudflare.com/cloudflare-dns.com/pages.dev/workers.dev）。其他网站默认保留真实 A/AAAA；对于 HTTPS 记录仍可能通过动态归属探测进行 ECH 增强。
   - **Meta 系**：facebook.com/instagram.com/whatsapp.com/messenger.com/fb.com/meta.com（固定 ECH 注入）
   - **增强规则（enhance=rule/full）**：Google 系（google.com/youtube.com/googleapis.com/gstatic.com 等 → Google IPv6 直连）、Meta 全家桶 IPv6、Medium、Pinterest
   - **best=true 全局跟随**：任意 CF 托管的网站（自动归属探测）都使用优选 IP + ECH 注入
-- **优选 IP 订阅**：`https://你的域名/sub.txt`（配合 `sub=ip-https://你的域名/sub.txt` 使用）
+- **优选 IP 订阅**：`https://你的域名/sub.txt`；将订阅用于 `sub=ip-https://...` 时必须先为 Worker 配置 `DOH_ALLOWED_SUB_HOSTS`，默认不允许从外部 URL 下载。
 - **DOH地址(完整参数示例)**：  
   ```
    "https://your-domain.pages.dev/ech?sub=ip-https://bestcf.pages.dev/gslege/Cfxyz.txt&best=true"
@@ -187,9 +221,9 @@ Cloudflare Worker
   -- 使用代理工具：将需要直连的CF站点的域名解析服务器doh设置为`https://你的域名/ech`，并可通过请求头或 URL 参数传递自定义内容。
 ---
 ## 注意事项
-- **子请求上限**：免费计划每日 10 万次子请求，已通过缓存降低使用量，正常个人使用一般不会超出。
+- **限额**：Cloudflare Workers 的免费配额、子请求额度和缓存能力可能变化，请以当前 Cloudflare 官方文档及账号限制为准；不应将应用层缓存当作抵御大量滥用查询的手段。
 - **ECH 有效性**：Meta 的 ECH 为固定配置（可能会过期），Cloudflare 的 ECH 从指定域名动态获取，可自定义 `ech` 参数。
-- **隐私与安全**：上游查询使用 Google、Cloudflare、Quad9、DNSPod 等多家公共 DNS（JSON API）竞速取最快响应，国内域名分流至阿里 DNS/DNSPod 解析（ **可自行替换为其他 DoH 服务**，如带去广告规则的 nextDNS、AdGuard DNS 等，见 `_worker.js` 顶部 `UPSTREAM_JSON_LIST` / `UPSTREAM_CN_JSON_LIST` 配置）。
+- **隐私与安全**：当前上游包含阿里 DNS、DNSPod 和 Cloudflare；国内域名分流至阿里 DNS/DNSPod。客户端原始 IP 可被转成 ECS 参数发送给上游，因此默认启用时需要考虑隐私需求。可调整 `_worker.js` 顶部的上游配置。
   
 ## 项目特性
 

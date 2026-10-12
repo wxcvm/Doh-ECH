@@ -155,12 +155,21 @@ function buildConfig(url, headers = null) {
     return config;
 }
 // ===================== Worker 入口 =====================
+// Once-per-isolate warmup: avoid starting three independent tasks for every DNS query.
+let nextWarmupAt = 0;
+function scheduleRuntimeWarmup(ctx) {
+    const now = Date.now();
+    if (now < nextWarmupAt) return;
+    nextWarmupAt = now + 60_000;
+    ctx.waitUntil(Promise.allSettled([
+        ensureCNDomainSet(),
+        fetchRealEch('cloudflare-ech.com', ''),
+        getBuiltinRulesMap()
+    ]));
+}
 export default {
     async fetch(req, env, ctx) {
-        // 异步预热国内域名列表/CF ECH配置/hosts文件
-        ctx.waitUntil(ensureCNDomainSet());
-        ctx.waitUntil(fetchRealEch('cloudflare-ech.com', ''));
-         ctx.waitUntil(getBuiltinRulesMap());
+        scheduleRuntimeWarmup(ctx);
         const url = new URL(req.url);
         // 浏览器端 JS 客户端跨域 POST application/dns-message 会先发 OPTIONS 预检
         if (req.method === 'OPTIONS') {
@@ -323,7 +332,8 @@ async function handleDoHRequest(req, injectEch, ctx, clientIP, env) {
                 queryId = query?.id ?? null;
                 queryHasEdns = !!query?.hasEdns;
                 if (query?.questions?.length === 1 && query.questions[0].qclass === 1 &&
-                    !query.dnssecOk && new DataView(buf).getUint16(4) === 1 &&
+                    !query.dnssecOk && !query.questionCompressed &&
+                    new DataView(buf).getUint16(4) === 1 &&
                     (new DataView(buf).getUint16(2) & 0x7800) === 0) {
                     const qName = query.questions[0].name.toLowerCase().replace(/\.$/, "");
                     const qType = query.questions[0].type;
@@ -396,7 +406,7 @@ async function handleDnsQuery(rawBuffer, config, ctx, clientIP, ns = 'ech') {
         // Non-IN, multi-question, non-QUERY, or DNSSEC-sensitive packets must be forwarded untouched.
         const header = new DataView(rawBuffer);
         if (header.getUint16(4) !== 1 || (header.getUint16(2) & 0x7800) !== 0 ||
-            questions[0].qclass !== 1 || query.dnssecOk) {
+            questions[0].qclass !== 1 || query.dnssecOk || query.questionCompressed) {
             const res = await forwardQuery(rawBuffer);
             return dnsResponse(await res.arrayBuffer());
         }
@@ -1855,10 +1865,11 @@ function parseDnsPacket(buf) {
     if (buf.byteLength < 12) return null;
     let offset = 12;
     const labels = [];
+    let questionCompressed = false;
     while (offset < buf.byteLength) {
         const len = v.getUint8(offset);
         if (len === 0) { offset++; break; }
-        if ((len & 0xC0) === 0xC0) { offset += 2; break; }
+        if ((len & 0xC0) === 0xC0) { questionCompressed = true; offset += 2; break; }
         offset++;
         labels.push(new TextDecoder().decode(buf.slice(offset, offset + len)));
         offset += len;
@@ -1892,6 +1903,8 @@ function parseDnsPacket(buf) {
         id: v.getUint16(0),
         hasEdns,
         dnssecOk,
+        questionCompressed,
+        questionEnd: offset,
         questions: [{ name: labels.join('.'), type: qType, qclass }]
     };
 }
@@ -1947,11 +1960,46 @@ async function forwardQuery(body) {
         headers: { 'Content-Type': 'application/dns-message', 'Accept': 'application/dns-message' },
         body
     };
-    // 多上游二进制 DoH 竞速，取最快响应（2s 快速超时）
+    const query = new Uint8Array(body);
+    const queryId = query.byteLength >= 2 ? new DataView(query.buffer, query.byteOffset, query.byteLength).getUint16(0) : 0;
+    // Race valid complete DNS replies, not just the first HTTP-200 header.
+    // A temporary DNS SERVFAIL is not a successful upstream resolution.
     const promises = UPSTREAM_DNS_LIST.map(url =>
-        fetchWithTimeout(url, reqInit, 2000).then(res => res.ok ? res : Promise.reject())
+        fetchWithTimeout(url, reqInit, 2000).then(async res => {
+            if (!res.ok || !(res.headers.get('Content-Type') || '').toLowerCase().startsWith('application/dns-message')) {
+                throw new Error('upstream returned non-DNS response');
+            }
+            const packet = await res.arrayBuffer();
+            if (packet.byteLength < 12 || packet.byteLength > 65535) throw new Error('bad DNS packet length');
+            const header = new DataView(packet);
+            const flags = header.getUint16(2);
+            if (header.getUint16(0) !== queryId || !(flags & 0x8000) ||
+                [2, 5].includes(flags & 0x0f)) throw new Error('invalid DNS reply or SERVFAIL');
+            return new Response(packet, {
+                headers: { 'Content-Type': 'application/dns-message' }
+            });
+        })
     );
-    try { return await Promise.any(promises); } catch { return fetchWithTimeout(UPSTREAM_DNS_LIST[0], reqInit, 2000); }
+    try {
+        return await Promise.any(promises);
+    } catch {
+        // Do not turn a 503 HTML page into HTTP 200 application/dns-message.
+        // Return a valid SERVFAIL packet with the original uncompressed question.
+        const parsed = (() => { try { return parseDnsPacket(body); } catch { return null; } })();
+        const qCount = query.byteLength >= 6 ? (query[4] << 8) | query[5] : 0;
+        const preserveQuestion = parsed && !parsed.questionCompressed && qCount === 1 &&
+            parsed.questionEnd <= query.byteLength;
+        const output = preserveQuestion ? query.slice(0, parsed.questionEnd) : new Uint8Array(12);
+        if (!preserveQuestion) output.set(query.subarray(0, Math.min(2, query.byteLength)), 0);
+        const view = new DataView(output.buffer);
+        const requestedRd = query.byteLength > 3 && (query[2] & 1) ? 0x0100 : 0;
+        view.setUint16(2, 0x8082 | requestedRd);
+        view.setUint16(4, preserveQuestion ? 1 : 0);
+        view.setUint16(6, 0); view.setUint16(8, 0); view.setUint16(10, 0);
+        return new Response(output.buffer, {
+            headers: { 'Content-Type': 'application/dns-message' }
+        });
+    }
 }
 
 /**

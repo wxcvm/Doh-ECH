@@ -94,7 +94,7 @@ assert.equal(wire.readUInt16BE(0), 0x1234, 'forwarded DNS transaction ID must ma
 const resolved = await request('/api/query?domain=github.com&type=A');
 assert.equal(resolved.status, 200);
 const record = await resolved.json();
-assert.ok(record.answers?.includes('203.0.113.17'), 'non-Cloudflare domain must retain upstream A answers: '+JSON.stringify({record,calls:calls.filter(s=>s.includes('github.com'))}));
+assert.ok(record.answers?.includes('203.0.113.17'), 'non-Cloudflare domain must retain upstream A answers: '+JSON.stringify({record,calls:calls.slice(-25),cacheKeys:Array.from(cache.keys()).slice(-20)}));
 
 await request('/api/query?domain=example.net&type=A&sub=ip-https%3A%2F%2Funtrusted.invalid%2Flist');
 assert.equal(calls.some(s => s.includes('untrusted.invalid')), false, 'SSRF URL must not be fetched');

@@ -31,7 +31,7 @@
 > - 未知路径返回 **404 JSON**（旧版会把任意路径都渲染成首页）；支持 `OPTIONS` CORS 预检。
 > - 事务 ID 与 EDNS0 OPT 一律在响应时按**当前请求**回写/追加，缓存体固定为「ID=0 且不含 OPT」的规范形式：不会把某个客户端的事务 ID、OPT（含 COOKIE）或 `ip4`/`ip6`/`no6`/`enhance`/`ech` 等参数的结果带给其他客户端。
 > - `/ech` 仅对结果与自定义参数无关的静态请求缓存合成的 DNS 结果；`/doh` 直接转发上游完整 DNS 响应，不复用仅由域名和类型决定的自定义缓存。对客户端的 DNS HTTP 响应使用 `Cache-Control: no-store`。
-> - 上游返回 NXDOMAIN 时透传 RCODE=3，不再被吞成 NODATA。
+> - 上游返回 NXDOMAIN 时透传 RCODE=3；如果二进制 DoH 的所有上游都失败，返回 DNS SERVFAIL，而非把 HTML 错误页当作 DNS 报文。
 ## Enhance Mode 功能与使用
 增强模式是 DoH-ECH 的一项高级功能，允许您为网站主动注入连接优化参数，例如强制 QUIC (HTTP/3)、提供自定义 IP 提示 (IP hints) 以及精确屏蔽 A/AAAA 记录。这不仅能加速网站访问，还能解决某些浏览器因协议偏好导致的连接失败问题。
 
@@ -231,7 +231,7 @@ DOH_ALLOWED_SUB_HOSTS = "feeds.example.com"
   提供 `/ech`（注入 ECH和enhance mode）和 `/doh`（纯净转发）两个标准 DoH 端点，支持 GET/POST。
 - ✅ **多上游竞速**  
   同时查询 Google / Cloudflare / Quad9 / DNSPod 多家上游，取最快响应；国内域名走阿里 / DNSPod 国内上游，提高解析速度与准确性。
-- ✅ **全球边缘缓存**  
-  利用 Cloudflare Cache API 缓存上游 DNS 结果（A/AAAA 300s，HTTPS 600s），大幅减少上游请求次数。
+- ✅ **边缘节点本地缓存**  
+  使用 Cloudflare Cache API 缓存可复用的上游 DNS 结果；缓存不是跨所有数据中心自动复制，时效也可能随记录与策略而变化。
 - ✅ **ECS就近解析**  
   默认自动获取发起doh查询的用户端ClientIP（支持自定义 clientip=x.x.x.x）,实现就近解析，同时在频繁切换网络环境时仍能保证最佳解析结果。

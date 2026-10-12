@@ -322,7 +322,9 @@ async function handleDoHRequest(req, injectEch, ctx, clientIP, env) {
                 const query = parseDnsPacket(buf);
                 queryId = query?.id ?? null;
                 queryHasEdns = !!query?.hasEdns;
-                if (query?.questions?.length) {
+                if (query?.questions?.length === 1 && query.questions[0].qclass === 1 &&
+                    !query.dnssecOk && new DataView(buf).getUint16(4) === 1 &&
+                    (new DataView(buf).getUint16(2) & 0x7800) === 0) {
                     const qName = query.questions[0].name.toLowerCase().replace(/\.$/, "");
                     const qType = query.questions[0].type;
                     if (query.questions[0].name.replace(/\.$/, "") === qName && isCacheableStaticRequest(qName, config)) {
@@ -2539,9 +2541,12 @@ async function applySubConfig(config, env) {
                try {
                 const controller = new AbortController();
                 const timer = setTimeout(() => controller.abort(), 5000);
-                const res = await fetch(url, { signal: controller.signal, redirect: 'error' });
-                content = await limitedResponseText(res, 128 * 1024);
-                clearTimeout(timer);
+                try {
+                    const res = await fetch(url, { signal: controller.signal, redirect: 'error' });
+                    content = await limitedResponseText(res, 128 * 1024);
+                } finally {
+                    clearTimeout(timer);
+                }
                 if (content !== null) {
                     subCache.set(url, { content, expire: Date.now() + SUB_CACHE_TTL });
                      // 异步写入 Cache API（新增）
@@ -2559,7 +2564,7 @@ async function applySubConfig(config, env) {
               }
            }
         }
-        if (!content) continue;
+        if (!content || content.length > 128 * 1024) continue;
         const lines = content.split(/\r?\n/)
             .map(line => line.trim())
             .filter(line => line && !line.startsWith('#'))

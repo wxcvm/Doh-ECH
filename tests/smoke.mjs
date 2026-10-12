@@ -4,6 +4,7 @@ import worker from '../_worker.js';
 // Lightweight Cloudflare runtime mocks. Tests must not perform network requests.
 const calls = [];
 const cache = new Map();
+let simulateBinaryOutage = false;
 globalThis.caches = {
   default: {
     async match(key) { return cache.get(key instanceof Request ? key.url : String(key))?.clone() || undefined; },
@@ -20,6 +21,10 @@ globalThis.fetch = async (input, init = {}) => {
     return new Response('203.0.113.55\n', { headers: { 'Content-Type': 'text/plain' } });
   }
   if ((init.method || 'GET') === 'POST' && init.body) {
+    if (simulateBinaryOutage) return new Response('temporarily unavailable', { status: 503 });
+    if (url.hostname === 'dns.alidns.com') {
+      return new Response('not a DNS response', { headers: { 'Content-Type': 'text/html' } });
+    }
     const reply = Buffer.from(init.body);
     if (reply.length < 12) throw new Error('Invalid test query');
     reply.writeUInt16BE(0x8180, 2);
@@ -114,5 +119,18 @@ const unsupported = await request('/ech', {
 });
 assert.equal(unsupported.status, 200, 'non-IN DNS query should be forwarded');
 assert.equal(Buffer.from(await unsupported.arrayBuffer()).readUInt16BE(0), 0x1234);
+
+simulateBinaryOutage = true;
+const failed = await request('/doh', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/dns-message' },
+  body: question('example.net')
+});
+simulateBinaryOutage = false;
+assert.equal(failed.status, 200);
+const servfail = Buffer.from(await failed.arrayBuffer());
+assert.equal(servfail.readUInt16BE(0), 0x1234, 'SERVFAIL must preserve transaction ID');
+assert.equal(servfail.readUInt16BE(2) & 0x000f, 2, 'outage must return DNS SERVFAIL, not HTTP error bytes');
+assert.equal(servfail.readUInt16BE(4), 1, 'SERVFAIL must preserve question count');
 
 console.log('Doh-ECH smoke tests passed');

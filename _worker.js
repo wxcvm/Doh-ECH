@@ -130,6 +130,8 @@ const CN_DOMAIN_SUFFIXES = ['jd.com','meituan.com','taobao.com', '.cn', '.com.cn
 // ===================== 缓存逻辑 =====================
 let cnDomainSet = null;
 let cnDomainLastFetch = 0;
+let cnRefreshRunning = false;
+let cnRetryAt = 0;
 globalThis.__workerStartTime = globalThis.__workerStartTime || Date.now();
 const CN_DOMAIN_CACHE_TTL = 7 * 24 * 3600 * 1000;   // 每7天更新CN列表
 const cacheMap = new Map();
@@ -575,7 +577,7 @@ async function handleApiQuery(url, clientIP, env) {
 async function resolveDNS(domain, type, config, clientIP) {
     domain = domain.toLowerCase().replace(/\.$/, '');
     // 国内域名分流：直接返回国内上游原始解析结果
-    ensureCNDomainSet();
+    if (!cnDomainSet) cnDomainSet = new Set(CN_DOMAIN_SUFFIXES);
     if (isCNDomain(domain)) {
         return await handleCNDomain(domain, type, config, clientIP);
     }
@@ -935,10 +937,26 @@ async function collectIpHints(domain, config, clientIP, owner, source) {
 // ===================== 规则匹配 =====================
 
 let builtinRulesMap = null;
+let builtinRulesRefreshAt = 0;
+let builtinRulesRefreshing = false;
+
+function staticBuiltinRules() {
+    const map = new Map();
+    for (const group of BUILTIN_HINTS) {
+        if (!group.domains) continue;
+        const { ips = [], noA = false, noAAAA = false } = group;
+        for (const domain of group.domains) map.set(domain, { ips, noA, noAAAA });
+    }
+    return map;
+}
 
 async function getBuiltinRulesMap() {
-    if (builtinRulesMap) return builtinRulesMap;
-
+    if (builtinRulesRefreshing) return builtinRulesMap || staticBuiltinRules();
+    if (builtinRulesMap && Date.now() < builtinRulesRefreshAt) return builtinRulesMap;
+    builtinRulesRefreshing = true;
+    let retry = false;
+    let nextRefresh = Date.now() + HOSTS_CACHE_TTL;
+    try {
     const map = new Map();
     const hints = BUILTIN_HINTS;
     if (Array.isArray(hints)) {
@@ -950,7 +968,7 @@ async function getBuiltinRulesMap() {
                 const hostIpsMap = new Map();
                 for (const url of group.hosts) {
                     let data = null;
-                    const cacheKey = `https://dns-cache/hosts/${encodeURIComponent(url)}`;
+                    const cacheKey = `https://dns-cache/hosts-v2/${encodeURIComponent(url)}`;
                     const cached = hostsCache.get(url);
 
                     // 1. 内存缓存命中
@@ -961,8 +979,11 @@ async function getBuiltinRulesMap() {
                         const cachedText = await readCache(cacheKey);
                         if (cachedText) {
                             try {
-                                data = JSON.parse(cachedText);
-                                hostsCache.set(url, { data, expire: Date.now() + HOSTS_CACHE_TTL });
+                                const entry = JSON.parse(cachedText);
+                                if (Array.isArray(entry.data) && entry.expire > Date.now()) {
+                                    data = entry.data;
+                                    hostsCache.set(url, entry);
+                                }
                             } catch (e) {
                                 data = null;
                             }
@@ -970,30 +991,24 @@ async function getBuiltinRulesMap() {
                         // 3. Cache API 未命中，远程下载（原逻辑）
                         if (!data) {
                             try {
-                                const controller = new AbortController();
-                                const timer = setTimeout(() => controller.abort(), 5000);
-                                const res = await fetch(url, { signal: controller.signal });
-                                clearTimeout(timer);
-                                if (res.ok) {
-                                    data = await res.json();
-                                    // 写入内存缓存
-                                    hostsCache.set(url, {
-                                        data: data,
-                                        expire: Date.now() + HOSTS_CACHE_TTL
-                                    });
-                                    // 异步写入 Cache API（新增）
-                                    writeCache(cacheKey, JSON.stringify(data), HOSTS_CACHE_TTL / 1000);
-                                } else if (cached) {
-                                    // 下载失败，使用过期内存缓存
-                                    data = cached.data;
-                                }
+                                data = await fetchWithTimeout(url, {}, 5000, async res => {
+                                    if (!res.ok) throw new Error('hosts HTTP error');
+                                    const result = await res.json();
+                                    if (!Array.isArray(result)) throw new Error('invalid hosts list');
+                                    return result;
+                                });
+                                const entry = { data, expire: Date.now() + HOSTS_CACHE_TTL };
+                                hostsCache.set(url, entry);
+                                await writeCache(cacheKey, JSON.stringify(entry), HOSTS_CACHE_TTL / 1000);
                             } catch (e) {
-                                console.error('Fetch hosts error:', url, e);
+                                retry = true;
                                 if (cached) data = cached.data;
                             }
                         }
                     }
 
+                    const stored = hostsCache.get(url);
+                    if (stored?.expire > Date.now()) nextRefresh = Math.min(nextRefresh, stored.expire);
                     if (data && Array.isArray(data)) {
                         for (const entry of data) {
                             let domain, ip;
@@ -1039,31 +1054,28 @@ async function getBuiltinRulesMap() {
         }
     }
     builtinRulesMap = map;
+    builtinRulesRefreshAt = retry ? Date.now() + 60_000 : nextRefresh;
     return map;
+    } finally { builtinRulesRefreshing = false; }
 }
 
 async function matchRule(domain, config) {
    
-    // 必须新建对象：getBuiltinRulesMap() 返回的是全局共享的规则表，
-    // 就地改写会把 CIDR 首次展开的随机结果永久固化，绕过 prefixCache 的 24h 轮换。
-    const merged = new Map(await getBuiltinRulesMap());
-    if (config.rules) {
-        const user = parseRules(config.rules);
-        for (const [k, v] of user) merged.set(k, v);
-    }
-    const matched = [];
-    for (const [pattern, ruleObj] of merged) {
-        if (matchDomainPattern(domain, pattern)) {
-            matched.push({ pattern, ruleObj });
+    const builtin = await getBuiltinRulesMap();
+    const user = config.rules ? parseRules(config.rules) : null;
+    // Exact match first, then longest suffix; user entries override the same pattern.
+    let winner = user?.get(domain) || builtin.get(domain);
+    if (!winner) {
+        for (let name = domain; name;) {
+            const pattern = '*.' + name;
+            winner = user?.get(pattern) || builtin.get(pattern);
+            if (winner) break;
+            const dot = name.indexOf('.');
+            if (dot < 0) break;
+            name = name.slice(dot + 1);
         }
     }
-    if (matched.length === 0) return null;
-    matched.sort((a, b) => {
-        const specificity = p => p.startsWith('*.') ? p.length - 2 : p.length;
-        return specificity(b.pattern) - specificity(a.pattern) ||
-            Number(a.pattern.startsWith('*.')) - Number(b.pattern.startsWith('*.'));
-    });
-    const winner = matched[0].ruleObj;
+    if (!winner) return null;
     return { ...winner, ips: winner.ips.flatMap(ip => ip.includes('/') ? getPrefixIPs(ip) : [ip]) };
 }
 
@@ -2162,56 +2174,34 @@ async function resolveFallbackRecord(domain, type, clientIP, upstreamUrl = null)
  */
 async function ensureCNDomainSet() {
     const now = Date.now();
-    // 同步兜底：确保首次调用后 cnDomainSet 永不为 null（避免冷启动竞态崩溃）
-    if (!cnDomainSet) {
-        cnDomainSet = new Set(CN_DOMAIN_SUFFIXES);
-        cnDomainLastFetch = 0;
-    }
-    // 已有有效缓存，直接返回
-    if (cnDomainSet && ( now - cnDomainLastFetch) < CN_DOMAIN_CACHE_TTL) {
-        return;
-    }
-    // 2. 从Cache API读取（新增）
-    const cacheKey = `https://dns-cache/cn/domains`;
-    const cachedText = await readCache(cacheKey);
-    if (cachedText) {
+    if (!cnDomainSet) cnDomainSet = new Set(CN_DOMAIN_SUFFIXES);
+    if (cnRefreshRunning || now < cnRetryAt || now - cnDomainLastFetch < CN_DOMAIN_CACHE_TTL) return;
+    cnRefreshRunning = true;
+    const cacheKey = 'https://dns-cache/cn/domains-v2';
+    try {
+        const cachedText = await readCache(cacheKey);
+        let data = cachedText ? JSON.parse(cachedText) : null;
+        if (!data?.text || !(data.expire > Date.now())) {
+            const text = await fetchWithTimeout(CN_DOMAIN_LIST_URL, {}, 5000, res => {
+                if (!res.ok) throw new Error('CN list HTTP error');
+                return res.text();
+            });
+            if (!text.trim()) throw new Error('empty CN list');
+            data = { text, expire: Date.now() + CN_DOMAIN_CACHE_TTL };
+            await writeCache(cacheKey, JSON.stringify(data), CN_DOMAIN_CACHE_TTL / 1000);
+        }
         const domains = new Set(CN_DOMAIN_SUFFIXES);
-        for (const line of cachedText.split(/\r?\n/)) {
-            const d = line.trim();
+        for (const line of data.text.split(/\r?\n/)) {
+            const d = line.trim().toLowerCase();
             if (d && !d.startsWith('#')) domains.add(d);
         }
         cnDomainSet = domains;
-        cnDomainLastFetch = now;
-        return;
-    }
-    // 如果集合为空，先用内置后缀创建临时集合，保证匹配立即可用
-    if (!cnDomainSet) {
-        cnDomainSet = new Set(CN_DOMAIN_SUFFIXES);
-        cnDomainLastFetch = 0; // 标记为需要更新
-    }
-
-    // 异步下载最新列表（不阻塞当前调用者）
-    try {
-        const res = await fetch(CN_DOMAIN_LIST_URL);
-        if (res.ok) {
-            const domains = new Set(CN_DOMAIN_SUFFIXES); // 内置后缀始终包含
-            const text = await res.text();
-            for (const line of text.split(/\r?\n/)) {
-                const d = line.trim();
-                if (d && !d.startsWith('#')) {
-                    domains.add(d);
-                }
-            }
-            cnDomainSet = domains;
-            cnDomainLastFetch = Date.now();
-            // 异步写入 Cache API（新增）
-            writeCache(cacheKey, text, CN_DOMAIN_CACHE_TTL / 1000);
-        }
-    } catch (e) {
-        // 远程加载失败，继续使用现有集合（临时内置集合或上次缓存）
-        // 更新时间戳，避免短时间内重复尝试
-        cnDomainLastFetch = Date.now();
-    }
+        cnDomainLastFetch = data.expire - CN_DOMAIN_CACHE_TTL;
+        cnRetryAt = 0;
+    } catch {
+        // Keep the last usable data; retry soon instead of treating failure as a 7-day success.
+        cnRetryAt = Date.now() + 60_000;
+    } finally { cnRefreshRunning = false; }
 }
 
 /**

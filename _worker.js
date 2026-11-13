@@ -1529,7 +1529,8 @@ async function queryUpstreamDNS(name, type, clientIP = '', upstreamUrl = null, p
     let result;
     try { result = await firstWithType(promises, type, preferEch); } catch { return null; }
 
-    const maxAge = upstreamAnswerTtl(result, type === 65 ? 600 : 300);
+    const maxAge = preferEch && !result?.Answer?.some(r => r.type === 65 && parseHttpsRecord(r.data)?.ech)
+        ? 0 : upstreamAnswerTtl(result, type === 65 ? 600 : 300);
     if (maxAge > 0 && typeof caches !== 'undefined' && caches.default) {
         try {
             await caches.default.put(cacheKey, new Response(JSON.stringify(result), {
@@ -1595,7 +1596,7 @@ function firstWithType(promises, type, preferEch = false) {
  * 获取 Cloudflare ECH 公钥（带内存缓存）
  */
 async function fetchRealEch(echDomain, clientIP) {
-    const cacheKey = `ech:${echDomain}`;
+    const cacheKey = `ech-v2:${echDomain}`;
     const cacheUrl = `https://dns-cache/${cacheKey}`;
     // 1. 内存缓存
     const cached = cacheMap.get(cacheKey);
@@ -1605,8 +1606,8 @@ async function fetchRealEch(echDomain, clientIP) {
         const cachedText = await readCache(cacheUrl);
         if (cachedText) {
             const data = JSON.parse(cachedText);
-            if (data && data.ech) {
-                cacheMap.set(cacheKey, { value: data.ech, expire: Date.now() + ECH_CACHE_TTL });
+            if (data?.ech && data.expire > Date.now()) {
+                cacheMap.set(cacheKey, { value: data.ech, expire: data.expire });
                 return data.ech;
             }
         }
@@ -1624,9 +1625,12 @@ async function fetchRealEch(echDomain, clientIP) {
             if (rec) {
                 const parsed = parseHttpsRecord(rec.data);
                 if (parsed && parsed.ech) {
-                    cacheMap.set(cacheKey, { value: parsed.ech, expire: Date.now() + ECH_CACHE_TTL });
-                    // 异步写入 Cache API（新增）
-                    writeCache(cacheUrl, JSON.stringify({ ech: parsed.ech }), ECH_CACHE_TTL / 1000);
+                    const ttl = upstreamAnswerTtl(data, ECH_CACHE_TTL / 1000);
+                    if (ttl > 0) {
+                        const expire = Date.now() + ttl * 1000;
+                        cacheMap.set(cacheKey, { value: parsed.ech, expire });
+                        writeCache(cacheUrl, JSON.stringify({ ech: parsed.ech, expire }), ttl);
+                    }
                     return parsed.ech;
                 }
             }
@@ -2144,7 +2148,7 @@ async function resolveFallbackRecord(domain, type, clientIP, upstreamUrl = null)
     if (!data) return { domain, type, answers: [], ech: null, rcode: 2, ttl: 0 };
 
     if (type === 'HTTPS') {
-        const result = { domain, type, answers: [] };
+        const result = { domain, type, answers: [], rcode: data.Status === 3 ? 3 : 0 };
         if (data?.Answer) {
             const rec = data.Answer.find(r => r.type === 65);
             if (rec) {
@@ -2459,14 +2463,16 @@ function ipToBytes(ip) {
 function ipv6ToBytes(ip) {
     let p = ip.split(':');
     if (ip.includes('::')) {
+        if (ip.split('::').length !== 2) return null;
         const [l, r] = ip.split('::');
         const lp = l ? l.split(':') : [];
         const rp = r ? r.split(':') : [];
+        if (lp.length + rp.length >= 8 || [...lp, ...rp].some(v => !v)) return null;
         p = [...lp, ...Array(8 - lp.length - rp.length).fill('0'), ...rp];
     }
     if (p.length !== 8) return null;
     for (const v of p) {
-        if (v !== '' && !/^[0-9a-fA-F]{1,4}$/.test(v)) return null;
+        if (!/^[0-9a-fA-F]{1,4}$/.test(v)) return null;
     }
     const b = new Uint8Array(16);
     p.forEach((v, i) => {

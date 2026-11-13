@@ -84,6 +84,20 @@ try {
   assert.equal(new URL(await page.locator('#echUrl').textContent()).searchParams.get('pins'),'x.com=203.0.113.88');
   console.log('PASS local pin input, real DNS response and generated URL');
 
+  // Explicit QUIC profile must expose the same address in A and HTTPS hints.
+  await page.locator('#pins').fill('');
+  await page.locator('#xh3').fill('172.66.0.227');
+  await page.locator('#type').selectOption('all');
+  await page.locator('#queryBtn').click();
+  await page.locator('#cards [data-type=HTTPS] .status').filter({hasText:'已声明 HTTP/3'}).waitFor();
+  const h3=JSON.parse(await page.locator('#rawJson').textContent());
+  assert.deepEqual(h3[0].answers,['172.66.0.227']);
+  assert.equal(h3[2].policy,'x-http3');
+  assert.equal(h3[2].alpn,'h3,h2');
+  assert.deepEqual(h3[2].ipv4hints,['172.66.0.227']);
+  assert.equal(new URL(await page.locator('#echUrl').textContent()).searchParams.get('xh3'),'172.66.0.227');
+  console.log('PASS X HTTP/3 profile, address consistency and generated URL');
+
   // Restore the rule preset before checking its advanced parameters.
   await page.getByRole('button',{name:'Google IPv6',exact:false}).click();
   await page.locator('#cards [data-type=AAAA] .status').filter({hasText:'已返回记录'}).waitFor();

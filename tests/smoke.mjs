@@ -446,4 +446,25 @@ assert.equal(pinPacket.readUInt32BE(question('www.google.com',28).length+6),30);
 assert.equal(pinPacket.subarray(question('www.google.com',28).length+12,question('www.google.com',28).length+28).toString('hex'),'20010db8000000000000000000000044');
 assert.equal((await apiAnswer('www.google.com','AAAA','enhance=direct&pins=www.google.com%3Dinvalid')).policy,'native-direct');
 assert.equal((await apiAnswer('example.com','A','enhance=direct&pins=example.com%3D1.2.3.4')).policy,undefined);
+// X HTTP/3 experiment: exact host, explicit IP, aligned wire and JSON records.
+const xh3='enhance=direct&xh3=172.66.0.227';
+const xa=await apiAnswer('x.com','A',xh3);
+assert.deepEqual(xa.answers,['172.66.0.227']);
+const xhttps=await apiAnswer('x.com','HTTPS',xh3);
+assert.equal(xhttps.policy,'x-http3');
+assert.equal(xhttps.alpn,'h3,h2');
+assert.deepEqual(xhttps.ipv4hints,['172.66.0.227']);
+assert.equal(xhttps.ech,null);
+assert.equal(xhttps.ttl,30);
+const xwire=await wireAnswer('x.com',65,xh3);
+assert.equal(xwire.readUInt16BE(6),1);
+assert.equal(xwire.readUInt32BE(question('x.com',65).length+6),30);
+// Priority 1, root target, alpn=h3,h2, ipv4hint 172.66.0.227, no ECH or no-default-alpn.
+assert.equal(xwire.subarray(question('x.com',65).length+12,question('x.com',65).length+33).toString('hex'),'0001000001000602683302683200040004ac4200e3');
+assert.deepEqual((await apiAnswer('x.com','A',xh3+'&pins=x.com%3D203.0.113.88')).answers,['172.66.0.227']);
+assert.equal((await apiAnswer('api.x.com','HTTPS',xh3)).policy,'native-direct');
+assert.equal((await apiAnswer('www.google.com','HTTPS',xh3)).policy,'native-direct');
+assert.equal((await apiAnswer('x.com','HTTPS','enhance=direct')).policy,'native-direct');
+assert.equal((await apiAnswer('x.com','HTTPS','enhance=direct&xh3=bad')).policy,'native-direct');
+assert.equal((await apiAnswer('x.com','HTTPS','enhance=off&xh3=172.66.0.227')).policy,undefined);
 console.log('Doh-ECH smoke tests passed (including adaptive upstreams, Meta ECH, owner TTL and ECS)');

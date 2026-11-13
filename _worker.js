@@ -59,6 +59,21 @@ function localDirectPins(domain, type, config) {
     }
     return [...result].slice(0, 8);
 }
+// Explicit X-only experimental profile, using the client's measured QUIC address.
+function xHttp3Result(domain, type, config) {
+    if (domain !== 'x.com' || !isNativeDirect(domain, config) || !config.xh3) return null;
+    const ip = config.xh3.trim();
+    if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(ip) || !ipToBytes(ip)) return null;
+    const address = bytesToIp(ipToBytes(ip));
+    if (type === 'A') return { domain, type, answers: [address], rcode: 0, ttl: 30, policy: 'x-http3' };
+    if (type === 'HTTPS') {
+        // Chromium may ignore RRsets that exclusively disable the default ALPN.
+        // Advertise H3 and H2; the client decides whether to race/fallback.
+        const result = buildHttpsRecordFromParams(domain, [{key: 'alpn', val: 'h3,h2'}], [address], []);
+        return { ...result, alpn: 'h3,h2', rcode: 0, ttl: 30, policy: 'x-http3' };
+    }
+    return null;
+}
 const SVC_PARAM_IDS = { mandatory: 0, alpn: 1, "no-default-alpn": 2, port: 3, ipv4hint: 4, ech: 5, ipv6hint: 6};// SVC PARAMS构造
 const IPV4_ONLY_DOMAINS = ["twitter.com", "x.com", "t.co", "twimg.com"];// CDN IPv4-only policy; dl.google.com is handled by an opt-in rule below.
 //Cloudflare 配置
@@ -192,7 +207,7 @@ function buildConfig(url, headers = null) {
         best: get('best', 'X-Best') || 'false', sub: get('sub', 'X-Sub'),
         exclude: get('exclude', 'X-Exclude'), shuffle: get('shuffle', 'X-Shuffle') || 'true',
         area: get('area', 'X-Area'), enhance: get('enhance', 'X-Enhance') || 'off',
-        pins: get('pins', 'X-Pins'), rules: get('rules', 'X-Rules'), alpn: get('alpn', 'X-Alpn') || 'h3,h2',
+        pins: get('pins', 'X-Pins'), xh3: get('xh3', 'X-XH3'), rules: get('rules', 'X-Rules'), alpn: get('alpn', 'X-Alpn') || 'h3,h2',
         clientIp: get('clientIp', 'X-ClientIP') || '',
         no6: get('no6', 'X-No6') || 'false',   
         mandatory: get('mandatory', 'X-Mandatory') || 'alpn',
@@ -226,7 +241,7 @@ export default {
                 headers: {
                     'Access-Control-Allow-Origin': '*',
                     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-                    'Access-Control-Allow-Headers': 'Content-Type, Accept, X-Ip4, X-Ip6, X-MetaIp4, X-MetaIp6, X-CF, X-Meta, X-ECH, X-Best, X-Sub, X-Exclude, X-Shuffle, X-Pins, X-Area, X-Enhance, X-Rules, X-Alpn, X-ClientIP, X-No6, X-Mandatory, X-NoCF6',
+                    'Access-Control-Allow-Headers': 'Content-Type, Accept, X-Ip4, X-Ip6, X-MetaIp4, X-MetaIp6, X-CF, X-Meta, X-ECH, X-Best, X-Sub, X-Exclude, X-Shuffle, X-Pins, X-XH3, X-Area, X-Enhance, X-Rules, X-Alpn, X-ClientIP, X-No6, X-Mandatory, X-NoCF6',
                     'Access-Control-Max-Age': '86400'
                 }
             });
@@ -404,7 +419,9 @@ async function handleDnsQuery(rawBuffer, config, ctx, clientIP) {
 
         // Direct profile is explicit, scoped and preserves native DNS packets (including HTTPS/SVCB).
         if (isNativeDirect(qName, config)) {
-            const type = qType === 1 ? 'A' : qType === 28 ? 'AAAA' : '';
+            const type = qType === 1 ? 'A' : qType === 28 ? 'AAAA' : qType === 65 ? 'HTTPS' : '';
+            const h3 = xHttp3Result(qName, type, config);
+            if (h3) return dnsResponseFromResult(id, rawQName, qType, h3, echoEdns);
             const pins = localDirectPins(qName, type, config);
             if (pins.length) return dnsResponseFromResult(id, rawQName, qType, { answers: pins, ttl: 30 }, echoEdns);
             const res = await forwardQuery(rawBuffer, DIRECT_WIRE);
@@ -619,6 +636,8 @@ async function handleApiQuery(url, clientIP, env) {
 async function resolveDNS(domain, type, config, clientIP) {
     domain = domain.toLowerCase().replace(/\.$/, '');
     if (isNativeDirect(domain, config)) {
+        const h3 = xHttp3Result(domain, type, config);
+        if (h3) return h3;
         const pins = localDirectPins(domain, type, config);
         if (pins.length) return { domain, type, answers: pins, ech: null, rcode: 0, ttl: 30, policy: 'local-pins' };
         // Native addresses and HTTPS metadata, never random prefixes or generic CDN IPs.
@@ -2915,7 +2934,7 @@ function getHtml() {
 <label><input type="checkbox" id="allowCF6"> 允许 CF IPv6</label>
 <label><input type="checkbox" id="shuffle" checked> 随机排列地址</label>
 </div><p class="help">全局跟随优选会主动探测 CDN 归属；CF IPv6 默认关闭。ECS 可能向上游透露大致网络位置。</p></div>
-<div class="advanced-group"><h3>本机验证地址（Google / X 原生直连模式）</h3><label class="field"><span>本机测速结果 · pins</span><input id="pins" placeholder="www.google.com=IPv6地址;x.com=IPv4地址"></label><p class="help">仅覆盖指定域名和地址族，按本机实测顺序返回；未设置的域名及地址族仍用原生 DNS。请只填自己实际通过 TLS 证书验证和 HTTP 测试的地址，网络变化后重新测试。<a href="https://github.com/wxcvm/Doh-ECH/blob/main/scripts/direct-probe.py" target="_blank" rel="noopener noreferrer">本机检测脚本</a></p></div>
+<div class="advanced-group"><h3>本机验证地址（Google / X 原生直连模式）</h3><label class="field"><span>X HTTP/3 实测 IPv4 · xh3</span><input id="xh3" placeholder="172.66.0.227"></label><p class="help">仅 x.com 生效：填写本机通过 HTTP/3 证书与 HTTP 响应验证的 IPv4，生成 A 与 HTTPS（h3,h2）记录。浏览器仍自行选择协议；不改变其他域名、不注入 ECH。网络变化后重新验证。</p><label class="field"><span>本机测速结果 · pins</span><input id="pins" placeholder="www.google.com=IPv6地址;x.com=IPv4地址"></label><p class="help">仅覆盖指定域名和地址族，按本机实测顺序返回；未设置的域名及地址族仍用原生 DNS。请只填自己实际通过 TLS 证书验证和 HTTP 测试的地址，网络变化后重新测试。<a href="https://github.com/wxcvm/Doh-ECH/blob/main/scripts/direct-probe.py" target="_blank" rel="noopener noreferrer">本机检测脚本</a></p></div>
 </details>
 <div class="actions"><button class="primary" id="queryBtn" type="submit">开始查询</button><button class="secondary" id="resetBtn" type="button">重置</button></div>
 <div class="feedback" id="feedback" role="status" aria-live="polite"></div>
@@ -2944,6 +2963,7 @@ function params(){
  for(const key of fields){const v=$(key).value.trim();if(v)p.set(key,v);}
  if($('enhance').value!=='off')p.set('enhance',$('enhance').value);
  if($('enhance').value==='direct'&&$('pins').value.trim())p.set('pins',$('pins').value.trim());
+ if($('enhance').value==='direct'&&$('xh3').value.trim())p.set('xh3',$('xh3').value.trim());
  for(const [key,def] of [['alpn','h3,h2'],['mandatory','alpn']]){const v=$(key).value.trim();if(v&&v!==def)p.set(key,v);}
  if($('best').checked)p.set('best','true');
  if($('no6').checked)p.set('no6','true');
@@ -2979,12 +2999,13 @@ function cardFor(type,out){
  else if(d.rcode===3){status='域名不存在';tone='warn';description='上游返回 NXDOMAIN（RCODE 3）。';}
  else if(d.rcode!==undefined&&d.rcode!==0){status='解析失败';tone='bad';description='DNS 错误码 '+d.rcode+'，可以稍后重试。';}
  else if(type==='HTTPS'){
-  if(d.ech){status='已取得 ECH 配置';description=d.echSource==='legacy-meta'?'使用 Meta 兼容配置，需实际握手验证。':'已取得 ECH 配置，是否接受仍需实际握手验证。';}
+  if(d.policy==='x-http3'){status='已声明 HTTP/3';description='DNS 已声明 h3,h2；需要实际浏览器连接验证，不代表 ECH 已启用。';}
+  else if(d.ech){status='已取得 ECH 配置';description=d.echSource==='legacy-meta'?'使用 Meta 兼容配置，需实际握手验证。':'已取得 ECH 配置，是否接受仍需实际握手验证。';}
   else{status='未取得 ECH';tone='warn';description='未返回 ECH 配置，不一定表示域名异常。';}
  }else if(!Array.isArray(d.answers)||!d.answers.length){status='无此类记录';tone='warn';description='可能是域名未发布该记录，或当前解析策略屏蔽了此类型。';}
  else{description='DNS 返回 '+d.answers.length+' 条记录。';}
  title.append(el('span','status '+tone,status));card.append(title,el('p','muted',description));
- if(d){if(d.policy==='native-direct')line(card,'解析策略：原生 DNS（未替换地址）');if(d.policy==='local-pins')line(card,'解析策略：本机指定地址（服务器未验证你的网络）');values(card,d.answers);if(d.ipv4hints?.length){line(card,'IPv4 提示');values(card,d.ipv4hints);}if(d.ipv6hints?.length){line(card,'IPv6 提示');values(card,d.ipv6hints);}if(d.echSource)line(card,'ECH 来源：'+(d.echSource==='legacy-meta'?'Meta 兼容配置':d.echSource==='dns'?'DNS 动态配置':d.echSource));if(Number.isFinite(d.ttl))line(card,'TTL：'+d.ttl+' 秒');}
+ if(d){if(d.policy==='native-direct')line(card,'解析策略：原生 DNS（未替换地址）');if(d.policy==='local-pins')line(card,'解析策略：本机指定地址（服务器未验证你的网络）');if(d.policy==='x-http3')line(card,'解析策略：X HTTP/3 实验配置（浏览器自行选择协议）');if(d.alpn)line(card,'ALPN：'+d.alpn);values(card,d.answers);if(d.ipv4hints?.length){line(card,'IPv4 提示');values(card,d.ipv4hints);}if(d.ipv6hints?.length){line(card,'IPv6 提示');values(card,d.ipv6hints);}if(d.echSource)line(card,'ECH 来源：'+(d.echSource==='legacy-meta'?'Meta 兼容配置':d.echSource==='dns'?'DNS 动态配置':d.echSource));if(Number.isFinite(d.ttl))line(card,'TTL：'+d.ttl+' 秒');}
  if(Number.isFinite(out.ms))line(card,'查询耗时：'+out.ms+' ms（浏览器到服务的请求时间）');
  return card;
 }

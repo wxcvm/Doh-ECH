@@ -129,6 +129,42 @@ function stripBalancedEcs(packet, injection) {
 }
 // Small isolate-local positive cache for ordinary domestic address queries.
 const domesticWireCache = new Map();
+// Aggregate counters only: no queried names, client addresses or ECS prefixes are recorded.
+const runtimeMetrics = {
+    startedAt: Date.now(), wire:{requests:0,completed:0,ms:0,httpErrors:0,exceptions:0,rcode:{}},
+    routing:{domestic:0,international:0,domesticMs:0,internationalMs:0,domesticCompleted:0,internationalCompleted:0,fallback:0},
+    cache:{domestic:{hits:0,misses:0,bypasses:0},json:{hits:0,misses:0}},
+    ecs:{wireAttempts:0,wireAccepted:0,wireRetries:0,jsonRetries:0},
+    upstreams:{}
+};
+function rate(n,d){return d?Math.round(n/d*10000)/100:null;}
+function mean(n,d){return d?Math.round(n/d*10)/10:null;}
+function cacheMetric(c){return {...c,hitRate:rate(c.hits,c.hits+c.misses)};}
+function metricsSnapshot(){
+    const m=runtimeMetrics,w=m.wire,r=m.routing;
+    return {scope:'isolate',startedAt:new Date(m.startedAt).toISOString(),updatedAt:new Date().toISOString(),
+        wire:{...w,avgMs:mean(w.ms,w.completed)},
+        routing:{...r,domesticAvgMs:mean(r.domesticMs,r.domesticCompleted),internationalAvgMs:mean(r.internationalMs,r.internationalCompleted)},
+        cache:{domestic:{...cacheMetric(m.cache.domestic),entries:domesticWireCache.size},json:cacheMetric(m.cache.json)},
+        ecs:{...m.ecs},
+        upstreams:Object.entries(m.upstreams).map(([key,v])=>({key,...v,validRate:rate(v.valid,v.completed),avgMs:mean(v.ms,v.completed)}))};
+}
+// Observe final client DNS replies once, not internal upstream attempts or the JSON console.
+async function monitoredDoH(req,injectEch,ctx,clientIP,env){
+    const m=runtimeMetrics.wire,start=Date.now();m.requests++;
+    try{
+        const response=await handleDoHRequest(req,injectEch,ctx,clientIP,env);
+        if(!response.ok){m.httpErrors++;return response;}
+        if((response.headers.get('Content-Type')||'').startsWith('application/dns-message')){
+            const body=await response.arrayBuffer();
+            const code=body.byteLength>=12?new DataView(body).getUint16(2)&15:'invalid';
+            m.rcode[code]=(m.rcode[code]||0)+1;
+            return new Response(body,{status:response.status,headers:response.headers});
+        }
+        return response;
+    }catch(e){m.exceptions++;throw e;}
+    finally{m.completed++;m.ms+=Math.max(0,Date.now()-start);}
+}
 function domesticCacheKey(raw, prefix) {
     const p=inspectDnsWire(raw), v=new DataView(raw);
     if(!p || p.questions.length!==1 || p.questions[0].compressed || ![1,28].includes(p.questions[0].type) ||
@@ -157,23 +193,32 @@ function domesticCacheWrite(key,packet,type) {
     domesticWireCache.set(key,{packet:packet.slice(0),stored:Date.now(),ttl,offsets:p.records.map(r=>r.ttlOffset)});
 }
 async function forwardBalanced(rawBuffer, domain, config, clientIP) {
-    const domestic = balancedDomestic(domain);
+    const domestic=balancedDomestic(domain),group=domestic?'domestic':'international',start=Date.now(),m=runtimeMetrics.routing;
+    m[group]++;
+    try{return await forwardBalancedCore(rawBuffer,domain,config,clientIP,domestic);}
+    finally{m[group+'Completed']++;m[group+'Ms']+=Math.max(0,Date.now()-start);}
+}
+async function forwardBalancedCore(rawBuffer, domain, config, clientIP, domestic) {
     const ecs=domestic?balancedEcsIP(config,clientIP):'';
     const key=domestic?domesticCacheKey(rawBuffer,ecsPrefix(ecs)||'none'):'';
     const hit=key&&domesticCacheRead(key,new DataView(rawBuffer).getUint16(0));
+    if(domestic){const c=runtimeMetrics.cache.domestic;if(!key)c.bypasses++;else if(hit)c.hits++;else c.misses++;}
     if(hit)return dnsResponse(hit,{'X-Cache':'DOMESTIC_HIT'});
     const type=key?inspectDnsWire(rawBuffer).questions[0].type:0;
     if(domestic) {
         const injection=addBalancedEcs(rawBuffer,ecs);
         if(injection) {
+            runtimeMetrics.ecs.wireAttempts++;
             const result=await forwardQuery(injection.body,BALANCED_CN_WIRE);
             const packet=stripBalancedEcs(await result.arrayBuffer(),injection);
-            if(packet) {domesticCacheWrite(key,packet,type);return dnsResponse(packet);}
+            if(packet) {runtimeMetrics.ecs.wireAccepted++;domesticCacheWrite(key,packet,type);return dnsResponse(packet);}
+            runtimeMetrics.ecs.wireRetries++;
         }
     }
     const result = await forwardQuery(rawBuffer, domestic ? BALANCED_CN_WIRE : BALANCED_INTL_WIRE);
     const packet = await result.arrayBuffer();
     if (domestic && (new DataView(packet).getUint16(2) & 15) === 2) {
+        runtimeMetrics.routing.fallback++;
         const fallback = await forwardQuery(rawBuffer, BALANCED_INTL_WIRE);
         return dnsResponse(await fallback.arrayBuffer());
     }
@@ -409,8 +454,8 @@ export default {
         }
         const clientIP = url.searchParams.get('clientIp') || req.headers.get('X-ClientIP') || req.headers.get('CF-Connecting-IP') || '';
         if (url.pathname === '/api/query') return handleApiQuery(url, clientIP, env, req.cf?.country || '');
-        if (url.pathname === '/ech' || url.pathname === '/dns-query') return handleDoHRequest(req, true, ctx, clientIP, env);
-        if (url.pathname === '/doh') return handleDoHRequest(req, false, ctx, clientIP, env);
+        if (url.pathname === '/ech' || url.pathname === '/dns-query') return monitoredDoH(req, true, ctx, clientIP, env);
+        if (url.pathname === '/doh') return monitoredDoH(req, false, ctx, clientIP, env);
         if (url.pathname === '/' || url.pathname === '/index.html') {
             return new Response(getHtml(), { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'public, max-age=3600, s-maxage=3600' } });
         }
@@ -419,7 +464,7 @@ export default {
         const ct = (req.headers.get('Content-Type') || '').toLowerCase();
         if ((req.method === 'POST' && ct.includes('application/dns-message')) ||
             (req.method === 'GET' && url.searchParams.get('dns'))) {
-            return handleDoHRequest(req, true, ctx, clientIP, env);
+            return monitoredDoH(req, true, ctx, clientIP, env);
         }
         return new Response(JSON.stringify({
             error: 'Not Found',
@@ -1526,18 +1571,19 @@ async function handleLogsRequest() {
         };
 
         // ==================== 缓存状态 ====================
-        const echKey = 'ech:cloudflare-ech.com';
+        const echKey = 'ech-v3:cloudflare-ech.com:none';
+        const echWarm=!!cacheMap.get(echKey)?.value && cacheMap.get(echKey).expire>now;
         const cacheStatus = {
             _description: '内存 & Cache API 双重缓存状态',
             memory: {
-                echCache: cacheMap.has(echKey) ? '已预热 (warm)' : '未预热 (cold)',
+                echCache: echWarm ? '已预热 (warm)' : '未预热 (cold)',
                 ownerCacheSize: cacheMap.size,
                 subCacheCount: subCache.size,
                 hostsCacheCount: hostsCache.size,
                 prefixCacheCount: prefixCache.size,
             },
             edgeCache: {
-                ech: cacheMap.has(echKey) ? '已缓存 (cached)' : '未缓存 (empty)',
+                ech: echWarm ? '已缓存 (cached)' : '未缓存 (empty)',
                 sub: subCache.size > 0 ? '已缓存 (cached)' : '未缓存 (empty)',
                 cn: cnDomainSet && cnDomainSet.size > 1000 ? '已缓存 (cached)' : '未缓存 (empty)',
                 hosts: hostsCache.size > 0 ? '已缓存 (cached)' : '未缓存 (empty)',
@@ -1570,9 +1616,10 @@ async function handleLogsRequest() {
             cnList: cnList,
             caches: cacheStatus,
             subCache: subDetails,
+            metrics: metricsSnapshot(),
         };
 
-        return json(payload);
+        return new Response(JSON.stringify(payload),{headers:{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'}});
     } catch (e) {
         // 捕获异常并返回错误信息，方便定位
         // Do not reveal internal error messages on the administrative endpoint.
@@ -1687,12 +1734,14 @@ async function queryUpstreamDNS(name, type, clientIP = '', upstreamUrl = null, p
                 const data = await cachedRes.json();
                 const age = Math.max(0, Math.floor((Date.now() - stored) / 1000));
                 if (stored > 0 && isUsableDnsJson(data, type, name) && upstreamAnswerTtl(data, type === 65 ? 600 : 300) > age) {
+                    runtimeMetrics.cache.json.hits++;
                     return { ...data, Answer: data.Answer.map(r => ({ ...r, TTL: Math.max(0, r.TTL - age) })) };
                 }
             }
         }
     } catch {}
 
+    runtimeMetrics.cache.json.misses++;
     let result;
     try {
         result = await raceUpstreams(upstreamList, 'json', url =>
@@ -1707,6 +1756,7 @@ async function queryUpstreamDNS(name, type, clientIP = '', upstreamUrl = null, p
     } catch {
         // Some JSON resolvers reject ECS. Retry the same upstream group without ECS;
         // the fallback uses its own no-ECS cache key and never changes domestic routing.
+        if(prefix)runtimeMetrics.ecs.jsonRetries++;
         return prefix ? queryUpstreamDNS(name, type, '', upstreamUrl, preferEch) : null;
     }
 
@@ -1769,10 +1819,13 @@ function raceUpstreams(endpoints, kind, run, preferred, betterFallback = (a, b) 
             clearTimeout(timer);
             const url = ordered[next++];
             const started = Date.now();
+            const stats=runtimeMetrics.upstreams[key(url)] ||= {attempts:0,completed:0,valid:0,failed:0,ms:0};
+            stats.attempts++;
             pending++;
             const record = ok => {
                 const old = upstreamHealth.get(key(url));
                 const latency = Math.max(1, Date.now() - started);
+                stats.completed++;stats[ok?'valid':'failed']++;stats.ms+=latency;
                 upstreamHealth.set(key(url), {
                     latency: old ? old.latency * 0.75 + latency * 0.25 : latency,
                     failures: ok ? 0 : Math.min(4, (old?.failures || 0) + 1),

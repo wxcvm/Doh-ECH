@@ -39,23 +39,15 @@ try {
   await page.getByRole('button',{name:'Android 推送',exact:false}).click();
   await page.locator('#cards [data-type=A] .status').filter({hasText:'已返回记录'}).waitFor();
   assert.match(await page.locator('#resultSummary').textContent(),/mtalk.google.com/);
-  for(const ip of ['invalid','114.114.114.114','223.5.5.5']){
-    const response=await page.request.get(new URL('/api/query?domain=taobao.com&type=A&clientIp='+encodeURIComponent(ip),base).href);
-    console.log('ECS DIAGNOSTIC '+ip+' '+await response.text());
-  }
-  for(const endpoint of ['https://dns.alidns.com/resolve','https://doh.pub/dns-query','https://cloudflare-dns.com/dns-query']){
-    try{
-      const response=await fetch(endpoint+'?name=taobao.com&type=1',{headers:{Accept:'application/dns-json'},signal:AbortSignal.timeout(5000)});
-      console.log('UPSTREAM DIAGNOSTIC '+endpoint+' '+response.status+' '+(await response.text()).slice(0,1500));
-    }catch(e){console.log('UPSTREAM DIAGNOSTIC '+endpoint+' '+e.message);}
-  }
-  for (const name of ['taobao.com','www.taobao.com','www.baidu.com','baidu.com']) {
-    const response = await page.request.get(new URL('/api/query?domain='+name+'&type=A',base).href);
-    console.log('DOMESTIC DIAGNOSTIC '+name+' '+response.status()+' '+(await response.text()).slice(0,1000));
+  // Real domestic queries must remain usable with valid ECS and automatic client IP.
+  for(const name of ['taobao.com','www.baidu.com']){
+    const response=await page.request.get(new URL('/api/query?domain='+name+'&type=A&clientIp=114.114.114.114',base).href);
+    const data=await response.json();
+    assert.equal(data.rcode,0,name+' ECS resolution failed: '+JSON.stringify(data));
+    assert.ok(data.answers.length>0,name+' must return A records');
   }
   await page.getByRole('button',{name:'国内解析',exact:false}).click();
   await page.locator('#cards [data-type=A] .status').waitFor();
-  console.log('DOMESTIC PRESET '+await page.locator('#cards').textContent());
   assert.match(await page.locator('#cards [data-type=A] .status').textContent(),/已返回记录/);
   assert.match(await page.locator('#resultSummary').textContent(),/taobao.com/);
   console.log('PASS real Meta, Android FCM and domestic presets');

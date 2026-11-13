@@ -2957,6 +2957,7 @@ async function run(){
   const completed=outcomes.filter(o=>!o.error&&(!o.data.rcode||o.data.rcode===0)).length;
   $('resultSummary').textContent=domain+' · '+modeNames[mode]+' · '+completed+'/'+types.length+' 项正常返回';
   $('feedback').textContent='查询完成。结果在下方。';
+  if(matchMedia('(max-width:760px)').matches) $('results').scrollIntoView({block:'start',behavior:matchMedia('(prefers-reduced-motion: reduce)').matches?'instant':'smooth'});
  }finally{busy=false;$('queryBtn').disabled=false;$('queryBtn').textContent='开始查询';document.querySelectorAll('.preset,#resetBtn').forEach(b=>b.disabled=false);}
 }
 async function copy(id){

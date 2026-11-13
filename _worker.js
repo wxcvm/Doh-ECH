@@ -230,8 +230,9 @@ async function forwardBalancedCore(rawBuffer, domain, config, clientIP, domestic
         const injection=addBalancedEcs(rawBuffer,ecs);
         if(injection) {
             runtimeMetrics.ecs.wireAttempts++;
-            const result=await forwardQuery(injection.body,BALANCED_CN_WIRE,preferRecord);
-            const packet=stripBalancedEcs(await result.arrayBuffer(),injection);
+            const result=await forwardQuery(injection.body,BALANCED_CN_WIRE,preferRecord,injection);
+            const candidate=await result.arrayBuffer();
+            const packet=(new DataView(candidate).getUint16(2)&15)===2?null:candidate;
             if(packet) {runtimeMetrics.ecs.wireAccepted++;balancedCacheWrite(cache,key,packet,type,clientOpt);return dnsResponse(packet);}
             runtimeMetrics.ecs.wireRetries++;
         }
@@ -2343,7 +2344,7 @@ function inspectDnsWire(buffer) {
     }
 }
 
-async function forwardQuery(body, upstreams = UPSTREAM_DNS_LIST, preferRecord = false) {
+async function forwardQuery(body, upstreams = UPSTREAM_DNS_LIST, preferRecord = false, injection = null) {
     const reqInit = {
         method: 'POST',
         headers: { 'Content-Type': 'application/dns-message', 'Accept': 'application/dns-message' },
@@ -2377,7 +2378,11 @@ async function forwardQuery(body, upstreams = UPSTREAM_DNS_LIST, preferRecord = 
             if(preferRecord && ((reply.flags&0x0200) || ![0,3].includes(code))) {
                 throw new Error('incomplete or erroneous DNS record reply');
             }
-            const response=new Response(packet,{headers:{'Content-Type':'application/dns-message'}});
+            // Validate injected ECS before selecting a winner; an incompatible
+            // resolver must not prevent the other domestic resolver from winning.
+            const clientPacket=injection?stripBalancedEcs(packet,injection):packet;
+            if(!clientPacket)throw new Error('incompatible ECS response');
+            const response=new Response(clientPacket,{headers:{'Content-Type':'application/dns-message'}});
             // For ordinary balanced address/HTTPS queries, give the other configured
             // resolver a chance if the first returns no requested record.
             const answers=reply.records.slice(0,new DataView(packet).getUint16(6));

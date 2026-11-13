@@ -347,3 +347,13 @@ A/AAAA/HTTPS 并行查询，各自独立显示等待、正常记录、无记录�
 ### 均衡模式：国际地址缓存
 
 国际 A/AAAA 普通查询采用独立的 512 条 isolate 内正向报文缓存，并与国内缓存共享相同的 TTL、事务 ID 和空 EDNS0 处理规则。命中返回 `X-Cache: INTERNATIONAL_HIT`；国际查询不会注入国内 ECS。仅缓存完整、含请求类型地址的正常应答，不缓存负应答、DNSSEC DO、非空 OPT、回退结果或 HTTPS/ECH 记录。国内外缓存独立计数，`/monitor` 可查看各自的命中率。国际地址查询也优先完整有效地址，国内规则和其他模式不变。缓存降低 DNS 重复查询耗时，不保证实际网站/CDN 连接速度。
+
+### 国内外均衡模式实测
+
+在 Windows Python 3 或 Android Termux 中运行：
+
+```bash
+python scripts/balanced-probe.py --url 'https://你的域名/ech?enhance=balanced&cnEcs=auto' --rounds 3
+```
+
+输出国内外 A/AAAA/HTTPS 二进制 DoH 往返时间、基础 RCODE、截断标志和 X-Cache，以及当前系统网络的 TCP 连接、TLS 和首字节时间。首轮不保证冷缓存；只有 X-Cache 明确命中才视为已观察到命中。HTTPS 使用系统 DNS 和当前路由，不保证使用被测 DoH；若要比较 AdGuard 实际体验，先自行确认系统 DNS 路径，保持网络和代理状态一致。脚本不修改配置、不上传报告、不证明 ECH 握手。错误保留在报告中，不计为成功测速。

@@ -125,4 +125,22 @@ await check('real ECH bootstrap and synthesized HTTPS TTL', async () => {
   }
   console.log('Native ECH query: ' + (native.ech ? 'config exposed' : 'no JSON ECH field') + '; synthesized TTL: ' + configured.ttl);
 });
+await check('Meta ECH DNS response and compatibility alias', async () => {
+  for (const name of ['www.facebook.com', 'www.instagram.com']) {
+    const result = await api(name, 'HTTPS', { enhance: 'off' });
+    assert.ok(result.ech, name + ': no ECH config');
+    assert.ok(['dns', 'legacy-meta'].includes(result.echSource), name + ': ECH source missing');
+    assert.ok(result.ttl >= 0 && result.ttl <= (result.echSource === 'legacy-meta' ? 30 : 300));
+    console.log(name + ': ECH source ' + result.echSource + ', TTL ' + result.ttl);
+    const packet = await wire('/ech', name, 65, 'POST', { enhance: 'off' });
+    assert.equal(packet.readUInt16BE(6), 1);
+  }
+  const alias = await wire('/ech', 'fb.ech', 65, 'GET', { enhance: 'off' });
+  assert.equal(alias.readUInt16BE(6), 1);
+  assert.ok(alias.readUInt32BE(question('fb.ech', 65).length + 6) <= 300);
+});
+await check('ordinary domain retains native HTTPS policy', async () => {
+  const result = await api('example.com', 'HTTPS', { enhance: 'off' });
+  assert.equal(result.echSource, undefined);
+});
 console.log('All ' + passed + ' live Worker checks passed; this verifies DNS behavior, not end-to-end ECH/TLS connectivity.');

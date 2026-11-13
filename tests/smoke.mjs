@@ -819,4 +819,20 @@ const ecsRaceAfter=(await monitor()).ecs;
 assert.equal(ecsRaceAfter.wireAccepted-ecsRaceBefore.wireAccepted,1);
 assert.equal(ecsRaceAfter.wireRetries-ecsRaceBefore.wireRetries,0);
 binaryReplyOverride=null;
+// Pure forwarding preserves extended RCODEs; monitoring must not count BADVERS as NOERROR.
+const monitorBase=question('monitor-badvers.example.com',1);
+const monitorQuery=Buffer.concat([monitorBase,ednsPlain.subarray(-11)]);
+monitorQuery.writeUInt16BE(1,10);
+const monitorBefore=(await monitor()).wire.rcode;
+binaryReplyOverride=q=>{
+  const p=addressReply(q,monitorBase.length,0,false);
+  p.writeUInt32BE(0x01000000,p.length-6);
+  return p;
+};
+const monitorReply=await request('/doh',{method:'POST',headers:{'Content-Type':'application/dns-message'},body:monitorQuery});
+assert.equal(Buffer.from(await monitorReply.arrayBuffer()).readUInt32BE(monitorQuery.length-6),0x01000000);
+const monitorAfter=(await monitor()).wire.rcode;
+assert.equal((monitorAfter['16']||0)-(monitorBefore['16']||0),1);
+assert.equal((monitorAfter['0']||0)-(monitorBefore['0']||0),0);
+binaryReplyOverride=null;
 console.log('Doh-ECH smoke tests passed (including adaptive upstreams, Meta ECH, owner TTL and ECS)');

@@ -6,6 +6,7 @@ const calls = [];
 const cache = new Map();
 let simulateBinaryOutage = false;
 let binaryReplyOverride = null;
+let domesticWireOutage = false;
 globalThis.caches = {
   default: {
     async match(key) { return cache.get(key instanceof Request ? key.url : String(key))?.clone() || undefined; },
@@ -22,7 +23,7 @@ globalThis.fetch = async (input, init = {}) => {
     return new Response('203.0.113.55\n', { headers: { 'Content-Type': 'text/plain' } });
   }
   if ((init.method || 'GET') === 'POST' && init.body) {
-    if (simulateBinaryOutage) return new Response('temporarily unavailable', { status: 503 });
+    if (simulateBinaryOutage || (domesticWireOutage && ['dns.alidns.com','doh.pub'].includes(url.hostname))) return new Response('temporarily unavailable', { status: 503 });
     if (binaryReplyOverride) {
       return new Response(binaryReplyOverride(Buffer.from(init.body)), {
         headers: { 'Content-Type': 'application/dns-message' }
@@ -467,4 +468,38 @@ assert.equal((await apiAnswer('www.google.com','HTTPS',xh3)).policy,'native-dire
 assert.equal((await apiAnswer('x.com','HTTPS','enhance=direct')).policy,'native-direct');
 assert.equal((await apiAnswer('x.com','HTTPS','enhance=direct&xh3=bad')).policy,'native-direct');
 assert.equal((await apiAnswer('x.com','HTTPS','enhance=off&xh3=172.66.0.227')).policy,undefined);
+// Balanced daily mode preserves complete native responses and routing.
+const daily='enhance=balanced';
+const wireCalls = () => calls.filter(u=>u.endsWith('/dns-query'));
+for (const [name, group] of [['www.taobao.com','domestic'],['www.example.cn','domestic'],['x.com','international'],['www.google.com','international'],['cloudflare.com','international']]) {
+  for (const type of [1,28,65,16]) {
+    const start=wireCalls().length;
+    await wireAnswer(name,type,daily+'&best=true&ip4=1.2.3.4&xh3=172.66.0.227');
+    const hosts=wireCalls().slice(start).map(u=>new URL(u).hostname);
+    assert.ok(hosts.length>0);
+    assert.ok(hosts.every(h=>(group==='domestic'?['dns.alidns.com','doh.pub']:['cloudflare-dns.com','dns.google']).includes(h)), name+' '+type+' '+hosts);
+  }
+  const value=await apiAnswer(name,'A',daily+'&best=true&ip4=1.2.3.4');
+  assert.equal(value.policy,'balanced-'+group);
+  assert.deepEqual(value.answers,['203.0.113.17']);
+}
+const beforeDaily=wireCalls().length;
+const dailyEdns=question('www.example.cn',65,{ednsDo:true});
+const dailyReply=Buffer.from(await (await request('/ech?'+daily,{method:'POST',headers:{'Content-Type':'application/dns-message'},body:dailyEdns})).arrayBuffer());
+assert.equal(dailyReply.readUInt16BE(10),1);
+assert.deepEqual(dailyReply.subarray(12),dailyEdns.subarray(12));
+assert.ok(wireCalls().slice(beforeDaily).every(u=>['dns.alidns.com','doh.pub'].includes(new URL(u).hostname)));
+const beforeFallback=wireCalls().length;
+domesticWireOutage=true;
+await wireAnswer('www.example.cn',1,daily);
+domesticWireOutage=false;
+const fallbackHosts=wireCalls().slice(beforeFallback).map(u=>new URL(u).hostname);
+assert.ok(fallbackHosts.some(h=>['dns.alidns.com','doh.pub'].includes(h)));
+assert.ok(fallbackHosts.some(h=>['cloudflare-dns.com','dns.google'].includes(h)));
+assert.equal((await apiAnswer('failure.example.cn','A',daily)).policy,'balanced-fallback');
+assert.equal((await apiAnswer('missing.example.cn','A',daily)).rcode,3);
+assert.equal((await apiAnswer('missing.example.cn','A',daily)).policy,'balanced-domestic');
+const getQuery=question('www.example.cn',1);
+const getDaily=await request('/ech?'+daily+'&dns='+getQuery.toString('base64url'));
+assert.equal(Buffer.from(await getDaily.arrayBuffer()).readUInt16BE(0),0x1234);
 console.log('Doh-ECH smoke tests passed (including adaptive upstreams, Meta ECH, owner TTL and ECS)');

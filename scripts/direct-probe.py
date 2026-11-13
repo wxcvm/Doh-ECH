@@ -19,14 +19,15 @@ DEFAULT = "https://dohech.dpdns.org"
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 CONTEXT = ssl.create_default_context()
 
-def candidates(base, host, kind, profile):
-    query = urllib.parse.urlencode({"domain": host, "type": kind, "enhance": profile})
-    with OPENER.open(base.rstrip("/") + "/api/query?" + query, timeout=10) as response:
-        data = json.load(response)
-    if data.get("rcode", 0) != 0 or data.get("error"):
-        raise RuntimeError(str(data.get("error") or "DNS RCODE " + str(data["rcode"])))
+def read_dns_json(url):
+    request = urllib.request.Request(url, headers={"Accept": "application/dns-json",
+                                                    "User-Agent": "Doh-ECH-Direct-Probe/1.1"})
+    with OPENER.open(request, timeout=10) as response:
+        return json.load(response)
+
+def valid_addresses(values, kind):
     result = []
-    for value in data.get("answers", []):
+    for value in values:
         try:
             ip = ipaddress.ip_address(value)
             if ip.is_global and ip.version == (6 if kind == "AAAA" else 4):
@@ -34,6 +35,43 @@ def candidates(base, host, kind, profile):
         except ValueError:
             pass
     return list(dict.fromkeys(result))
+
+def candidates(base, host, kind, profile):
+    query = urllib.parse.urlencode({"domain": host, "type": kind, "enhance": profile})
+    errors = []
+    try:
+        data = read_dns_json(base.rstrip("/") + "/api/query?" + query)
+        if data.get("rcode", 0) != 0 or data.get("error"):
+            raise RuntimeError(str(data.get("error") or "DNS RCODE " + str(data["rcode"])))
+        if not isinstance(data.get("answers"), list):
+            raise ValueError("invalid Doh-ECH response")
+        return valid_addresses(data["answers"], kind)
+    except (OSError, ValueError, RuntimeError) as error:
+        errors.append("Doh-ECH: " + str(error))
+    # Public recursive resolvers supply native DNS only; never label their answers as legacy.
+    if profile != "direct":
+        raise RuntimeError("; ".join(errors))
+    dns_type = 28 if kind == "AAAA" else 1
+    query = urllib.parse.urlencode({"name": host, "type": kind})
+    for label, endpoint in (("Google Public DNS", "https://dns.google/resolve"),
+                            ("Cloudflare DNS", "https://cloudflare-dns.com/dns-query")):
+        try:
+            data = read_dns_json(endpoint + "?" + query)
+            question = data.get("Question")
+            if (not isinstance(question, list) or len(question) != 1
+                    or question[0].get("name", "").rstrip(".").lower() != host.lower()
+                    or question[0].get("type") != dns_type):
+                raise ValueError("DNS question mismatch")
+            if data.get("Status") != 0:
+                raise RuntimeError("DNS RCODE " + str(data.get("Status")))
+            answers = valid_addresses([r["data"] for r in data.get("Answer", [])
+                                       if r.get("type") == dns_type and "data" in r], kind)
+            print(f"DNS fallback {host} {kind}: {label} (Doh-ECH unavailable)", flush=True)
+            return answers
+        except (OSError, ValueError, RuntimeError, TypeError, AttributeError) as error:
+            errors.append(label + ": " + str(error))
+    raise RuntimeError("; ".join(errors))
+
 
 def probe(host, ip, source, timeout):
     result = {"host": host, "ip": ip, "source": source, "stage": "TCP",
@@ -99,6 +137,7 @@ def collect_jobs(base, hosts, legacy, timeout):
                             for ip in ips[:8] if ip not in native)
             except (OSError, ValueError, RuntimeError) as error:
                 dns_errors.append({"host": host, "type": "legacy AAAA", "error": str(error)})
+                print(f"DNS {host} legacy AAAA: unavailable ({error}); native candidates retained", flush=True)
     return jobs, dns_errors
 
 def save_candidates(path, base, jobs, dns_errors):

@@ -20,7 +20,7 @@ try {
 
   await page.getByRole('button',{name:'普通 DNS',exact:false}).click();
   await page.locator('#cards .result-card').last().waitFor();
-  await page.waitForFunction(()=>document.querySelector('#cards').children.length===3);
+  await page.waitForFunction(()=>document.querySelector('#cards').children.length===3 && !document.querySelector('#queryBtn').disabled);
   assert.equal(await page.locator('#cards .result-card').count(),3);
   assert.match(await page.locator('[data-type=A] .status').textContent(),/已返回记录/);
   assert.match(await page.locator('#resultSummary').textContent(),/github.com/);
@@ -47,7 +47,7 @@ try {
     assert.ok(data.answers.length>0,name+' must return A records');
   }
   await page.getByRole('button',{name:'国内解析',exact:false}).click();
-  await page.locator('#cards [data-type=A] .status').waitFor();
+  await page.locator('#cards [data-type=A] .status').filter({hasText:'已返回记录'}).waitFor();
   assert.match(await page.locator('#cards [data-type=A] .status').textContent(),/已返回记录/);
   assert.match(await page.locator('#resultSummary').textContent(),/taobao.com/);
   console.log('PASS real Meta, Android FCM and domestic presets');
@@ -63,7 +63,7 @@ try {
   for(const [label,domain] of [['Google 直连诊断','www.google.com'],['X 直连诊断','x.com']]){
     await page.getByRole('button',{name:label,exact:false}).click();
     await page.locator('#cards .result-card').last().waitFor();
-    await page.waitForFunction(()=>document.querySelector('#cards').children.length===3);
+    await page.waitForFunction(()=>document.querySelector('#cards').children.length===3 && !document.querySelector('#queryBtn').disabled);
     const raw=JSON.parse(await page.locator('#rawJson').textContent());
     assert.equal(raw[0].policy,'native-direct');
     assert.equal(raw[0].rcode,0,JSON.stringify(raw[0]));
@@ -94,6 +94,7 @@ try {
   assert.equal(new URL(await page.locator('#echUrl').textContent()).searchParams.toString(),'enhance=balanced');
   await page.getByRole('button',{name:'X 直连诊断',exact:false}).click();
   await page.locator('#cards [data-type=HTTPS]').waitFor();
+  await page.waitForFunction(()=>!document.querySelector('#queryBtn').disabled);
   await page.locator('#advanced summary').click();
   console.log('PASS daily balanced preset and native domestic route');
 
@@ -103,6 +104,7 @@ try {
   await page.locator('#type').selectOption('all');
   await page.locator('#queryBtn').click();
   await page.locator('#cards [data-type=HTTPS] .status').filter({hasText:'已声明 HTTP/3'}).waitFor();
+  await page.waitForFunction(()=>!document.querySelector('#queryBtn').disabled);
   const h3=JSON.parse(await page.locator('#rawJson').textContent());
   assert.deepEqual(h3[0].answers,['172.66.0.227']);
   assert.equal(h3[2].policy,'x-http3');
@@ -110,6 +112,29 @@ try {
   assert.deepEqual(h3[2].ipv4hints,['172.66.0.227']);
   assert.equal(new URL(await page.locator('#echUrl').textContent()).searchParams.get('xh3'),'172.66.0.227');
   console.log('PASS X HTTP/3 profile, address consistency and generated URL');
+
+  // A fast panel must display before a delayed HTTPS query finishes.
+  let releaseHttps;
+  const httpsGate=new Promise(resolve=>{releaseHttps=resolve;});
+  await page.route('**/api/query?*',async route=>{
+    const u=new URL(route.request().url()),type=u.searchParams.get('type'),domain=u.searchParams.get('domain');
+    if(type==='HTTPS')await httpsGate;
+    const data={domain,type,answers:type==='A'?['203.0.113.42']:[],rcode:0,ttl:60};
+    if(type==='HTTPS')data.httpsRecords=[{name:domain,ttl:60,data:'0 svc.example.'}];
+    await route.fulfill({json:data});
+  });
+  await page.locator('#domain').fill('example.com');
+  await page.locator('#type').selectOption('all');
+  await page.locator('#queryBtn').click();
+  await page.locator('#cards [data-type=A] .status').filter({hasText:'已返回记录'}).waitFor();
+  assert.match(await page.locator('#cards [data-type=HTTPS] .status').textContent(),/查询中/);
+  await page.locator('#cards [data-type=AAAA] .status').filter({hasText:'无此类记录'}).waitFor();
+  releaseHttps();
+  await page.locator('#cards [data-type=HTTPS] .status').filter({hasText:'已返回 HTTPS 记录'}).waitFor();
+  assert.match(await page.locator('#cards [data-type=HTTPS]').textContent(),/0 svc.example\./);
+  await page.waitForFunction(()=>!document.querySelector('#queryBtn').disabled);
+  await page.unroute('**/api/query?*');
+  console.log('PASS independent panels, NODATA, and native HTTPS alias record');
 
   // Restore the rule preset before checking its advanced parameters.
   await page.getByRole('button',{name:'Google IPv6',exact:false}).click();

@@ -87,7 +87,7 @@ try {
   // Daily balanced profile exposes native DNS, with a separate ready-to-copy URL.
   assert.equal(await page.locator('#balancedUrl').textContent(),new URL('/ech?enhance=balanced',base).href);
   await page.locator('#enhance').selectOption('balanced');
-  await page.locator('#domain').fill('www.baidu.com');
+  await page.locator('#domain').fill('www.taobao.com');
   await page.locator('#type').selectOption('A');
   await page.locator('#queryBtn').click();
   await page.locator('#cards [data-type=A]').filter({hasText:'日常均衡 · 国内上游'}).waitFor();

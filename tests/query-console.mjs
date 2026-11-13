@@ -175,4 +175,32 @@ try {
   assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
   assert.equal(errors.length,0,errors.join('\n'));
   console.log('PASS reset, desktop layout, no browser JavaScript errors');
+  // Monitor shell is public, data requires the existing private token.
+  await page.goto(new URL('/monitor',base).href);
+  assert.equal(await page.locator('#stats').isVisible(),false);
+  await page.locator('#token').fill('not-a-real-token');
+  await page.locator('#refresh').click();
+  await page.locator('#status').filter({hasText:'令牌不正确'}).waitFor();
+  await page.route('**/log',async route=>{
+    assert.equal(route.request().headers().authorization,'Bearer testsecret');
+    await route.fulfill({json:{metrics:{scope:'isolate',startedAt:'start',updatedAt:'now',
+      wire:{requests:3,completed:3,rcode:{'0':2,'2':1},httpErrors:0,exceptions:0,avgMs:12},
+      routing:{domestic:2,international:1,domesticAvgMs:10,internationalAvgMs:16,fallback:0},
+      cache:{domestic:{hits:1,misses:1,bypasses:0,hitRate:50,entries:1},json:{hits:0,misses:0,hitRate:null}},
+      ecs:{wireAttempts:1,wireAccepted:1,wireRetries:0,jsonRetries:0},upstreams:[]},
+      cnList:{domainCount:42,lastFetch:null},caches:{memory:{echCache:'warm'}}}});
+  });
+  await page.locator('#token').fill('testsecret');
+  await page.locator('#refresh').click();
+  await page.locator('#stats').waitFor();
+  assert.match(await page.locator('#cache').textContent(),/50%/);
+  assert.match(await page.locator('#jsonCache').textContent(),/—/);
+  assert.match(await page.locator('#wire').textContent(),/SERVFAIL1/);
+  await page.locator('#lock').click();
+  assert.equal(await page.locator('#stats').isVisible(),false);
+  assert.equal(await page.locator('#token').inputValue(),'');
+  assert.equal(await page.locator('#wire').textContent(),'');
+  assert.equal(errors.length,0,errors.join('\\n'));
+  console.log('PASS authenticated monitor, no-sample state and lock');
+
 } finally { await browser.close(); }

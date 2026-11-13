@@ -290,3 +290,23 @@ python direct-probe.py --offline
 `--prepare` 仅保存候选 IP 到 `direct-candidates.json`，不做连通性判断；`--offline` 直接使用其中的 IP 建立连接，不再请求 DNS 服务。无候选时不会覆盖已有文件。候选来自下载时的网络和 DNS 视角，仍须本机测试，不保证覆盖所有可用地址。
 
 候选获取遇到 HTTP 403、超时或其他 DNS API 失败时，新版脚本自动尝试 Google Public DNS 和 Cloudflare DNS 的 HTTPS JSON 接口获取原生候选，并校验问题域名和记录类型。备用 DNS 不生成旧增强规则地址；若 `--legacy` 获取失败，原生候选仍可继续离线测试。此回退不会修改 Worker 安全规则，也不会证明备用解析器在关闭代理后可访问。
+
+
+### 独立原生地址池与 HTTP/3 专项
+
+开启代理，仅下载候选（保留旧报告与旧候选文件，另存一份）：
+
+```bash
+python direct-probe.py --host www.google.com --host x.com --prepare --expanded --candidates direct-native.json
+```
+
+`--expanded` 独立查询 Google Public DNS 和 Cloudflare DNS 的 A/AAAA/HTTPS 记录，合并去重真实地址，保存原始 HTTPS 记录及错误；不调用项目自身的增强规则，不生成随机 IPv6，不上传报告。原生 HTTPS 记录仅用于查看服务宣告，包含 ech 参数也不能证明 ECH 握手已被接受。
+
+关闭代理、VPN/TUN 后：
+
+```bash
+python direct-probe.py --offline --candidates direct-native.json --timeout 8
+python direct-probe.py --http3-probe --candidates direct-native.json --timeout 12
+```
+
+HTTP/3 专项需要能启动且 `curl --version` 的 Features 行包含 HTTP3 的 curl。它以 `--http3-only`、指定 IP 和真实 TLS 主机名进行 QUIC/UDP 443 连接，不降级至 TCP，不关闭证书验证，不跟随重定向；验证实际 HTTP 版本、IP、证书及响应码。每域名每地址族最多两个候选；HTTP/3 专项结果单独写入 `direct-http3-result.json`，不自动生成 DNS pins。客户端不具备 HTTP/3 能力时明确跳过网络测试。仅 HTTP/3 成功不能保证浏览器后续会选择该协议，也不能证明整个网站可用。

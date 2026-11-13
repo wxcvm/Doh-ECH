@@ -322,4 +322,36 @@ const ech = await apiAnswer('cloudflare.com', 'HTTPS', 'enhance=off&ech=ech-race
 assert.equal(ech.ech, 'AAECAw==', 'ECH lookup must prefer a record that actually contains ECH');
 const json = await request('/api/query?domain=ecs.example&type=A&clientIp=192.0.2.1');
 assert.equal(json.headers.get('Cache-Control'), 'no-store');
-console.log('Doh-ECH smoke tests passed (including ECS, TTL, ECH racing and Google policies)');
+// ECH RR lifetime must not outlive its actual configuration; fake aliases follow it too.
+assert.ok(ech.ttl >= 0 && ech.ttl <= 60);
+for (const name of ['cloudflare.com', 'cf.ech']) {
+  const body = question(name, 65);
+  const path = '/ech?enhance=off&ech=ech-race.example';
+  const post = await request(path, { method: 'POST', headers: { 'Content-Type': 'application/dns-message' }, body });
+  const get = await request(path + '&dns=' + body.toString('base64url'));
+  for (const response of [post, get]) {
+    const packet = Buffer.from(await response.arrayBuffer());
+    assert.equal(packet.readUInt16BE(2) & 15, 0);
+    assert.equal(packet.readUInt16BE(6), 1);
+    assert.ok(packet.readUInt32BE(body.length + 6) <= 60, name + ' ECH TTL');
+    assert.equal(response.headers.get('X-Cache'), null, 'HTTPS RR must not use static address cache');
+  }
+}
+const unavailable = await request('/ech?ech=no-ech.example', { method: 'POST', headers: {'Content-Type':'application/dns-message'}, body: question('cf.ech', 65) });
+assert.equal(Buffer.from(await unavailable.arrayBuffer()).readUInt16BE(2) & 15, 2, 'missing ECH config must not masquerade as successful fake ECH');
+const staticBody = question('cloudflare.com', 1);
+const staticPost = await request('/ech', { method:'POST', headers:{'Content-Type':'application/dns-message'}, body:staticBody });
+const staticGet = await request('/ech?dns=' + staticBody.toString('base64url'));
+assert.deepEqual(Buffer.from(await staticPost.arrayBuffer()), Buffer.from(await staticGet.arrayBuffer()), 'GET and POST use the same static answer path');
+assert.equal(staticGet.headers.get('X-Cache'), 'DOH_HIT');
+const txt = await request('/api/query?domain=cloudflare.com&type=TXT');
+assert.equal(txt.headers.get('Cache-Control'), 'no-store', 'dynamic TXT must not use fixed-address cache');
+count = ecsCalls('ech-race.example').length;
+await apiAnswer('cloudflare.com', 'HTTPS', 'enhance=off&ech=ech-race.example&clientIp=192.0.2.123');
+assert.ok(ecsCalls('ech-race.example').length > count, 'custom ECH config is isolated by ECS prefix');
+count = ecsCalls('ech-race.example').length;
+await apiAnswer('cloudflare.com', 'HTTPS', 'enhance=off&ech=ECH-RACE.EXAMPLE.&clientIp=192.0.2.222');
+assert.equal(ecsCalls('ech-race.example').length, count, 'same ECH name and prefix share cached config');
+await apiAnswer('cloudflare.com', 'HTTPS', 'enhance=off&ech=ech-race.example&clientIp=192.0.3.1');
+assert.ok(ecsCalls('ech-race.example').length > count, 'different ECS prefix must not reuse custom ECH');
+console.log('Doh-ECH smoke tests passed (including ECS, ECH lifetimes, GET/POST and Google policies)');

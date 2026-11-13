@@ -343,3 +343,7 @@ A/AAAA/HTTPS 并行查询，各自独立显示等待、正常记录、无记录�
 ### 国内普通 EDNS0 性能优化
 
 均衡模式的国内 A/AAAA 正向缓存支持无 OPT 和空 EDNS0 OPT（版本 0、无 DO 和其他选项）。缓存键包含原始问题、OPT 字节及 ECS 网段，不跨 EDNS UDP payload 大小或请求大小写共享；应答保留原有空 OPT，TTL 仅扣减真正的资源记录。Cookie、已有 ECS、DNSSEC DO、非空响应 OPT、负应答及回退仍不缓存。普通国内地址查询收到 NODATA/NXDOMAIN 时继续尝试同组另一解析器，优先含请求类型地址的有效应答；若均无地址，保留真实 CNAME/NODATA/NXDOMAIN（不因 NXDOMAIN 触发国际回退）。该策略不改变国际、复杂 EDNS 或旧模式。在线重复查询记录真实 X-Cache 和往返时间；命中仅保证在同一 Worker isolate 与有效 TTL 内，不能推断手机 CDN 加速。
+
+### 均衡模式：国际地址缓存
+
+国际 A/AAAA 普通查询采用独立的 512 条 isolate 内正向报文缓存，并与国内缓存共享相同的 TTL、事务 ID 和空 EDNS0 处理规则。命中返回 `X-Cache: INTERNATIONAL_HIT`；国际查询不会注入国内 ECS。仅缓存完整、含请求类型地址的正常应答，不缓存负应答、DNSSEC DO、非空 OPT、回退结果或 HTTPS/ECH 记录。国内外缓存独立计数，`/monitor` 可查看各自的命中率。国际地址查询也优先完整有效地址，国内规则和其他模式不变。缓存降低 DNS 重复查询耗时，不保证实际网站/CDN 连接速度。

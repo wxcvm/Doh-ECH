@@ -111,4 +111,18 @@ await check('NXDOMAIN preserved in JSON and wire DNS', async () => {
   assert.deepEqual(result.answers, []);
   assert.equal((await wire('/ech', name, 1, 'POST', { enhance: 'off' }, 3)).readUInt16BE(6), 0);
 });
+await check('real ECH bootstrap and synthesized HTTPS TTL', async () => {
+  const native = await api('cloudflare-ech.com', 'HTTPS', { enhance: 'off' });
+  const configured = await api('cloudflare.com', 'HTTPS', { enhance: 'off' });
+  assert.ok(configured.ech, 'Cloudflare ECH config must be present');
+  assert.ok(Number.isInteger(configured.ttl) && configured.ttl >= 0 && configured.ttl <= 300);
+  for (const name of ['cloudflare.com', 'cf.ech']) {
+    for (const method of ['GET', 'POST']) {
+      const packet = await wire('/ech', name, 65, method, { enhance: 'off' });
+      assert.equal(packet.readUInt16BE(6), 1, name + ': expected HTTPS record');
+      assert.ok(packet.readUInt32BE(question(name, 65).length + 6) <= 300, name + ': excessive TTL');
+    }
+  }
+  console.log('Native ECH query: ' + (native.ech ? 'config exposed' : 'no JSON ECH field') + '; synthesized TTL: ' + configured.ttl);
+});
 console.log('All ' + passed + ' live Worker checks passed; this verifies DNS behavior, not end-to-end ECH/TLS connectivity.');

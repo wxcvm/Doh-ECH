@@ -165,11 +165,16 @@ async function monitoredDoH(req,injectEch,ctx,clientIP,env){
     }catch(e){m.exceptions++;throw e;}
     finally{m.completed++;m.ms+=Math.max(0,Date.now()-start);}
 }
-function domesticCacheKey(raw, prefix) {
-    const p=inspectDnsWire(raw), v=new DataView(raw);
+function domesticCacheKey(raw, prefix, p) {
+    const v=new DataView(raw);
     if(!p || p.questions.length!==1 || p.questions[0].compressed || ![1,28].includes(p.questions[0].type) ||
-        v.getUint16(2)!==0x0100 || v.getUint16(6) || v.getUint16(8) || v.getUint16(10)) return '';
-    // Exact question bytes retain DNS 0x20 case; transaction ID alone is excluded.
+        v.getUint16(2)!==0x0100 || v.getUint16(6) || v.getUint16(8)) return '';
+    const ar=v.getUint16(10),opt=p.opt;
+    // Empty EDNS0 is common in DNS clients. Keep its exact payload size and bytes
+    // in the key; cookies, ECS, DO, other options and signed queries bypass.
+    if(ar>1 || (ar===1 && (!opt || opt.start!==p.questionEnd || opt.end!==raw.byteLength ||
+        opt.rdlength!==0 || opt.ttl!==0)))return '';
+    // Exact question and OPT bytes retain DNS 0x20 case; only transaction ID is excluded.
     return prefix+'|'+Array.from(new Uint8Array(raw).subarray(2)).join(',');
 }
 function domesticCacheRead(key,id) {
@@ -182,15 +187,21 @@ function domesticCacheRead(key,id) {
     for(const offset of entry.offsets)v.setUint32(offset,v.getUint32(offset)-age);
     return out;
 }
-function domesticCacheWrite(key,packet,type) {
+function domesticCacheWrite(key,packet,type,clientOpt) {
     if(!key || packet.byteLength>4096)return;
     const p=inspectDnsWire(packet),v=new DataView(packet);
-    if(!p || (p.flags&0x022f) || !v.getUint16(6) || v.getUint16(8) || v.getUint16(10) ||
-       !p.records.some(r=>r.type===type) || p.records.some(r=>![1,5,28].includes(r.type)))return;
-    const ttl=Math.min(300,...p.records.map(r=>r.ttl));
+    if(!p || (p.flags&0x022f) || !v.getUint16(6) || v.getUint16(8))return;
+    const ar=v.getUint16(10),opt=p.opt;
+    // Preserve a native empty OPT only for the matching EDNS query. Never cache
+    // response-specific options or age the OPT pseudo-record's flags as a TTL.
+    if(ar>1 || (ar===1 && (!clientOpt || !opt || opt.end!==packet.byteLength ||
+        opt.rdlength!==0 || opt.ttl!==0)))return;
+    const records=p.records.slice(0,v.getUint16(6));
+    if(!records.some(r=>r.type===type) || records.some(r=>![1,5,28].includes(r.type)))return;
+    const ttl=Math.min(300,...records.map(r=>r.ttl));
     if(!ttl)return;
     if(domesticWireCache.size>=512)domesticWireCache.delete(domesticWireCache.keys().next().value);
-    domesticWireCache.set(key,{packet:packet.slice(0),stored:Date.now(),ttl,offsets:p.records.map(r=>r.ttlOffset)});
+    domesticWireCache.set(key,{packet:packet.slice(0),stored:Date.now(),ttl,offsets:records.map(r=>r.ttlOffset)});
 }
 async function forwardBalanced(rawBuffer, domain, config, clientIP) {
     const domestic=balancedDomestic(domain),group=domestic?'domestic':'international',start=Date.now(),m=runtimeMetrics.routing;
@@ -200,22 +211,24 @@ async function forwardBalanced(rawBuffer, domain, config, clientIP) {
 }
 async function forwardBalancedCore(rawBuffer, domain, config, clientIP, domestic) {
     const ecs=domestic?balancedEcsIP(config,clientIP):'';
-    const key=domestic?domesticCacheKey(rawBuffer,ecsPrefix(ecs)||'none'):'';
+    const parsed=domestic?inspectDnsWire(rawBuffer):null;
+    const key=domestic?domesticCacheKey(rawBuffer,ecsPrefix(ecs)||'none',parsed):'';
     const hit=key&&domesticCacheRead(key,new DataView(rawBuffer).getUint16(0));
     if(domestic){const c=runtimeMetrics.cache.domestic;if(!key)c.bypasses++;else if(hit)c.hits++;else c.misses++;}
     if(hit)return dnsResponse(hit,{'X-Cache':'DOMESTIC_HIT'});
-    const type=key?inspectDnsWire(rawBuffer).questions[0].type:0;
+    const type=key?parsed.questions[0].type:0;
+    const clientOpt=!!parsed?.opt;
     if(domestic) {
         const injection=addBalancedEcs(rawBuffer,ecs);
         if(injection) {
             runtimeMetrics.ecs.wireAttempts++;
-            const result=await forwardQuery(injection.body,BALANCED_CN_WIRE);
+            const result=await forwardQuery(injection.body,BALANCED_CN_WIRE,!!key);
             const packet=stripBalancedEcs(await result.arrayBuffer(),injection);
-            if(packet) {runtimeMetrics.ecs.wireAccepted++;domesticCacheWrite(key,packet,type);return dnsResponse(packet);}
+            if(packet) {runtimeMetrics.ecs.wireAccepted++;domesticCacheWrite(key,packet,type,clientOpt);return dnsResponse(packet);}
             runtimeMetrics.ecs.wireRetries++;
         }
     }
-    const result = await forwardQuery(rawBuffer, domestic ? BALANCED_CN_WIRE : BALANCED_INTL_WIRE);
+    const result = await forwardQuery(rawBuffer, domestic ? BALANCED_CN_WIRE : BALANCED_INTL_WIRE,!!key);
     const packet = await result.arrayBuffer();
     if (domestic && (new DataView(packet).getUint16(2) & 15) === 2) {
         runtimeMetrics.routing.fallback++;
@@ -223,7 +236,7 @@ async function forwardBalancedCore(rawBuffer, domain, config, clientIP, domestic
         return dnsResponse(await fallback.arrayBuffer());
     }
     // Do not cache a no-ECS retry under a personalized ECS key, or an international fallback.
-    if(domestic&&!ecs)domesticCacheWrite(key,packet,type);
+    if(domestic&&!ecs)domesticCacheWrite(key,packet,type,clientOpt);
     return dnsResponse(packet);
 }
 const DIRECT_JSON = ["https://cloudflare-dns.com/dns-query"];
@@ -2322,7 +2335,7 @@ function inspectDnsWire(buffer) {
     }
 }
 
-async function forwardQuery(body, upstreams = UPSTREAM_DNS_LIST) {
+async function forwardQuery(body, upstreams = UPSTREAM_DNS_LIST, preferAddress = false) {
     const reqInit = {
         method: 'POST',
         headers: { 'Content-Type': 'application/dns-message', 'Accept': 'application/dns-message' },
@@ -2350,12 +2363,21 @@ async function forwardQuery(body, upstreams = UPSTREAM_DNS_LIST) {
                     question.qclass !== parsedQuery.questions[i].qclass)) {
                 throw new Error('invalid DNS reply or SERVFAIL');
             }
-            return new Response(packet, {
-                headers: { 'Content-Type': 'application/dns-message' }
-            });
+            const response=new Response(packet,{headers:{'Content-Type':'application/dns-message'}});
+            // For ordinary domestic addresses only, give the other configured
+            // resolver a chance if the first returns no requested address.
+            const code=reply.flags&15;
+            const answers=reply.records.slice(0,new DataView(packet).getUint16(6));
+            const rank=(reply.flags&0x0200)?-1:code===0?
+                (answers.some(r=>r.type===parsedQuery.questions[0]?.type)?3:answers.some(r=>r.type===5)?2:1):
+                code===3?0:-1;
+            return {response,rank};
         });
     try {
-        return await raceUpstreams(upstreams, 'wire', requestUpstream, () => true);
+        const selected=await raceUpstreams(upstreams, 'wire', requestUpstream,
+            value=>!preferAddress || value.rank===3,
+            (a,b)=>!a || b.rank>a.rank?b:a);
+        return selected.response;
     } catch {
         // Do not turn a 503 HTML page into HTTP 200 application/dns-message.
         // Return a valid SERVFAIL packet with the original uncompressed question.

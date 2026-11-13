@@ -1,0 +1,25 @@
+name: Meta ECH verification
+on:
+  pull_request:
+    paths:
+      - 'scripts/probe-meta-ech.go'
+      - '.github/workflows/meta-ech-probe.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+      - name: Verify authenticated ECH negotiation
+        run: go run scripts/probe-meta-ech.go
+      - uses: actions/upload-artifact@v4
+        with:
+          name: meta-ech-probe
+          path: meta-ech-probe.json
+          retention-days: 7

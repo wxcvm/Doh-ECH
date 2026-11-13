@@ -61,6 +61,12 @@ globalThis.fetch = async (input, init = {}) => {
       if (url.hostname !== 'dns.alidns.com') return new Response('upstream failure',{status:503});
       return Response.json({Status:0,Question:question,Answer:[{name,type,TTL:50,data:'203.0.113.52'}]});
     }
+    if (name === 'https-panel.example' && type === 65) {
+      return Response.json({Status:0,Question:[{name:name+'.',type}],Answer:[
+        {name,type,TTL:60,data:'0 svc.example.'},{name,type,TTL:40,data:'1 . alpn=h2,h3'}
+      ]});
+    }
+    if (name === 'https-failure.example' && type === 65) return Response.json({Status:2,Question:[{name:name+'.',type}]});
     if (name === 'www.facebook.com' && type === 65) {
       return Response.json({ Status: 0, Question: [{ name: name + '.', type }],
         Answer: [{ name, type, TTL: 42, data: '1 . alpn=h2 ech=AAECAw==' }] });
@@ -557,4 +563,48 @@ assert.ok(wireBodies.slice(startEcs).some(x=>x.body.subarray(-11).toString('hex'
 const jsonStart=calls.length;
 await apiAnswer('www.taobao.com','A',ecsDaily);
 assert.ok(calls.slice(jsonStart).some(u=>new URL(u).searchParams.get('edns_client_subnet')==='192.0.2.0/24'));
+// HTTPS console preserves alias-mode and all service records, and reports real errors.
+const panel=await apiAnswer('https-panel.example','HTTPS','enhance=off');
+assert.deepEqual(panel.httpsRecords.map(r=>r.data),['0 svc.example.','1 . alpn=h2,h3']);
+assert.equal(panel.ttl,40);
+assert.equal((await apiAnswer('https-failure.example','HTTPS','enhance=off')).rcode,2);
+assert.equal((await apiAnswer('cloudflare.com','AAAA','enhance=off')).blocked,true);
+assert.ok((await apiAnswer('cloudflare.com','HTTPS','enhance=off')).httpsRecords.length);
+// Positive domestic cache: TTL aging, transaction IDs, exact question casing, ECS isolation.
+const cacheDomain='cache-test.example.cn';
+const cacheQuestion=question(cacheDomain,1);
+binaryReplyOverride=query=>{
+  const end=cacheQuestion.length;
+  const reply=Buffer.from(query);
+  reply.writeUInt16BE(0x8180,2);reply.writeUInt16BE(1,6);
+  const rr=Buffer.from([0xc0,0x0c,0,1,0,1,0,0,0,60,0,4,203,0,113,19]);
+  return Buffer.concat([reply.subarray(0,end),rr,reply.subarray(end)]);
+};
+async function cacheReq(params= daily, q=cacheQuestion){
+  const r=await request('/ech?'+params,{method:'POST',headers:{'Content-Type':'application/dns-message'},body:q});
+  return {hit:r.headers.get('X-Cache'),packet:Buffer.from(await r.arrayBuffer())};
+}
+let cacheStart=wireBodies.length;
+const firstCache=await cacheReq();
+assert.equal(firstCache.hit,null);
+assert.ok(wireBodies.length>cacheStart);
+cacheStart=wireBodies.length;
+const changedId=Buffer.from(cacheQuestion);changedId.writeUInt16BE(0x9876,0);
+const realNow=Date.now;
+Date.now=()=>realNow()+5000;
+const hitCache=await cacheReq(daily,changedId);
+Date.now=realNow;
+assert.equal(hitCache.hit,'DOMESTIC_HIT');
+assert.equal(wireBodies.length,cacheStart);
+assert.equal(hitCache.packet.readUInt16BE(0),0x9876);
+assert.equal(hitCache.packet.readUInt32BE(cacheQuestion.length+6),55);
+assert.equal((await cacheReq(daily+'&cnEcs=on&clientIp=192.0.2.123')).hit,null);
+assert.equal((await cacheReq(daily+'&cnEcs=on&clientIp=192.0.2.222')).hit,'DOMESTIC_HIT');
+assert.equal((await cacheReq(daily+'&cnEcs=on&clientIp=198.51.100.123')).hit,null);
+const upper=question('Cache-test.example.cn',1);
+assert.equal((await cacheReq(daily,upper)).hit,null);
+Date.now=()=>realNow()+61000;
+assert.equal((await cacheReq()).hit,null);
+Date.now=realNow;
+binaryReplyOverride=null;
 console.log('Doh-ECH smoke tests passed (including adaptive upstreams, Meta ECH, owner TTL and ECS)');

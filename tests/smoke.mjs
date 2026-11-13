@@ -692,5 +692,47 @@ binaryReplyOverride=q=>{attempts++;return addressReply(q,missingDomain.length,3,
 quality=await cacheReq(daily,missingDomain);
 assert.equal(quality.packet.readUInt16BE(2)&15,3);
 assert.equal(attempts,2,'valid NXDOMAIN does not trigger international fallback');
+// Truncation and EDNS extended errors are failed attempts, not usable address answers.
+const truncatedDomain=question('quality-truncated.example.cn',1);attempts=0;
+binaryReplyOverride=q=>{
+  const p=addressReply(q,truncatedDomain.length);
+  if(attempts++===0)p.writeUInt16BE(0x8380,2);
+  return p;
+};
+quality=await cacheReq(daily,truncatedDomain);
+assert.equal(quality.packet.readUInt16BE(2)&0x0200,0);
+assert.equal(quality.packet.readUInt16BE(6),1);
+assert.equal(attempts,2);
+const badversBase=question('quality-badvers.example.cn',1);
+const badversQuery=Buffer.concat([badversBase,ednsPlain.subarray(-11)]);
+badversQuery.writeUInt16BE(1,10);attempts=0;
+binaryReplyOverride=q=>{
+  const p=addressReply(q,badversBase.length);
+  if(attempts++===0)p.writeUInt32BE(0x01000000,p.length-6);
+  return p;
+};
+quality=await cacheReq(daily,badversQuery);
+assert.equal(quality.packet.readUInt32BE(quality.packet.length-6),0);
+assert.equal(attempts,2);
+const fallbackDomain=question('quality-truncated-fallback.example.cn',1);attempts=0;
+const routingBefore=(await monitor()).routing.fallback;
+binaryReplyOverride=q=>{
+  const p=addressReply(q,fallbackDomain.length);
+  if(attempts++<2)p.writeUInt16BE(0x8380,2);
+  return p;
+};
+quality=await cacheReq(daily,fallbackDomain);
+assert.equal(quality.packet.readUInt16BE(2)&0x0200,0);
+assert.equal(quality.packet.readUInt16BE(6),1);
+assert.equal(attempts,3);
+assert.equal((await monitor()).routing.fallback-routingBefore,1);
+const allTruncated=question('quality-all-truncated.example.cn',1);attempts=0;
+binaryReplyOverride=q=>{
+  attempts++;const p=addressReply(q,allTruncated.length);
+  p.writeUInt16BE(0x8380,2);return p;
+};
+quality=await cacheReq(daily,allTruncated);
+assert.equal(quality.packet.readUInt16BE(2)&15,2);
+assert.equal(attempts,4);
 binaryReplyOverride=null;
 console.log('Doh-ECH smoke tests passed (including adaptive upstreams, Meta ECH, owner TTL and ECS)');

@@ -42,6 +42,15 @@ globalThis.fetch = async (input, init = {}) => {
     const name = url.searchParams.get('name');
     const type = Number(url.searchParams.get('type'));
     const error = url.hostname === 'dns.alidns.com' && name === 'github.com';
+    if (name === 'ttl.example' || name === 'zero.example' || name === 'missing.example.cn' || name === 'failure.example.cn') {
+      const status = name === 'missing.example.cn' ? 3 : name === 'failure.example.cn' ? 2 : 0;
+      return Response.json({ Status: status, Question: [{ name: name + '.', type }],
+        Answer: status === 0 ? [{ name, type, TTL: name === 'zero.example' ? 0 : 12, data: '203.0.113.42' }] : [] });
+    }
+    if (name === 'ech-race.example' && type === 65) {
+      return Response.json({ Status: 0, Question: [{ name: name + '.', type }],
+        Answer: [{ name, type, TTL: 60, data: url.hostname === 'cloudflare-dns.com' ? '1 . alpn=h2 ech=AAECAw==' : '1 . alpn=h2' }] });
+    }
     return Response.json({
       Status: error ? 2 : 0,
       Question: [{ name: name + '.', type }],
@@ -267,4 +276,50 @@ assert.deepEqual((await apiAnswer('cloudflare.com', 'AAAA', 'enhance=off&nocf6=t
 assert.deepEqual((await apiAnswer('cloudflare.com', 'AAAA', 'enhance=off')).answers, []);
 assert.deepEqual((await apiAnswer('cloudflare.com', 'HTTPS', 'enhance=off&nocf6=false')).ipv6hints, ['2001:db8::17']);
 assert.equal((await apiAnswer('cloudflare.com', 'HTTPS', 'enhance=off&nocf6=true')).ipv6hints, undefined);
-console.log('Doh-ECH smoke tests passed (including upstream Google and IPv6 policies)');
+// Cache keys use canonical client subnet, resolver policy and selection mode.
+const ecsCalls = name => calls.filter(c => new URL(c).searchParams.get('name') === name);
+await apiAnswer('ecs.example', 'A', 'enhance=off&clientIp=192.0.2.123');
+assert.equal(new URL(ecsCalls('ecs.example')[0]).searchParams.get('edns_client_subnet'), '192.0.2.0/24');
+let count = ecsCalls('ecs.example').length;
+await apiAnswer('ECS.EXAMPLE.', 'A', 'enhance=off&clientIp=192.0.2.222');
+assert.equal(ecsCalls('ecs.example').length, count, 'same IPv4 prefix should hit cache');
+await apiAnswer('ecs.example', 'A', 'enhance=off&clientIp=192.0.3.1');
+assert.ok(ecsCalls('ecs.example').length > count, 'different subnet must not reuse result');
+await apiAnswer('ecs6.example', 'A', 'enhance=off&clientIp=2001:db8:abcd:12ff::42');
+assert.equal(new URL(ecsCalls('ecs6.example')[0]).searchParams.get('edns_client_subnet'), '2001:db8:abcd:1200::/56');
+count = ecsCalls('ecs6.example').length;
+await apiAnswer('ecs6.example', 'A', 'enhance=off&clientIp=2001:0db8:abcd:12aa:0:0:0:1');
+assert.equal(ecsCalls('ecs6.example').length, count, 'equivalent IPv6 /56 must share cache');
+await apiAnswer('bad-ecs.example', 'A', 'enhance=off&clientIp=2001::db8::1');
+assert.equal(new URL(ecsCalls('bad-ecs.example')[0]).searchParams.has('edns_client_subnet'), false);
+const ttl = await apiAnswer('ttl.example', 'A', 'enhance=off');
+assert.equal(ttl.ttl, 12);
+const ttlKey = [...cache.keys()].find(k => k.includes('/upstream-v2/') && k.includes('/ttl.example/'));
+assert.ok(ttlKey);
+const old = cache.get(ttlKey);
+const headers = new Headers(old.headers);
+headers.set('X-DNS-Stored-At', String(Date.now() - 5000));
+cache.set(ttlKey, new Response(await old.clone().text(), { headers }));
+const cached = await apiAnswer('ttl.example', 'A', 'enhance=off');
+assert.ok(cached.ttl <= 7 && cached.ttl > 0, 'cache hit must age TTL');
+const wireTtl = await wireAnswer('ttl.example', 1, 'enhance=off');
+assert.ok(wireTtl.readUInt32BE(question('ttl.example').length + 6) <= 7, 'wire TTL must age too');
+headers.set('X-DNS-Stored-At', String(Date.now() - 20000));
+cache.set(ttlKey, new Response(await old.clone().text(), { headers }));
+count = ecsCalls('ttl.example').length;
+await apiAnswer('ttl.example', 'A', 'enhance=off');
+assert.ok(ecsCalls('ttl.example').length > count, 'expired cache must refetch');
+await apiAnswer('zero.example', 'A', 'enhance=off');
+count = ecsCalls('zero.example').length;
+await apiAnswer('zero.example', 'A', 'enhance=off');
+assert.ok(ecsCalls('zero.example').length > count, 'TTL zero must not cache');
+for (const [name, rcode] of [['missing.example.cn',3], ['failure.example.cn',2]]) {
+  assert.equal((await apiAnswer(name, 'A', 'enhance=off')).rcode, rcode);
+  const result = await request('/ech', { method:'POST', headers:{'Content-Type':'application/dns-message'}, body:question(name) });
+  assert.equal(Buffer.from(await result.arrayBuffer()).readUInt16BE(2) & 15, rcode);
+}
+const ech = await apiAnswer('cloudflare.com', 'HTTPS', 'enhance=off&ech=ech-race.example');
+assert.equal(ech.ech, 'AAECAw==', 'ECH lookup must prefer a record that actually contains ECH');
+const json = await request('/api/query?domain=ecs.example&type=A&clientIp=192.0.2.1');
+assert.equal(json.headers.get('Cache-Control'), 'no-store');
+console.log('Doh-ECH smoke tests passed (including ECS, TTL, ECH racing and Google policies)');

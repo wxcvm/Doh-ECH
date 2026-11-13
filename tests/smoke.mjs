@@ -7,6 +7,9 @@ const cache = new Map();
 let simulateBinaryOutage = false;
 let binaryReplyOverride = null;
 let domesticWireOutage = false;
+const wireBodies = [];
+let ecsReject = false;
+let ecsMismatch = false;
 globalThis.caches = {
   default: {
     async match(key) { return cache.get(key instanceof Request ? key.url : String(key))?.clone() || undefined; },
@@ -23,6 +26,11 @@ globalThis.fetch = async (input, init = {}) => {
     return new Response('203.0.113.55\n', { headers: { 'Content-Type': 'text/plain' } });
   }
   if ((init.method || 'GET') === 'POST' && init.body) {
+    const incoming=Buffer.from(init.body);
+    wireBodies.push({host:url.hostname,body:incoming});
+    const hasInjected=incoming.subarray(-11).toString('hex').startsWith('00080007000118') || incoming.subarray(-15).toString('hex').startsWith('0008000b000238');
+    if(ecsReject && hasInjected) return new Response('no ECS',{status:503});
+    if(ecsMismatch && hasInjected) {const reply=Buffer.from(incoming);reply.writeUInt16BE(0x8180,2);reply[reply.length-1]^=1;return new Response(reply,{headers:{'Content-Type':'application/dns-message'}});}
     if (simulateBinaryOutage || (domesticWireOutage && ['dns.alidns.com','doh.pub'].includes(url.hostname))) return new Response('temporarily unavailable', { status: 503 });
     if (binaryReplyOverride) {
       return new Response(binaryReplyOverride(Buffer.from(init.body)), {
@@ -502,4 +510,51 @@ assert.equal((await apiAnswer('missing.example.cn','A',daily)).policy,'balanced-
 const getQuery=question('www.example.cn',1);
 const getDaily=await request('/ech?'+daily+'&dns='+getQuery.toString('base64url'));
 assert.equal(Buffer.from(await getDaily.arrayBuffer()).readUInt16BE(0),0x1234);
+// Domestic ECS is explicit or automatic for mainland clients, and only scoped to domestic A/AAAA/HTTPS.
+for(const name of ['www.bilibili.com','p3.douyinpic.com','res.wx.qq.com','img.alicdn.com','api.xiaohongshu.com']){
+  assert.equal((await apiAnswer(name,'A',daily)).policy,'balanced-domestic');
+}
+assert.equal((await apiAnswer('qq.com.evil.example','A',daily)).policy,'balanced-international');
+const ecsDaily=daily+'&cnEcs=on&clientIp=192.0.2.123';
+const original=question('www.taobao.com',1);
+let startEcs=wireBodies.length;
+const resultEcs=await wireAnswer('www.taobao.com',1,ecsDaily);
+let sent=wireBodies.slice(startEcs);
+assert.ok(sent.some(x=>x.body.subarray(-11).toString('hex')==='0008000700011800c00002'));
+assert.equal(resultEcs.readUInt16BE(10),0,'injected OPT must not leak to stub');
+assert.deepEqual(resultEcs.subarray(12),original.subarray(12));
+startEcs=wireBodies.length;
+await wireAnswer('www.taobao.com',28,daily+'&cnEcs=on&clientIp=2001%3Adb8%3A1234%3A5678%3A%3A1');
+assert.ok(wireBodies.slice(startEcs).some(x=>x.body.subarray(-15).toString('hex')==='0008000b0002380020010db8123456'));
+for(const [name,type,params] of [['www.google.com',1,ecsDaily],['www.taobao.com',16,ecsDaily],['www.taobao.com',1,daily+'&cnEcs=off&clientIp=192.0.2.123']]){
+  const start=wireBodies.length; await wireAnswer(name,type,params);
+  assert.ok(wireBodies.slice(start).every(x=>x.body.readUInt16BE(10)===0));
+}
+const emptyOpt=Buffer.concat([original,Buffer.from([0,0,41,4,208,0,0,0,0,0,0])]);
+emptyOpt.writeUInt16BE(1,10);
+startEcs=wireBodies.length;
+const optResponse=Buffer.from(await (await request('/ech?'+ecsDaily,{method:'POST',headers:{'Content-Type':'application/dns-message'},body:emptyOpt})).arrayBuffer());
+assert.ok(wireBodies.slice(startEcs).some(x=>x.body.subarray(-11).toString('hex')==='0008000700011800c00002'));
+assert.deepEqual(optResponse.subarray(12),emptyOpt.subarray(12),'client empty OPT retained, injected ECS removed');
+const existing=Buffer.concat([emptyOpt,Buffer.from([0,8,0,7,0,1,24,0,198,51,100])]);
+existing.writeUInt16BE(11,emptyOpt.length-2);
+startEcs=wireBodies.length;
+await request('/ech?'+ecsDaily,{method:'POST',headers:{'Content-Type':'application/dns-message'},body:existing});
+assert.ok(wireBodies.slice(startEcs).every(x=>x.body.equals(existing)),'existing client ECS untouched');
+for(const mode of ['reject','mismatch']){
+  ecsReject=mode==='reject';ecsMismatch=mode==='mismatch';startEcs=wireBodies.length;
+  const packet=await wireAnswer('www.taobao.com',1,ecsDaily);
+  ecsReject=false;ecsMismatch=false;
+  assert.equal(packet.readUInt16BE(10),0);
+  assert.ok(wireBodies.slice(startEcs).some(x=>x.body.equals(original)),'retry original domestic query after ECS failure');
+  assert.ok(wireBodies.slice(startEcs).every(x=>['dns.alidns.com','doh.pub'].includes(x.host)));
+}
+const autoReq=new Request('https://resolver.example/ech?'+daily,{method:'POST',headers:{'Content-Type':'application/dns-message','CF-Connecting-IP':'192.0.2.123'},body:original});
+Object.defineProperty(autoReq,'cf',{value:{country:'CN'}});
+startEcs=wireBodies.length;
+await worker.fetch(autoReq,env,ctx);
+assert.ok(wireBodies.slice(startEcs).some(x=>x.body.subarray(-11).toString('hex')==='0008000700011800c00002'));
+const jsonStart=calls.length;
+await apiAnswer('www.taobao.com','A',ecsDaily);
+assert.ok(calls.slice(jsonStart).some(u=>new URL(u).searchParams.get('edns_client_subnet')==='192.0.2.0/24'));
 console.log('Doh-ECH smoke tests passed (including adaptive upstreams, Meta ECH, owner TTL and ECS)');

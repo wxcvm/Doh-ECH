@@ -800,4 +800,23 @@ assert.equal(nativeResult.packet.readUInt16BE(2)&0x0200,0);
 assert.deepEqual(nativeResult.packet.subarray(nativeHttps.length),nativeRR);
 assert.equal(nativeResult.hit,null);
 binaryReplyOverride=null;
+// An incompatible ECS answer must not win over another compatible domestic resolver.
+const ecsRaceBase=question('ecs-race.example.cn',1);
+let ecsRaceAttempts=0;
+binaryReplyOverride=q=>{
+  const p=addressReply(q,ecsRaceBase.length);
+  if(ecsRaceAttempts++===0)p[p.length-1]^=1;
+  return p;
+};
+const ecsRaceBefore=(await monitor()).ecs;
+const ecsRaceStart=wireBodies.length;
+const ecsRaceResult=await cacheReq(daily+'&cnEcs=on&clientIp=192.0.2.123',ecsRaceBase);
+assert.equal(ecsRaceResult.packet.readUInt16BE(6),1);
+assert.equal(ecsRaceResult.packet.readUInt16BE(10),0);
+assert.equal(ecsRaceAttempts,2);
+assert.ok(wireBodies.slice(ecsRaceStart).every(x=>x.body.length>ecsRaceBase.length));
+const ecsRaceAfter=(await monitor()).ecs;
+assert.equal(ecsRaceAfter.wireAccepted-ecsRaceBefore.wireAccepted,1);
+assert.equal(ecsRaceAfter.wireRetries-ecsRaceBefore.wireRetries,0);
+binaryReplyOverride=null;
 console.log('Doh-ECH smoke tests passed (including adaptive upstreams, Meta ECH, owner TTL and ECS)');

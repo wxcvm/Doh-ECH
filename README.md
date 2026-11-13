@@ -277,3 +277,14 @@ python direct-probe.py --host www.google.com --host x.com --legacy
 默认候选来自真实 DNS；`--legacy` 额外检查原 Google IPv6 规则返回的一部分候选。脚本对每个真实地址直接建立 TCP 443、验证 TLS 证书和目标 SNI，再请求 HTTP 首页。仅 2xx/3xx 候选可进入本机配置，按总耗时排列，每域名每地址族最多保留三个；403/429 等仅表明收到 HTTP 响应，不算可用地址。默认不探测任意域名，仅固定的 Google/X 及其相关资源域名。可不指定 --host 检测完整列表。
 
 如果有通过项，脚本会打印 `/ech?enhance=direct&pins=...` 的专属 URL，并在本地写入 `direct-probe-result.json`。若所有地址失败，不生成虚假的成功配置。报告不会自动上传。将输出 URL 填入浏览器安全 DNS；高级设置中的 pins 也支持手动输入。同一 URL 仅指定的域名和地址族使用指定 IP，TTL 30 秒；其他域名及地址族使用原生 DNS，HTTPS 保留原生记录。浏览器可能根据原生 HTTPS hints 选择其他地址。DNS 记录到期不代表自动撤销 URL 中的 pin；网络变化后重新运行并更新 URL。多个候选依赖客户端自己的地址重试机制，服务端不声称能监测客户端网络。脚本使用普通 TLS（不证明 ECH 握手），且不绕过 VPN/TUN 路由。
+
+
+若关闭代理后连 Doh-ECH 查询接口本身都失败，请先在代理/VPN/TUN 开启、Termux 可访问 DoH 服务时下载候选，再关闭代理实测：
+
+```bash
+python direct-probe.py --host www.google.com --host x.com --legacy --prepare
+# 关闭代理、VPN/TUN 后：
+python direct-probe.py --offline
+```
+
+`--prepare` 仅保存候选 IP 到 `direct-candidates.json`，不做连通性判断；`--offline` 直接使用其中的 IP 建立连接，不再请求 DNS 服务。无候选时不会覆盖已有文件。候选来自下载时的网络和 DNS 视角，仍须本机测试，不保证覆盖所有可用地址。

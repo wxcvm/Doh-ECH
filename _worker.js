@@ -127,13 +127,14 @@ function stripBalancedEcs(packet, injection) {
     new DataView(out.buffer).setUint16(opt.dataStart-2,length);
     return out.buffer;
 }
-// Small isolate-local positive cache for ordinary domestic address queries.
+// Separate isolate-local positive caches for ordinary balanced address queries.
 const domesticWireCache = new Map();
+const internationalWireCache = new Map();
 // Aggregate counters only: no queried names, client addresses or ECS prefixes are recorded.
 const runtimeMetrics = {
     startedAt: Date.now(), wire:{requests:0,completed:0,ms:0,httpErrors:0,exceptions:0,rcode:{}},
     routing:{domestic:0,international:0,domesticMs:0,internationalMs:0,domesticCompleted:0,internationalCompleted:0,fallback:0},
-    cache:{domestic:{hits:0,misses:0,bypasses:0},json:{hits:0,misses:0}},
+    cache:{domestic:{hits:0,misses:0,bypasses:0},international:{hits:0,misses:0,bypasses:0},json:{hits:0,misses:0}},
     ecs:{wireAttempts:0,wireAccepted:0,wireRetries:0,jsonRetries:0},
     upstreams:{}
 };
@@ -145,7 +146,7 @@ function metricsSnapshot(){
     return {scope:'isolate',startedAt:new Date(m.startedAt).toISOString(),updatedAt:new Date().toISOString(),
         wire:{...w,avgMs:mean(w.ms,w.completed)},
         routing:{...r,domesticAvgMs:mean(r.domesticMs,r.domesticCompleted),internationalAvgMs:mean(r.internationalMs,r.internationalCompleted)},
-        cache:{domestic:{...cacheMetric(m.cache.domestic),entries:domesticWireCache.size},json:cacheMetric(m.cache.json)},
+        cache:{domestic:{...cacheMetric(m.cache.domestic),entries:domesticWireCache.size},international:{...cacheMetric(m.cache.international),entries:internationalWireCache.size},json:cacheMetric(m.cache.json)},
         ecs:{...m.ecs},
         upstreams:Object.entries(m.upstreams).map(([key,v])=>({key,...v,validRate:rate(v.valid,v.completed),avgMs:mean(v.ms,v.completed)}))};
 }
@@ -165,7 +166,7 @@ async function monitoredDoH(req,injectEch,ctx,clientIP,env){
     }catch(e){m.exceptions++;throw e;}
     finally{m.completed++;m.ms+=Math.max(0,Date.now()-start);}
 }
-function domesticCacheKey(raw, prefix, p) {
+function balancedCacheKey(raw, prefix, p) {
     const v=new DataView(raw);
     if(!p || p.questions.length!==1 || p.questions[0].compressed || ![1,28].includes(p.questions[0].type) ||
         v.getUint16(2)!==0x0100 || v.getUint16(6) || v.getUint16(8)) return '';
@@ -177,17 +178,17 @@ function domesticCacheKey(raw, prefix, p) {
     // Exact question and OPT bytes retain DNS 0x20 case; only transaction ID is excluded.
     return prefix+'|'+Array.from(new Uint8Array(raw).subarray(2)).join(',');
 }
-function domesticCacheRead(key,id) {
-    const entry=domesticWireCache.get(key);
+function balancedCacheRead(cache,key,id) {
+    const entry=cache.get(key);
     if(!entry)return null;
     const age=Math.floor((Date.now()-entry.stored)/1000);
-    if(age>=entry.ttl){domesticWireCache.delete(key);return null;}
+    if(age>=entry.ttl){cache.delete(key);return null;}
     const out=entry.packet.slice(0), v=new DataView(out);
     v.setUint16(0,id);
     for(const offset of entry.offsets)v.setUint32(offset,v.getUint32(offset)-age);
     return out;
 }
-function domesticCacheWrite(key,packet,type,clientOpt) {
+function balancedCacheWrite(cache,key,packet,type,clientOpt) {
     if(!key || packet.byteLength>4096)return;
     const p=inspectDnsWire(packet),v=new DataView(packet);
     if(!p || (p.flags&0x022f) || !v.getUint16(6) || v.getUint16(8))return;
@@ -200,8 +201,8 @@ function domesticCacheWrite(key,packet,type,clientOpt) {
     if(!records.some(r=>r.type===type) || records.some(r=>![1,5,28].includes(r.type)))return;
     const ttl=Math.min(300,...records.map(r=>r.ttl));
     if(!ttl)return;
-    if(domesticWireCache.size>=512)domesticWireCache.delete(domesticWireCache.keys().next().value);
-    domesticWireCache.set(key,{packet:packet.slice(0),stored:Date.now(),ttl,offsets:records.map(r=>r.ttlOffset)});
+    if(cache.size>=512)cache.delete(cache.keys().next().value);
+    cache.set(key,{packet:packet.slice(0),stored:Date.now(),ttl,offsets:records.map(r=>r.ttlOffset)});
 }
 async function forwardBalanced(rawBuffer, domain, config, clientIP) {
     const domestic=balancedDomestic(domain),group=domestic?'domestic':'international',start=Date.now(),m=runtimeMetrics.routing;
@@ -211,11 +212,13 @@ async function forwardBalanced(rawBuffer, domain, config, clientIP) {
 }
 async function forwardBalancedCore(rawBuffer, domain, config, clientIP, domestic) {
     const ecs=domestic?balancedEcsIP(config,clientIP):'';
-    const parsed=domestic?inspectDnsWire(rawBuffer):null;
-    const key=domestic?domesticCacheKey(rawBuffer,ecsPrefix(ecs)||'none',parsed):'';
-    const hit=key&&domesticCacheRead(key,new DataView(rawBuffer).getUint16(0));
-    if(domestic){const c=runtimeMetrics.cache.domestic;if(!key)c.bypasses++;else if(hit)c.hits++;else c.misses++;}
-    if(hit)return dnsResponse(hit,{'X-Cache':'DOMESTIC_HIT'});
+    const parsed=inspectDnsWire(rawBuffer);
+    const cache=domestic?domesticWireCache:internationalWireCache;
+    const key=balancedCacheKey(rawBuffer,ecsPrefix(ecs)||'none',parsed);
+    const hit=key&&balancedCacheRead(cache,key,new DataView(rawBuffer).getUint16(0));
+    const c=runtimeMetrics.cache[domestic?'domestic':'international'];
+    if(!key)c.bypasses++;else if(hit)c.hits++;else c.misses++;
+    if(hit)return dnsResponse(hit,{'X-Cache':domestic?'DOMESTIC_HIT':'INTERNATIONAL_HIT'});
     const type=key?parsed.questions[0].type:0;
     const clientOpt=!!parsed?.opt;
     if(domestic) {
@@ -224,7 +227,7 @@ async function forwardBalancedCore(rawBuffer, domain, config, clientIP, domestic
             runtimeMetrics.ecs.wireAttempts++;
             const result=await forwardQuery(injection.body,BALANCED_CN_WIRE,!!key);
             const packet=stripBalancedEcs(await result.arrayBuffer(),injection);
-            if(packet) {runtimeMetrics.ecs.wireAccepted++;domesticCacheWrite(key,packet,type,clientOpt);return dnsResponse(packet);}
+            if(packet) {runtimeMetrics.ecs.wireAccepted++;balancedCacheWrite(cache,key,packet,type,clientOpt);return dnsResponse(packet);}
             runtimeMetrics.ecs.wireRetries++;
         }
     }
@@ -236,7 +239,7 @@ async function forwardBalancedCore(rawBuffer, domain, config, clientIP, domestic
         return dnsResponse(await fallback.arrayBuffer());
     }
     // Do not cache a no-ECS retry under a personalized ECS key, or an international fallback.
-    if(domestic&&!ecs)domesticCacheWrite(key,packet,type,clientOpt);
+    if(!ecs)balancedCacheWrite(cache,key,packet,type,clientOpt);
     return dnsResponse(packet);
 }
 const DIRECT_JSON = ["https://cloudflare-dns.com/dns-query"];
@@ -2370,7 +2373,7 @@ async function forwardQuery(body, upstreams = UPSTREAM_DNS_LIST, preferAddress =
                 throw new Error('incomplete or erroneous DNS address reply');
             }
             const response=new Response(packet,{headers:{'Content-Type':'application/dns-message'}});
-            // For ordinary domestic addresses only, give the other configured
+            // For ordinary balanced addresses, give the other configured
             // resolver a chance if the first returns no requested address.
             const answers=reply.records.slice(0,new DataView(packet).getUint16(6));
             const rank=(reply.flags&0x0200)?-1:code===0?
@@ -3111,7 +3114,7 @@ function getMonitorHtml(){
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:#e8eef8;font:15px/1.6 system-ui,sans-serif}main{max-width:1080px;margin:auto;padding:24px 16px 48px}h1{font-size:26px;margin:8px 0}h2{font-size:17px;margin:0 0 10px}p{margin:6px 0}a{color:var(--blue)}.muted{color:var(--muted)}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,250px),1fr));gap:12px;margin:16px 0}.panel{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:16px;min-width:0}.row{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;border-top:1px solid var(--border);padding:7px 0}.row b{font-variant-numeric:tabular-nums}form{display:flex;gap:8px;flex-wrap:wrap;align-items:center}input,button{font:inherit;border:1px solid var(--border);background:#16243a;color:inherit;padding:9px 12px;border-radius:8px}input{flex:1;min-width:160px}button{cursor:pointer;background:#2459a8}button:disabled{opacity:.5}#status{min-height:26px}.scroll{overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:13px}td,th{text-align:left;padding:8px;border-bottom:1px solid var(--border);white-space:nowrap}td:first-child{white-space:normal;overflow-wrap:anywhere}th{color:var(--muted)}[hidden]{display:none!important}
 </style></head><body><main><a href="/">返回查询台</a><h1>运行监控</h1><p class="muted">当前 Worker 实例 · 自启动累计 · 不等于账户过去 24 小时。请求可能被分配到其他实例，刷新后的计数可能变化。无样本显示 —，不伪造 0% 或延迟。</p>
 <section class="panel"><h2>管理员验证</h2><form id="auth"><input id="token" type="password" placeholder="DOH_ADMIN_TOKEN" aria-label="管理员令牌" autocomplete="off" required><button id="refresh">读取统计</button><button id="lock" type="button">锁定</button></form><p class="muted">令牌只用于本次页面内请求，不保存、不写入网址。未设置令牌或验证失败时无法读取。</p><p id="status" role="status" aria-live="polite">请输入管理员令牌。</p></section>
-<div id="stats" hidden><p id="scope" class="muted"></p><div class="grid"><section class="panel"><h2>客户端 DoH</h2><div id="wire"></div></section><section class="panel"><h2>均衡国内外分流</h2><div id="routing"></div></section><section class="panel"><h2>国内地址缓存</h2><div id="cache"></div></section><section class="panel"><h2>JSON 上游缓存</h2><div id="jsonCache"></div></section><section class="panel"><h2>ECS 就近解析</h2><div id="ecs"></div></section><section class="panel"><h2>国内域名库</h2><div id="domains"></div></section></div>
+<div id="stats" hidden><p id="scope" class="muted"></p><div class="grid"><section class="panel"><h2>客户端 DoH</h2><div id="wire"></div></section><section class="panel"><h2>均衡国内外分流</h2><div id="routing"></div></section><section class="panel"><h2>国内地址缓存</h2><div id="cache"></div></section><section class="panel"><h2>国际地址缓存</h2><div id="internationalCache"></div></section><section class="panel"><h2>JSON 上游缓存</h2><div id="jsonCache"></div></section><section class="panel"><h2>ECS 就近解析</h2><div id="ecs"></div></section><section class="panel"><h2>国内域名库</h2><div id="domains"></div></section></div>
 <section class="panel"><h2>上游有效响应</h2><p class="muted">包含后台预热、查询台和实际 DNS；有效应答含 NXDOMAIN、无记录。耗时为 Worker 到上游，不是客户端访问延迟。</p><div class="scroll"><table><thead><tr><th>解析器 / 类型</th><th>尝试</th><th>已完成</th><th>有效率</th><th>失败</th><th>平均耗时</th></tr></thead><tbody id="upstreams"></tbody></table></div></section></div></main>
 <script>
 (()=>{'use strict';const $=id=>document.getElementById(id),fmt=(v,s='')=>v==null?'—':String(v)+s;
@@ -3122,6 +3125,7 @@ $('scope').textContent='实例启动 '+m.startedAt+' · 采样 '+m.updatedAt;
 rows('wire',[['请求',w.requests],['已完成',w.completed],['NOERROR',w.rcode['0']||0],['SERVFAIL',w.rcode['2']||0],['NXDOMAIN',w.rcode['3']||0],['其他 DNS 结果',Object.entries(w.rcode).filter(([k])=>!['0','2','3'].includes(k)).reduce((n,[,v])=>n+v,0)],['HTTP 错误',w.httpErrors],['未捕获异常',w.exceptions],['平均处理时间',fmt(w.avgMs,' ms')]]);
 rows('routing',[['国内',r.domestic],['国内平均',fmt(r.domesticAvgMs,' ms')],['国际',r.international],['国际平均',fmt(r.internationalAvgMs,' ms')],['国内故障回退',r.fallback]]);
 rows('cache',[['命中',c.hits],['未命中',c.misses],['跳过',c.bypasses],['命中率',fmt(c.hitRate,'%')],['当前条数',c.entries]]);
+const ic=m.cache.international;rows('internationalCache',[['命中',ic.hits],['未命中',ic.misses],['跳过',ic.bypasses],['命中率',fmt(ic.hitRate,'%')],['当前条数',ic.entries]]);
 rows('jsonCache',[['命中',j.hits],['未命中',j.misses],['命中率',fmt(j.hitRate,'%')]]);
 rows('ecs',[['尝试附加',e.wireAttempts],['兼容应答（不保证采纳）',e.wireAccepted],['原报文重试',e.wireRetries],['JSON 无 ECS 重试',e.jsonRetries]]);
 rows('domains',[['域名数',data.cnList.domainCount],['最近刷新',data.cnList.lastFetch||'尚未刷新'],['ECH 预热',data.caches.memory.echCache]]);

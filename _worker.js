@@ -52,7 +52,10 @@ const BALANCED_CN_SUFFIXES = new Set([
     "kuaishou.com","gifshow.com","ksapisrv.com","xiaohongshu.com","xhscdn.com","sina.com.cn","weibo.com",
     "iqiyi.com","qiyi.com","youku.com","ykimg.com","amap.com","autonavi.com","12306.cn","pinduoduo.com",
     "yangkeduo.com","bcebos.com","aliyuncs.com","myqcloud.com","qcloud.com","ctyun.cn","chinamobile.com",
-    "chinaunicom.com","chinatelecom.com.cn","mgtv.com","douyu.com","huya.com","zhihu.com","zhimg.com"
+    "chinaunicom.com","chinatelecom.com.cn","mgtv.com","douyu.com","huya.com","zhihu.com","zhimg.com",
+    "biliapi.net","biliapi.com","bilivideo.net","douyinstatic.com","douyinliving.com",
+    "bytecdn.cn","snssdk.com","tencent.com","weixin.com",
+    "taobaocdn.com","tbcdn.cn","jdcdn.com","126.net","tudou.com"
 ]);
 function balancedDomestic(domain) {
     if (!cnDomainSet) cnDomainSet = new Set(CN_DOMAIN_SUFFIXES);

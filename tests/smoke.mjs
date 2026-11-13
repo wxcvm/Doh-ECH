@@ -521,6 +521,16 @@ for(const name of ['www.bilibili.com','p3.douyinpic.com','res.wx.qq.com','img.al
   assert.equal((await apiAnswer(name,'A',daily)).policy,'balanced-domestic');
 }
 assert.equal((await apiAnswer('qq.com.evil.example','A',daily)).policy,'balanced-international');
+for(const name of ['api.biliapi.net','api.biliapi.com','upos.bilivideo.net','lf.douyinstatic.com','api.snssdk.com','www.tencent.com','res.weixin.com','img.taobaocdn.com','img.jdcdn.com','img.126.net','www.tudou.com']){
+  assert.equal((await apiAnswer(name,'A',daily)).policy,'balanced-domestic',name);
+  const start=wireBodies.length;
+  await wireAnswer(name,1,daily);
+  assert.ok(wireBodies.slice(start).length>0);
+  assert.ok(wireBodies.slice(start).every(x=>['dns.alidns.com','doh.pub'].includes(x.host)),name);
+}
+for(const name of ['biliapi.net.example.com','notjdcdn.com','tencent.com.example.com','www.tiktok.com','www.youtube.com']){
+  assert.equal((await apiAnswer(name,'A',daily)).policy,'balanced-international',name);
+}
 const ecsDaily=daily+'&cnEcs=on&clientIp=192.0.2.123';
 const original=question('www.taobao.com',1);
 let startEcs=wireBodies.length;

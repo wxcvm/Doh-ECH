@@ -794,7 +794,7 @@ async function resolveDNS(domain, type, config, clientIP) {
         const ruleObj = (config.enhance === 'rule' || config.enhance === 'full')
             ? await matchRule(domain, config) : null;
         if (isTypeBlocked(type, ruleObj, config, effectiveCF)) {
-            return { domain, type, answers: [], ech: null };
+            return { domain, type, answers: [], ech: null, blocked: true };
         }
         if (ruleObj) {
             const ips = ruleObj.ips.filter(ip => type === 'AAAA' ? ip.includes(':') : !ip.includes(':'));
@@ -829,22 +829,8 @@ async function resolveDNS(domain, type, config, clientIP) {
             const result = await buildEnhancedHttpsRecord(domain, config, clientIP);
             return cleanResult(result);
         }
-        // 默认返回上游原始 HTTPS 记录
-        const data = await queryUpstreamDNS(domain, 65, clientIP);
-        const result = { domain, type, answers: [] };
-        if (data?.Answer) {
-            const rec = data.Answer.find(r => r.type === 65);
-            if (rec) {
-                const parsed = parseHttpsRecordFull(rec.data);  
-                if (parsed) {
-                    result.ech = parsed.ech || null;
-                    if (parsed.ipv4hints && parsed.ipv4hints.length > 0) result.ipv4hints = parsed.ipv4hints;
-                    if (parsed.ipv6hints && parsed.ipv6hints.length > 0) result.ipv6hints = parsed.ipv6hints;
-                    result.alpn = parsed.alpn || '';
-                }
-            }
-        }
-        return result;
+        // 默认返回上游原始 HTTPS 记录，保留错误码、TTL 与全部记录。
+        return await resolveFallbackRecord(domain, type, clientIP);
     }
     // 通用兜底：CNAME、TXT、MX 等所有其他类型
     return await resolveFallbackRecord(domain, type, clientIP);
@@ -924,7 +910,7 @@ async function handleCNDomain(domain, type, config, clientIP) {
 
     // 1. 检查屏蔽（复用 isTypeBlocked）
     if (isTypeBlocked(type, ruleObj, config, false)) {
-        return { domain, type, answers: [], ech: null };
+        return { domain, type, answers: [], ech: null, blocked: true };
     }
 
     // 2. 规则提供了对应类型的 IP → 直接返回规则 IP
@@ -1327,6 +1313,8 @@ function buildHttpsRecordFromParams(domain, params, ipv4Hints, ipv6Hints) {
     const result = { domain, type: 'HTTPS', answers: [] };
     result.ech = finalParams.find(p => p.key === 'ech')?.val || null;
     result.httpsRecord = httpsRecord;
+    result.httpsRecords = [{name:domain,data:'1 . '+finalParams.map(p=>p.key+(p.val===''?'':'='+p.val)).join(' ')}];
+    result.alpn = finalParams.find(p=>p.key==='alpn')?.val || '';
     if (ipv4Hints.length) result.ipv4hints = ipv4Hints;
     if (ipv6Hints.length) result.ipv6hints = ipv6Hints;
     return result;
@@ -2365,7 +2353,7 @@ async function resolveFallbackRecord(domain, type, clientIP, upstreamUrl = null)
     if (!data) return { domain, type, answers: [], ech: null, rcode: 2, ttl: 0 };
 
     if (type === 'HTTPS') {
-        const result = { domain, type, answers: [], rcode: data.Status === 3 ? 3 : 0, ttl: upstreamAnswerTtl(data, 600) };
+        const result = { domain, type, answers: [], httpsRecords: (data.Answer || []).filter(r=>r.type===65).map(r=>({name:r.name,ttl:r.TTL,data:r.data})), rcode: data.Status === 3 ? 3 : 0, ttl: upstreamAnswerTtl(data, 600) };
         if (data?.Answer) {
             const rec = data.Answer.find(r => r.type === 65);
             if (rec) {
@@ -3124,24 +3112,27 @@ function cardFor(type,out){
  const title=el('div','result-title');title.append(el('h3','',typeNames[type]||type));
  let status='已返回记录',tone='good',description='';
  const d=out.data;
- if(out.error){status='查询失败';tone='bad';description=out.error;}
+ if(out.pending){status='查询中…';tone='warn';description='正在等待上游 DNS 应答。';}
+ else if(out.error){status='查询失败';tone='bad';description=out.error;}
  else if(d.rcode===3){status='域名不存在';tone='warn';description='上游返回 NXDOMAIN（RCODE 3）。';}
  else if(d.rcode!==undefined&&d.rcode!==0){status='解析失败';tone='bad';description='DNS 错误码 '+d.rcode+'，可以稍后重试。';}
  else if(type==='HTTPS'){
   if(d.policy==='x-http3'){status='已声明 HTTP/3';description='DNS 已声明 h3,h2；需要实际浏览器连接验证，不代表 ECH 已启用。';}
   else if(d.ech){status='已取得 ECH 配置';description=d.echSource==='legacy-meta'?'使用 Meta 兼容配置，需实际握手验证。':'已取得 ECH 配置，是否接受仍需实际握手验证。';}
-  else{status='未取得 ECH';tone='warn';description='未返回 ECH 配置，不一定表示域名异常。';}
- }else if(!Array.isArray(d.answers)||!d.answers.length){status='无此类记录';tone='warn';description='可能是域名未发布该记录，或当前解析策略屏蔽了此类型。';}
+  else if(d.httpsRecords?.length || d.alpn || d.ipv4hints?.length || d.ipv6hints?.length){status='已返回 HTTPS 记录';description='原生或配置的 HTTPS 记录存在，未声明 ECH。';}
+  else{status='无 HTTPS 记录';tone='warn';description='上游未发布此类型记录，不代表网站无法访问。';}
+ }else if(d.blocked){status='策略屏蔽';tone='warn';description='当前增强配置明确屏蔽了此地址类型。';}
+ else if(!Array.isArray(d.answers)||!d.answers.length){status='无此类记录';tone='warn';description='可能是域名未发布该记录，或当前解析策略屏蔽了此类型。';}
  else{description='DNS 返回 '+d.answers.length+' 条记录。';}
  title.append(el('span','status '+tone,status));card.append(title,el('p','muted',description));
- if(d){if(d.policy==='balanced-domestic')line(card,'解析策略：日常均衡 · 国内上游');if(d.policy==='balanced-international')line(card,'解析策略：日常均衡 · 国际上游');if(d.policy==='balanced-fallback')line(card,'解析策略：日常均衡 · 国内故障回退');if(d.policy==='native-direct')line(card,'解析策略：原生 DNS（未替换地址）');if(d.policy==='local-pins')line(card,'解析策略：本机指定地址（服务器未验证你的网络）');if(d.policy==='x-http3')line(card,'解析策略：X HTTP/3 实验配置（浏览器自行选择协议）');if(d.alpn)line(card,'ALPN：'+d.alpn);values(card,d.answers);if(d.ipv4hints?.length){line(card,'IPv4 提示');values(card,d.ipv4hints);}if(d.ipv6hints?.length){line(card,'IPv6 提示');values(card,d.ipv6hints);}if(d.echSource)line(card,'ECH 来源：'+(d.echSource==='legacy-meta'?'Meta 兼容配置':d.echSource==='dns'?'DNS 动态配置':d.echSource));if(Number.isFinite(d.ttl))line(card,'TTL：'+d.ttl+' 秒');}
+ if(d){if(d.policy==='balanced-domestic')line(card,'解析策略：日常均衡 · 国内上游');if(d.policy==='balanced-international')line(card,'解析策略：日常均衡 · 国际上游');if(d.policy==='balanced-fallback')line(card,'解析策略：日常均衡 · 国内故障回退');if(d.policy==='native-direct')line(card,'解析策略：原生 DNS（未替换地址）');if(d.policy==='local-pins')line(card,'解析策略：本机指定地址（服务器未验证你的网络）');if(d.policy==='x-http3')line(card,'解析策略：X HTTP/3 实验配置（浏览器自行选择协议）');if(d.alpn)line(card,'ALPN：'+d.alpn);if(d.httpsRecords?.length){line(card,'HTTPS 记录');values(card,d.httpsRecords.map(r=>r.data));}if(d.ech){line(card,'ECH 配置');values(card,[d.ech]);}values(card,d.answers);if(d.ipv4hints?.length){line(card,'IPv4 提示');values(card,d.ipv4hints);}if(d.ipv6hints?.length){line(card,'IPv6 提示');values(card,d.ipv6hints);}if(d.echSource)line(card,'ECH 来源：'+(d.echSource==='legacy-meta'?'Meta 兼容配置':d.echSource==='dns'?'DNS 动态配置':d.echSource));if(Number.isFinite(d.ttl))line(card,'TTL：'+d.ttl+' 秒');}
  if(Number.isFinite(out.ms))line(card,'查询耗时：'+out.ms+' ms（浏览器到服务的请求时间）');
  return card;
 }
 async function queryOne(domain,type,settings){
  const p=new URLSearchParams(settings);p.set('domain',domain);p.set('type',type);
  const start=performance.now();const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),15000);
- try{const r=await fetch('/api/query?'+p.toString(),{signal:controller.signal});const data=await r.json();if(!r.ok||data.error)throw new Error(data.error||'HTTP '+r.status);return {type,data,ms:Math.round(performance.now()-start)};}
+ try{const r=await fetch('/api/query?'+p.toString(),{signal:controller.signal});const data=await r.json();if(!data||typeof data!=='object'||!Array.isArray(data.answers)&&!data.error)throw new Error('服务返回了无效 DNS 数据');if(!r.ok||data.error)throw new Error(data.error||'HTTP '+r.status);return {type,data,ms:Math.round(performance.now()-start)};}
  catch(err){return {type,error:err.name==='AbortError'?'查询超时，请重试。':String(err.message||err),ms:Math.round(performance.now()-start)};}
  finally{clearTimeout(timer);}
 }
@@ -3153,14 +3144,15 @@ async function run(){
  const mode=$('enhance').value;busy=true;$('queryBtn').disabled=true;$('queryBtn').textContent='查询中…';
  document.querySelectorAll('.preset,#resetBtn').forEach(b=>b.disabled=true);
  $('feedback').textContent='正在查询 '+domain+'…';$('results').hidden=false;$('resultSummary').textContent=domain+' · '+modeNames[mode]+' · 查询中';
- $('cards').replaceChildren();$('rawJson').textContent='';
+ const outcomes=types.map(t=>({type:t,pending:true}));
+ function render(){ $('cards').replaceChildren(...outcomes.map(o=>cardFor(o.type,o)));$('rawJson').textContent=JSON.stringify(outcomes.map(o=>o.data||{type:o.type,...(o.pending?{pending:true}:{error:o.error})}),null,2); }
+ render();
  try{
-  const outcomes=await Promise.all(types.map(t=>queryOne(domain,t,settings)));
-  $('cards').replaceChildren(...outcomes.map(o=>cardFor(o.type,o)));
-  $('rawJson').textContent=JSON.stringify(outcomes.map(o=>o.data||{type:o.type,error:o.error}),null,2);
+  await Promise.all(types.map(async(t,i)=>{outcomes[i]=await queryOne(domain,t,settings);render();}));
+
   const completed=outcomes.filter(o=>!o.error&&(!o.data.rcode||o.data.rcode===0)).length;
   $('resultSummary').textContent=domain+' · '+modeNames[mode]+' · '+completed+'/'+types.length+' 项正常返回';
-  $('feedback').textContent='查询完成。结果在下方。';
+  $('feedback').textContent=completed===types.length?'查询完成。结果在下方。':'查询完成，部分记录异常或不存在；请查看各面板。';
   if(matchMedia('(max-width:760px)').matches) $('results').scrollIntoView({block:'start',behavior:matchMedia('(prefers-reduced-motion: reduce)').matches?'instant':'smooth'});
  }finally{busy=false;$('queryBtn').disabled=false;$('queryBtn').textContent='开始查询';document.querySelectorAll('.preset,#resetBtn').forEach(b=>b.disabled=false);}
 }

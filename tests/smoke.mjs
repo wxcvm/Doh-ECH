@@ -766,5 +766,28 @@ const intlNegative=question('cache-negative.example.com',1);
 binaryReplyOverride=q=>addressReply(q,intlNegative.length,3,false);
 assert.equal((await cacheReq(daily,intlNegative)).hit,null);
 assert.equal((await cacheReq(daily,intlNegative)).hit,null);
+// Native HTTPS replies retain their original wire records and recover from NODATA/TC.
+const nativeHttps=question('native-quality.example.com',65);
+const nativeRR=Buffer.from([0xc0,0x0c,0,65,0,1,0,0,0,60,0,3,0,1,0]);
+attempts=0;
+binaryReplyOverride=q=>{
+  const p=Buffer.from(q);p.writeUInt16BE(0x8180,2);
+  if(attempts++===0)return p;
+  p.writeUInt16BE(1,6);return Buffer.concat([p,nativeRR]);
+};
+let nativeResult=await cacheReq(daily,nativeHttps);
+assert.equal(attempts,2);
+assert.deepEqual(nativeResult.packet.subarray(nativeHttps.length),nativeRR);
+assert.equal(nativeResult.hit,null);
+attempts=0;
+binaryReplyOverride=q=>{
+  const p=Buffer.from(q);p.writeUInt16BE(attempts++===0?0x8380:0x8180,2);
+  p.writeUInt16BE(1,6);return Buffer.concat([p,nativeRR]);
+};
+nativeResult=await cacheReq(daily,nativeHttps);
+assert.equal(attempts,2);
+assert.equal(nativeResult.packet.readUInt16BE(2)&0x0200,0);
+assert.deepEqual(nativeResult.packet.subarray(nativeHttps.length),nativeRR);
+assert.equal(nativeResult.hit,null);
 binaryReplyOverride=null;
 console.log('Doh-ECH smoke tests passed (including adaptive upstreams, Meta ECH, owner TTL and ECS)');

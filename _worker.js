@@ -166,9 +166,9 @@ async function monitoredDoH(req,injectEch,ctx,clientIP,env){
     }catch(e){m.exceptions++;throw e;}
     finally{m.completed++;m.ms+=Math.max(0,Date.now()-start);}
 }
-function balancedCacheKey(raw, prefix, p) {
+function balancedCacheKey(raw, prefix, p, types=[1,28]) {
     const v=new DataView(raw);
-    if(!p || p.questions.length!==1 || p.questions[0].compressed || ![1,28].includes(p.questions[0].type) ||
+    if(!p || p.questions.length!==1 || p.questions[0].compressed || !types.includes(p.questions[0].type) ||
         v.getUint16(2)!==0x0100 || v.getUint16(6) || v.getUint16(8)) return '';
     const ar=v.getUint16(10),opt=p.opt;
     // Empty EDNS0 is common in DNS clients. Keep its exact payload size and bytes
@@ -219,23 +219,25 @@ async function forwardBalancedCore(rawBuffer, domain, config, clientIP, domestic
     const c=runtimeMetrics.cache[domestic?'domestic':'international'];
     if(!key)c.bypasses++;else if(hit)c.hits++;else c.misses++;
     if(hit)return dnsResponse(hit,{'X-Cache':domestic?'DOMESTIC_HIT':'INTERNATIONAL_HIT'});
+    // Native HTTPS records also need complete, usable replies, but are not cached.
+    const preferRecord=!!key || !!balancedCacheKey(rawBuffer,'none',parsed,[65]);
     const type=key?parsed.questions[0].type:0;
     const clientOpt=!!parsed?.opt;
     if(domestic) {
         const injection=addBalancedEcs(rawBuffer,ecs);
         if(injection) {
             runtimeMetrics.ecs.wireAttempts++;
-            const result=await forwardQuery(injection.body,BALANCED_CN_WIRE,!!key);
+            const result=await forwardQuery(injection.body,BALANCED_CN_WIRE,preferRecord);
             const packet=stripBalancedEcs(await result.arrayBuffer(),injection);
             if(packet) {runtimeMetrics.ecs.wireAccepted++;balancedCacheWrite(cache,key,packet,type,clientOpt);return dnsResponse(packet);}
             runtimeMetrics.ecs.wireRetries++;
         }
     }
-    const result = await forwardQuery(rawBuffer, domestic ? BALANCED_CN_WIRE : BALANCED_INTL_WIRE,!!key);
+    const result = await forwardQuery(rawBuffer, domestic ? BALANCED_CN_WIRE : BALANCED_INTL_WIRE,preferRecord);
     const packet = await result.arrayBuffer();
     if (domestic && (new DataView(packet).getUint16(2) & 15) === 2) {
         runtimeMetrics.routing.fallback++;
-        const fallback = await forwardQuery(rawBuffer, BALANCED_INTL_WIRE,!!key);
+        const fallback = await forwardQuery(rawBuffer, BALANCED_INTL_WIRE,preferRecord);
         return dnsResponse(await fallback.arrayBuffer());
     }
     // Do not cache a no-ECS retry under a personalized ECS key, or an international fallback.
@@ -2338,7 +2340,7 @@ function inspectDnsWire(buffer) {
     }
 }
 
-async function forwardQuery(body, upstreams = UPSTREAM_DNS_LIST, preferAddress = false) {
+async function forwardQuery(body, upstreams = UPSTREAM_DNS_LIST, preferRecord = false) {
     const reqInit = {
         method: 'POST',
         headers: { 'Content-Type': 'application/dns-message', 'Accept': 'application/dns-message' },
@@ -2369,12 +2371,12 @@ async function forwardQuery(body, upstreams = UPSTREAM_DNS_LIST, preferAddress =
             // A partial packet or an EDNS extended error is not a usable address
             // answer. Mark it failed so the normal resolver/fallback path can recover.
             const code=(reply.flags&15)|((reply.opt?.ttl>>>24)<<4);
-            if(preferAddress && ((reply.flags&0x0200) || ![0,3].includes(code))) {
-                throw new Error('incomplete or erroneous DNS address reply');
+            if(preferRecord && ((reply.flags&0x0200) || ![0,3].includes(code))) {
+                throw new Error('incomplete or erroneous DNS record reply');
             }
             const response=new Response(packet,{headers:{'Content-Type':'application/dns-message'}});
-            // For ordinary balanced addresses, give the other configured
-            // resolver a chance if the first returns no requested address.
+            // For ordinary balanced address/HTTPS queries, give the other configured
+            // resolver a chance if the first returns no requested record.
             const answers=reply.records.slice(0,new DataView(packet).getUint16(6));
             const rank=(reply.flags&0x0200)?-1:code===0?
                 (answers.some(r=>r.type===parsedQuery.questions[0]?.type)?3:answers.some(r=>r.type===5)?2:1):
@@ -2383,7 +2385,7 @@ async function forwardQuery(body, upstreams = UPSTREAM_DNS_LIST, preferAddress =
         });
     try {
         const selected=await raceUpstreams(upstreams, 'wire', requestUpstream,
-            value=>!preferAddress || value.rank===3,
+            value=>!preferRecord || value.rank===3,
             (a,b)=>!a || b.rank>a.rank?b:a);
         return selected.response;
     } catch {

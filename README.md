@@ -248,6 +248,14 @@ DOH_ALLOWED_SUB_HOSTS = "feeds.example.com"
   默认获取 DoH 客户端 IP（可用 `clientIp` 自定义），向上游仅发送规范化的 IPv4 /24 或 IPv6 /56 网段；按网段及上游策略隔离缓存。ECS 可能帮助就近解析，但不保证最佳连接性能。
 
 
+### 日常均衡配置（推荐给 AdGuard 和支持 DoH 的浏览器）
+
+使用 `https://你的域名/ech?enhance=balanced`：国内域名优先阿里 DNS / DNSPod，国际域名使用 Cloudflare DNS / Google Public DNS，组内继续使用已有的自适应上游选择。国内组全部失败（SERVFAIL）才回退国际组；真实 NXDOMAIN 或无该类型记录不因此改写。Google/X 已知国际域名优先于国内列表分类。
+
+本模式按原始 DNS 二进制报文转发单问题 IN 查询，包括 A、AAAA、HTTPS/SVCB、CNAME、TXT 与 DNSSEC 请求；不生成随机 IPv6，不固定 CDN 地址，不注入 ECH、不屏蔽 IPv6、不强制协议，也不读取高级地址覆盖或订阅。上游原生 ECH/HTTP3 元数据原样保留。查询台 JSON 与二进制路径使用相同上游分组，但因查询方式不同不保证逐字节/逐记录相同；本模式不额外注入客户端 ECS，保留客户端原始报文中的 EDNS。国内就近解析、ECS 与测速的进一步优化作为后续专项。
+
+旧 `/doh`、`/ech` 默认、`enhance=direct/rule/full` 及 X HTTP/3 实验配置保持不变。AdGuard 使用均衡地址后，可保留 DNS 过滤和正常广告拦截；不要求全局关闭 HTTPS 过滤或强制 QUIC。DNS 服务可达性、实际网站连接及 CDN 地理最优仍需在本地验证。
+
 ### Google / X 原生直连诊断
 
 - 查询台新增 **Google 直连诊断** 与 **X 直连诊断**，可同时检查 A、AAAA、HTTPS 记录。

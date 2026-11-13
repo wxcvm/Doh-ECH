@@ -264,3 +264,16 @@ curl.exe --noproxy "*" --doh-url "$dns" -4 --connect-timeout 8 --max-time 20 -I 
 ```
 
 HTTP 200/3xx 表示收到网站响应；403/429 也表示 TLS/HTTP 已到达服务，但不代表网页可正常使用。若超时或 TLS 失败，检查本机 IPv6 路由、代理状态及运营商网络。curl 的实际 ECH 能力取决于其 TLS 后端，此命令不保证使用 ECH。
+
+
+### 本机实测优选（Google / X）
+
+在 Android 的 Termux 或 Windows 的 Python 3 中运行 `scripts/direct-probe.py`。不需要额外 Python 库，不修改网络设置，不上传报告。先关闭代理、VPN、TUN，再运行：
+
+```bash
+python direct-probe.py --host www.google.com --host x.com --legacy
+```
+
+默认候选来自真实 DNS；`--legacy` 额外检查原 Google IPv6 规则返回的一部分候选。脚本对每个真实地址直接建立 TCP 443、验证 TLS 证书和目标 SNI，再请求 HTTP 首页。仅 2xx/3xx 候选可进入本机配置，按总耗时排列，每域名每地址族最多保留三个；403/429 等仅表明收到 HTTP 响应，不算可用地址。默认不探测任意域名，仅固定的 Google/X 及其相关资源域名。可不指定 --host 检测完整列表。
+
+如果有通过项，脚本会打印 `/ech?enhance=direct&pins=...` 的专属 URL，并在本地写入 `direct-probe-result.json`。若所有地址失败，不生成虚假的成功配置。报告不会自动上传。将输出 URL 填入浏览器安全 DNS；高级设置中的 pins 也支持手动输入。同一 URL 仅指定的域名和地址族使用指定 IP，TTL 30 秒；其他域名及地址族使用原生 DNS，HTTPS 保留原生记录。浏览器可能根据原生 HTTPS hints 选择其他地址。DNS 记录到期不代表自动撤销 URL 中的 pin；网络变化后重新运行并更新 URL。多个候选依赖客户端自己的地址重试机制，服务端不声称能监测客户端网络。脚本使用普通 TLS（不证明 ECH 握手），且不绕过 VPN/TUN 路由。

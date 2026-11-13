@@ -232,7 +232,7 @@ async function forwardBalancedCore(rawBuffer, domain, config, clientIP, domestic
     const packet = await result.arrayBuffer();
     if (domestic && (new DataView(packet).getUint16(2) & 15) === 2) {
         runtimeMetrics.routing.fallback++;
-        const fallback = await forwardQuery(rawBuffer, BALANCED_INTL_WIRE);
+        const fallback = await forwardQuery(rawBuffer, BALANCED_INTL_WIRE,!!key);
         return dnsResponse(await fallback.arrayBuffer());
     }
     // Do not cache a no-ECS retry under a personalized ECS key, or an international fallback.
@@ -2363,10 +2363,15 @@ async function forwardQuery(body, upstreams = UPSTREAM_DNS_LIST, preferAddress =
                     question.qclass !== parsedQuery.questions[i].qclass)) {
                 throw new Error('invalid DNS reply or SERVFAIL');
             }
+            // A partial packet or an EDNS extended error is not a usable address
+            // answer. Mark it failed so the normal resolver/fallback path can recover.
+            const code=(reply.flags&15)|((reply.opt?.ttl>>>24)<<4);
+            if(preferAddress && ((reply.flags&0x0200) || ![0,3].includes(code))) {
+                throw new Error('incomplete or erroneous DNS address reply');
+            }
             const response=new Response(packet,{headers:{'Content-Type':'application/dns-message'}});
             // For ordinary domestic addresses only, give the other configured
             // resolver a chance if the first returns no requested address.
-            const code=reply.flags&15;
             const answers=reply.records.slice(0,new DataView(packet).getUint16(6));
             const rank=(reply.flags&0x0200)?-1:code===0?
                 (answers.some(r=>r.type===parsedQuery.questions[0]?.type)?3:answers.some(r=>r.type===5)?2:1):

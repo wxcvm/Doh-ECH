@@ -72,6 +72,18 @@ try {
     assert.match(await page.locator('#echUrl').textContent(),/enhance=direct/);
     console.log('PASS native direct '+domain+' A='+raw[0].answers.length+' AAAA='+raw[1].answers.length+' ECH='+Boolean(raw[2].ech));
   }
+  // Local pins must be explicit, copied into the URL and reflected in real DNS JSON.
+  await page.locator('#advanced summary').click();
+  await page.locator('#pins').fill('x.com=203.0.113.88');
+  await page.locator('#type').selectOption('A');
+  await page.locator('#queryBtn').click();
+  await page.locator('#cards [data-type=A]').filter({hasText:'203.0.113.88'}).waitFor();
+  const pinned=JSON.parse(await page.locator('#rawJson').textContent())[0];
+  assert.equal(pinned.policy,'local-pins');
+  assert.equal(pinned.ttl,30);
+  assert.equal(new URL(await page.locator('#echUrl').textContent()).searchParams.get('pins'),'x.com=203.0.113.88');
+  console.log('PASS local pin input, real DNS response and generated URL');
+
   // Restore the rule preset before checking its advanced parameters.
   await page.getByRole('button',{name:'Google IPv6',exact:false}).click();
   await page.locator('#cards [data-type=AAAA] .status').filter({hasText:'已返回记录'}).waitFor();

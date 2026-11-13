@@ -42,6 +42,20 @@ globalThis.fetch = async (input, init = {}) => {
     const name = url.searchParams.get('name');
     const type = Number(url.searchParams.get('type'));
     const error = url.hostname === 'dns.alidns.com' && name === 'github.com';
+    if (name === 'www.facebook.com' && type === 65) {
+      return Response.json({ Status: 0, Question: [{ name: name + '.', type }],
+        Answer: [{ name, type, TTL: 42, data: '1 . alpn=h2 ech=AAECAw==' }] });
+    }
+    if (name === 'owner.example' && type === 1) {
+      const ecs = url.searchParams.get('edns_client_subnet');
+      const ips = ecs === '192.0.2.0/24' ? ['104.16.1.1'] :
+        ecs === '192.0.3.0/24' ? ['104.16.1.1','203.0.113.17'] : ['203.0.113.17'];
+      return Response.json({ Status: 0, Question: [{ name: name + '.', type }],
+        Answer: ips.map(data => ({ name, type, TTL: 20, data })) });
+    }
+    if (name === 'hedge-failure.example' && url.hostname !== 'cloudflare-dns.com') {
+      return Response.json({ Status: 2, Question: [{ name: name + '.', type }] });
+    }
     if (name === 'ttl.example' || name === 'zero.example' || name === 'missing.example.cn' || name === 'failure.example.cn') {
       const status = name === 'missing.example.cn' ? 3 : name === 'failure.example.cn' ? 2 : 0;
       return Response.json({ Status: status, Question: [{ name: name + '.', type }],
@@ -354,4 +368,28 @@ await apiAnswer('cloudflare.com', 'HTTPS', 'enhance=off&ech=ECH-RACE.EXAMPLE.&cl
 assert.equal(ecsCalls('ech-race.example').length, count, 'same ECH name and prefix share cached config');
 await apiAnswer('cloudflare.com', 'HTTPS', 'enhance=off&ech=ech-race.example&clientIp=192.0.3.1');
 assert.ok(ecsCalls('ech-race.example').length > count, 'different ECS prefix must not reuse custom ECH');
-console.log('Doh-ECH smoke tests passed (including ECS, ECH lifetimes, GET/POST and Google policies)');
+// A fast valid answer should need just one upstream, and failure must still reach alternatives.
+await apiAnswer('hedge-fast.example', 'A', 'enhance=off');
+assert.equal(ecsCalls('hedge-fast.example').length, 1);
+assert.ok((await apiAnswer('hedge-failure.example', 'A', 'enhance=off')).answers.length > 0);
+assert.ok(ecsCalls('hedge-failure.example').some(c => new URL(c).hostname === 'cloudflare-dns.com'));
+const nativeMeta = await apiAnswer('www.facebook.com', 'HTTPS', 'enhance=off');
+assert.equal(nativeMeta.ech, 'AAECAw==');
+assert.equal(nativeMeta.echSource, 'dns');
+assert.ok(nativeMeta.ttl <= 42);
+const legacyMeta = await apiAnswer('www.instagram.com', 'HTTPS', 'enhance=off');
+assert.equal(legacyMeta.echSource, 'legacy-meta');
+assert.ok(legacyMeta.ech && legacyMeta.ttl <= 60);
+const fbWire = await wireAnswer('fb.ech', 65, 'enhance=off');
+assert.ok(fbWire.readUInt32BE(question('fb.ech',65).length + 6) <= 42);
+const cfOwner = await apiAnswer('owner.example','A','enhance=off&best=true&clientIp=192.0.2.1');
+assert.ok(cfOwner.answers.includes('104.18.10.118'));
+const mixedOwner = await apiAnswer('owner.example','A','enhance=off&best=true&clientIp=192.0.3.1');
+assert.deepEqual(mixedOwner.answers, ['104.16.1.1','203.0.113.17']);
+const ownerKey = [...cache.keys()].find(k => k.includes('owner-v2:owner.example:') && k.includes('192.0.2.'));
+assert.ok(ownerKey, 'owner detection cache must include ECS prefix');
+const ownerEntry = await cache.get(ownerKey).clone().json();
+assert.ok(ownerEntry.expire - Date.now() <= 20000, 'owner TTL must follow actual DNS');
+const nativeThirdParty = await apiAnswer('owner.example','HTTPS','enhance=off&clientIp=192.0.2.1');
+assert.equal(nativeThirdParty.echSource, undefined, 'third-party CDN detection must not rewrite default HTTPS');
+console.log('Doh-ECH smoke tests passed (including adaptive upstreams, Meta ECH, owner TTL and ECS)');

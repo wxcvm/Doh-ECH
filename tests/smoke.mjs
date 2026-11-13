@@ -45,7 +45,7 @@ globalThis.fetch = async (input, init = {}) => {
     return Response.json({
       Status: error ? 2 : 0,
       Question: [{ name: name + '.', type }],
-      Answer: error ? [] : (type === 1 ? [{ name, type, TTL: 300, data: '203.0.113.17' }] : [])
+      Answer: error ? [] : (type === 1 || type === 28 ? [{ name, type, TTL: 300, data: type === 1 ? '203.0.113.17' : '2001:db8::17' }] : [])
     });
   }
   if (url.pathname.endsWith('.json')) return Response.json([]);
@@ -216,4 +216,55 @@ for (const [description, makeReply] of malformedReplies) {
 }
 binaryReplyOverride = null;
 
-console.log('Doh-ECH smoke tests passed (EDNS outage and 11 malformed upstream regressions included)');
+// Upstream policy sync: test both JSON and binary DNS paths with no live network.
+async function apiAnswer(domain, type, params = 'enhance=rule') {
+  const response = await request('/api/query?domain=' + encodeURIComponent(domain) + '&type=' + type + '&' + params);
+  assert.equal(response.status, 200, domain + ' ' + type);
+  return response.json();
+}
+async function wireAnswer(domain, type, params = 'enhance=rule') {
+  const response = await request('/ech?' + params, {
+    method: 'POST', headers: { 'Content-Type': 'application/dns-message' }, body: question(domain, type)
+  });
+  assert.equal(response.status, 200);
+  const packet = Buffer.from(await response.arrayBuffer());
+  assert.equal(packet.readUInt16BE(2) & 15, 0, domain + ' DNS RCODE');
+  return packet;
+}
+for (const name of ['mtalk.google.com', 'mobile-gtalk.l.google.com', 'alt7-mtalk.google.com']) {
+  assert.deepEqual((await apiAnswer(name, 'A')).answers, ['203.0.113.17']);
+  assert.deepEqual((await apiAnswer(name, 'AAAA')).answers, ['2001:db8::17']);
+  assert.equal((await wireAnswer(name, 1)).readUInt16BE(6), 1);
+  assert.equal((await wireAnswer(name, 28)).readUInt16BE(6), 1);
+  const https = await apiAnswer(name, 'HTTPS');
+  assert.deepEqual(https.ipv4hints, ['203.0.113.17']);
+  assert.deepEqual(https.ipv6hints, ['2001:db8::17']);
+}
+for (const name of ['dl.google.com', 'music.youtube.com', 'robinfrontend-pa.googleapis.com', 'signaler-pa.googleapis.com']) {
+  for (const mode of ['rule', 'full']) {
+    assert.deepEqual((await apiAnswer(name, 'A', 'enhance=' + mode)).answers, ['203.0.113.17']);
+    assert.deepEqual((await apiAnswer(name, 'AAAA', 'enhance=' + mode)).answers, []);
+    assert.equal((await wireAnswer(name, 28, 'enhance=' + mode)).readUInt16BE(6), 0);
+    const https = await apiAnswer(name, 'HTTPS', 'enhance=' + mode);
+    assert.deepEqual(https.ipv4hints, ['203.0.113.17']);
+    assert.equal(https.ipv6hints, undefined);
+    assert.equal((await wireAnswer(name, 65, 'enhance=' + mode)).readUInt16BE(6), 1);
+  }
+  assert.deepEqual((await apiAnswer(name, 'AAAA', 'enhance=off')).answers, ['2001:db8::17']);
+}
+for (const name of ['google.co.jp', 'www.google.de', 'google.com.au']) {
+  assert.deepEqual((await apiAnswer(name, 'A')).answers, []);
+  assert.ok((await apiAnswer(name, 'AAAA')).answers.every(ip => ip.startsWith('2001:4860:')));
+  assert.ok((await apiAnswer(name, 'AAAA')).answers.length > 0);
+  assert.equal((await wireAnswer(name, 1)).readUInt16BE(6), 0);
+}
+const exact = await apiAnswer('dl.google.com', 'AAAA', 'enhance=rule&rules=' + encodeURIComponent('dl.google.com:2001:db8::99'));
+assert.deepEqual(exact.answers, ['2001:db8::99'], 'exact user rule overrides equivalent wildcard');
+const unmatched = await wireAnswer('unmatched.example', 65);
+assert.equal(unmatched.readUInt16BE(6), 0, 'rule mode must not fabricate HTTPS for an unmatched name');
+assert.deepEqual((await apiAnswer('cloudflare.com', 'AAAA', 'enhance=off&nocf6=false')).answers, ['2001:db8::17']);
+assert.deepEqual((await apiAnswer('cloudflare.com', 'AAAA', 'enhance=off&nocf6=true')).answers, []);
+assert.deepEqual((await apiAnswer('cloudflare.com', 'AAAA', 'enhance=off')).answers, []);
+assert.deepEqual((await apiAnswer('cloudflare.com', 'HTTPS', 'enhance=off&nocf6=false')).ipv6hints, ['2001:db8::17']);
+assert.equal((await apiAnswer('cloudflare.com', 'HTTPS', 'enhance=off&nocf6=true')).ipv6hints, undefined);
+console.log('Doh-ECH smoke tests passed (including upstream Google and IPv6 policies)');

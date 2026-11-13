@@ -1,0 +1,30 @@
+name: Live DoH Worker validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      endpoint:
+        description: "HTTPS URL of a deployed test Worker"
+        required: true
+        default: "https://doh-ech-test.shizuku2023.workers.dev"
+  pull_request:
+    paths:
+      - 'tests/live.mjs'
+      - '.github/workflows/doh-live.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      DOH_ECH_TEST_URL: ${{ inputs.endpoint || 'https://doh-ech-test.shizuku2023.workers.dev' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Test the deployed staging Worker
+        run: node tests/live.mjs

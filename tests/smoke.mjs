@@ -429,4 +429,21 @@ assert.equal((await apiAnswer('notgoogle.com','A','enhance=direct')).policy,unde
 assert.equal((await apiAnswer('x.com.evil.example','A','enhance=direct')).policy,undefined);
 assert.deepEqual((await apiAnswer('www.google.com','A','enhance=rule')).answers,[],'legacy Google rule remains opt-in');
 assert.equal((await apiAnswer('cloudflare.com','HTTPS','enhance=direct')).policy,undefined);
+// Explicit local pins are isolated to exact names and address family, never shared.
+const pinParams = 'enhance=direct&pins='+encodeURIComponent('www.google.com=2001:db8::44,2001:db8::45;x.com=203.0.113.88');
+const pinned=await apiAnswer('www.google.com','AAAA',pinParams);
+assert.deepEqual(pinned.answers,['2001:db8::44','2001:db8::45']);
+assert.equal(pinned.policy,'local-pins');
+assert.equal(pinned.ttl,30);
+assert.deepEqual((await apiAnswer('www.google.com','A',pinParams)).answers,['203.0.113.17']);
+assert.deepEqual((await apiAnswer('accounts.google.com','AAAA',pinParams)).answers,['2001:db8::17']);
+assert.deepEqual((await apiAnswer('www.google.com','AAAA','enhance=direct')).answers,['2001:db8::17']);
+assert.deepEqual((await apiAnswer('x.com','A',pinParams)).answers,['203.0.113.88']);
+assert.equal((await apiAnswer('x.com','HTTPS',pinParams)).policy,'native-direct');
+const pinPacket=await wireAnswer('www.google.com',28,pinParams);
+assert.equal(pinPacket.readUInt16BE(6),2);
+assert.equal(pinPacket.readUInt32BE(question('www.google.com',28).length+6),30);
+assert.equal(pinPacket.subarray(question('www.google.com',28).length+12,question('www.google.com',28).length+28).toString('hex'),'20010db8000000000000000000000044');
+assert.equal((await apiAnswer('www.google.com','AAAA','enhance=direct&pins=www.google.com%3Dinvalid')).policy,'native-direct');
+assert.equal((await apiAnswer('example.com','A','enhance=direct&pins=example.com%3D1.2.3.4')).policy,undefined);
 console.log('Doh-ECH smoke tests passed (including adaptive upstreams, Meta ECH, owner TTL and ECS)');

@@ -78,5 +78,39 @@ class DirectProbeTests(unittest.TestCase):
         with patch.object(mod, "read_dns_json", side_effect=[OSError("timeout"), wrong, valid]):
             self.assertEqual(mod.candidates(mod.DEFAULT, "x.com", "A", "direct"), ["8.8.4.4"])
 
+    def test_tls_control_only_chain_verified(self):
+        raw=MagicMock(); raw.__enter__.return_value=raw
+        tls=MagicMock(); tls.__enter__.return_value=tls; tls.version.return_value="TLSv1.3"
+        context=MagicMock()
+        context.wrap_socket.return_value=tls
+        with patch.object(mod.ssl,"create_default_context",return_value=context), patch.object(mod.socket,"socket",return_value=raw):
+            normal=mod.tls_check("x.com","162.159.140.229","TLS1.3",3)
+            self.assertTrue(normal["hostname_verified"])
+            context.wrap_socket.assert_called_with(raw,server_hostname="x.com")
+            control=mod.tls_check("x.com","162.159.140.229","TLS1.3-no-SNI",3)
+            self.assertFalse(control["hostname_verified"])
+            self.assertFalse(context.check_hostname)
+            context.wrap_socket.assert_called_with(raw,server_hostname=None)
+            tls.sendall.assert_not_called()
+
+    def test_tls_diagnose_only_prior_tls_failures(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path=pathlib.Path(tmp)/"report.json"
+            path.write_text(json.dumps({"results":[
+                {"host":"x.com","ip":"162.159.140.229","stage":"TLS","ok":False,"tcp_ms":20},
+                {"host":"x.com","ip":"8.8.8.8","stage":"TCP","ok":False},
+                {"host":"www.google.com","ip":"8.8.4.4","stage":"TLS","ok":False}]}))
+            def result(host,ip,mode,timeout):
+                return dict(host=host,ip=ip,mode=mode,stage="TLS",ok=False)
+            original_open=open
+            with patch.object(mod,"tls_check",side_effect=result) as check, patch("builtins.open", wraps=original_open) as opened:
+                # Redirect only the generated diagnostic report; retain actual input reading.
+                def redirect(name,*args,**kwargs):
+                    return original_open(pathlib.Path(tmp)/"out.json" if name=="direct-tls-diagnosis.json" else name,*args,**kwargs)
+                opened.side_effect=redirect
+                mod.diagnose_tls(path,["x.com"],3)
+            self.assertEqual(check.call_count,3)
+            self.assertTrue(all(c.args[1]=="162.159.140.229" for c in check.call_args_list))
+
 if __name__=="__main__":
     unittest.main()

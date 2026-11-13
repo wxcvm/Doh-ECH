@@ -5,7 +5,7 @@ const base = process.env.DOH_ECH_TEST_URL;
 if (!base) throw new Error('DOH_ECH_TEST_URL is required');
 const browser = await chromium.launch({headless:true, channel:'chrome'});
 try {
-  const context = await browser.newContext({viewport:{width:390,height:844},permissions:['clipboard-read','clipboard-write']});
+  const context = await browser.newContext({viewport:{width:390,height:844},reducedMotion:'reduce',permissions:['clipboard-read','clipboard-write']});
   const page = await context.newPage();
   const errors = [];
   page.on('pageerror', e => errors.push(e.message));
@@ -26,11 +26,23 @@ try {
   assert.match(await page.locator('#resultSummary').textContent(),/github.com/);
   await page.locator('.raw summary').click();
   assert.equal(JSON.parse(await page.locator('#rawJson').textContent()).length,3);
+  await page.waitForFunction(()=>document.getElementById('results').getBoundingClientRect().top<innerHeight);
   console.log('PASS real DNS batch query and raw JSON');
 
   await page.getByRole('button',{name:'Cloudflare ECH',exact:false}).click();
   await page.locator('#cards [data-type=HTTPS] .status').filter({hasText:'已取得 ECH 配置'}).waitFor();
   console.log('PASS real ECH result');
+
+  await page.getByRole('button',{name:'Meta ECH',exact:false}).click();
+  await page.locator('#cards [data-type=HTTPS] .status').filter({hasText:'已取得 ECH 配置'}).waitFor();
+  assert.match(await page.locator('#cards').textContent(),/ECH 来源/);
+  await page.getByRole('button',{name:'Android 推送',exact:false}).click();
+  await page.locator('#cards [data-type=A] .status').filter({hasText:'已返回记录'}).waitFor();
+  assert.match(await page.locator('#resultSummary').textContent(),/mtalk.google.com/);
+  await page.getByRole('button',{name:'国内解析',exact:false}).click();
+  await page.locator('#cards [data-type=A] .status').filter({hasText:'已返回记录'}).waitFor();
+  assert.match(await page.locator('#resultSummary').textContent(),/taobao.com/);
+  console.log('PASS real Meta, Android FCM and domestic presets');
 
   await page.getByRole('button',{name:'Google IPv6',exact:false}).click();
   await page.locator('#cards [data-type=AAAA] .status').filter({hasText:'已返回记录'}).waitFor();

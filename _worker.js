@@ -1498,7 +1498,11 @@ async function queryUpstreamDNS(name, type, clientIP = '', upstreamUrl = null, p
             }),
             data => preferredDnsAnswer(data, type, preferEch),
             (a, b) => !a || (a.Status === 3 && b.Status === 0) ? b : a);
-    } catch { return null; }
+    } catch {
+        // Some JSON resolvers reject ECS. Retry the same upstream group without ECS;
+        // the fallback uses its own no-ECS cache key and never changes domestic routing.
+        return prefix ? queryUpstreamDNS(name, type, '', upstreamUrl, preferEch) : null;
+    }
 
     const maxAge = preferEch && !result?.Answer?.some(r => r.type === 65 && parseHttpsRecord(r.data)?.ech)
         ? 0 : upstreamAnswerTtl(result, type === 65 ? 600 : 300);
@@ -1516,10 +1520,12 @@ async function queryUpstreamDNS(name, type, clientIP = '', upstreamUrl = null, p
 function isUsableDnsJson(data, type, requestedName) {
     if (!data || typeof data !== 'object' || ![0, 3].includes(data.Status)) return false;
     if (data.Answer !== undefined && !Array.isArray(data.Answer)) return false;
-    if (data.Question !== undefined && !Array.isArray(data.Question)) return false;
-    if (Array.isArray(data.Question) && data.Question.length) {
-        const question = data.Question[0];
-        if (!question || String(question.name || '').toLowerCase().replace(/\.$/, '') !==
+    // AliDNS returns a single Question object; DNSPod and Cloudflare use an array.
+    if (data.Question !== undefined) {
+        const questions = Array.isArray(data.Question) ? data.Question : [data.Question];
+        if (questions.length !== 1) return false;
+        const question = questions[0];
+        if (!question || typeof question !== 'object' || String(question.name || '').toLowerCase().replace(/\.$/, '') !==
             requestedName.toLowerCase().replace(/\.$/, '') || Number(question.type) !== Number(type)) return false;
     }
     if (data.Answer?.some(a => !a || !Number.isInteger(a.type) || typeof a.data !== 'string')) return false;

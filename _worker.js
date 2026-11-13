@@ -38,6 +38,25 @@ const UPSTREAM_CN_JSON_LIST = [
     'https://dns.alidns.com/resolve',          // 阿里 DNS
     'https://doh.pub/dns-query',               // DNSPod（腾讯）
 ];
+// Daily profile uses native DNS with separate domestic and international upstreams.
+const BALANCED_CN_WIRE = UPSTREAM_DNS_LIST.slice(0, 2);
+const BALANCED_INTL_WIRE = ["https://cloudflare-dns.com/dns-query", "https://dns.google/dns-query"];
+const BALANCED_INTL_JSON = ["https://cloudflare-dns.com/dns-query", "https://dns.google/resolve"];
+function balancedDomestic(domain) {
+    if (!cnDomainSet) cnDomainSet = new Set(CN_DOMAIN_SUFFIXES);
+    if (DIRECT_DOMAINS.some(d => domain === d || domain.endsWith("." + d))) return false;
+    return isCNDomain(domain);
+}
+async function forwardBalanced(rawBuffer, domain) {
+    const domestic = balancedDomestic(domain);
+    const result = await forwardQuery(rawBuffer, domestic ? BALANCED_CN_WIRE : BALANCED_INTL_WIRE);
+    const packet = await result.arrayBuffer();
+    if (domestic && (new DataView(packet).getUint16(2) & 15) === 2) {
+        const fallback = await forwardQuery(rawBuffer, BALANCED_INTL_WIRE);
+        return dnsResponse(await fallback.arrayBuffer());
+    }
+    return dnsResponse(packet);
+}
 const DIRECT_JSON = ["https://cloudflare-dns.com/dns-query"];
 const DIRECT_WIRE = ["https://cloudflare-dns.com/dns-query"];
 const DIRECT_DOMAINS = ["google.com","google.com.hk","google.com.tw","google.co.jp","google.co.uk","google.de","google.fr","google.com.sg","googleapis.com","gstatic.com","googleusercontent.com","recaptcha.net","googlesource.com","gvt1.com","gvt2.com","x.com","twitter.com","t.co","twimg.com","twitterstatic.com"];
@@ -342,7 +361,7 @@ async function handleDoHRequest(req, injectEch, ctx, clientIP, env) {
     const config = buildConfig(url, req.headers);
     if (!config.clientIp) config.clientIp = clientIP;
     // Pure forwarding must not fetch user-provided subscription URLs.
-    if (injectEch) await applySubConfig(config, env);
+    if (injectEch && config.enhance !== 'balanced') await applySubConfig(config, env);
 
     if (req.method === 'POST') {
         const contentType = (req.headers.get('Content-Type') || '').toLowerCase();
@@ -407,6 +426,9 @@ async function handleDnsQuery(rawBuffer, config, ctx, clientIP) {
         // 原样保留客户端发来的大小写：使用 DNS-0x20 随机化的客户端/解析器会校验
         // 响应 question 与请求逐字节一致，统一转小写会导致其丢弃响应。
         const rawQName = questions[0].name.replace(/\.$/, "");
+        // Balanced mode preserves complete upstream wire responses, including CNAME, HTTPS and DNSSEC.
+        if (config.enhance === 'balanced' && questions.length === 1 && questions[0].qclass === 1 &&
+            (new DataView(rawBuffer).getUint16(2) & 0x7800) === 0) return forwardBalanced(rawBuffer, qName);
         // Non-IN, multi-question, non-QUERY, or DNSSEC-sensitive packets must be forwarded untouched.
         const header = new DataView(rawBuffer);
         if (header.getUint16(4) !== 1 || (header.getUint16(2) & 0x7800) !== 0 ||
@@ -561,7 +583,7 @@ async function handleApiQuery(url, clientIP, env) {
     if (!['A', 'AAAA', 'HTTPS', 'CNAME', 'TXT', 'MX', 'NS'].includes(type)) return json({ error: '类型不支持' }, 400);
     const config = buildConfig(url);
     if (!config.clientIp) config.clientIp = clientIP;
-    await applySubConfig(config, env);
+    if (config.enhance !== 'balanced') await applySubConfig(config, env);
 
     // 静态域名 + 默认参数 = 可缓存预计算响应（结果不依赖 clientIp/ECS）
     const cacheable = isCacheableStaticRequest(domain, config, type);
@@ -635,6 +657,16 @@ async function handleApiQuery(url, clientIP, env) {
 // ===================== 核心调度 =====================
 async function resolveDNS(domain, type, config, clientIP) {
     domain = domain.toLowerCase().replace(/\.$/, '');
+    if (config.enhance === 'balanced') {
+        const domestic = balancedDomestic(domain);
+        // Match wire routing without adding a client ECS that the wire path does not inject.
+        let result = await resolveFallbackRecord(domain, type, '', domestic ? UPSTREAM_CN_JSON_LIST : BALANCED_INTL_JSON);
+        if (domestic && result.rcode === 2) {
+            result = await resolveFallbackRecord(domain, type, '', BALANCED_INTL_JSON);
+            return { ...result, policy: 'balanced-fallback' };
+        }
+        return { ...result, policy: domestic ? 'balanced-domestic' : 'balanced-international' };
+    }
     if (isNativeDirect(domain, config)) {
         const h3 = xHttp3Result(domain, type, config);
         if (h3) return h3;
@@ -2903,9 +2935,9 @@ function getHtml() {
 <div class="form-grid">
 <label class="field full"><span>查询域名（也可以粘贴网站网址）</span><input id="domain" value="github.com" placeholder="例如 github.com" autocomplete="off" autocapitalize="none" spellcheck="false" required></label>
 <label class="field"><span>记录类型</span><select id="type"><option value="all">全部：A / AAAA / HTTPS</option><option value="A">A · IPv4</option><option value="AAAA">AAAA · IPv6</option><option value="HTTPS">HTTPS · ECH</option><option value="CNAME">CNAME · 别名</option><option value="TXT">TXT · 文本</option><option value="MX">MX · 邮件</option><option value="NS">NS · 域名服务器</option></select></label>
-<label class="field"><span>解析模式</span><select id="enhance"><option value="off">默认解析</option><option value="rule">规则增强</option><option value="full">全局增强</option><option value="direct">Google / X 原生直连</option></select></label>
+<label class="field"><span>解析模式</span><select id="enhance"><option value="off">默认解析</option><option value="balanced">日常均衡（推荐）</option><option value="rule">规则增强</option><option value="full">全局增强</option><option value="direct">Google / X 原生直连</option></select></label>
 </div>
-<p class="help">默认模式仍保留 Cloudflare / Meta 的内置 ECH 策略；规则增强可能改变 DNS 地址，请在实际网络验证。纯转发请使用右侧 /doh。</p>
+<p class="help">日常均衡：国内外分流，保留完整原生 DNS 应答；不应用高级改写参数。默认模式仍保留 Cloudflare / Meta 的内置 ECH 策略；规则增强可能改变 DNS 地址，请在实际网络验证。纯转发请使用右侧 /doh。</p>
 <p class="help">Google / X 原生直连：仅针对 Google、X 及相关资源域名，优先真实 DNS，保留 IPv4/IPv6 和原生 HTTPS 记录，不使用随机 IP 或全局优选；其他域名保持默认策略。此模式下目标域名不应用高级地址覆盖。</p>
 <details class="advanced" id="advanced"><summary>高级设置（可选） <span id="advancedCount" class="muted"></span></summary>
 <p class="muted">以下参数都可组合使用；关闭面板不会取消设置，点击重置即可恢复默认。</p>
@@ -2942,7 +2974,7 @@ function getHtml() {
 <section class="panel results" id="results" hidden aria-labelledby="resultsTitle"><div class="section-head"><h2 id="resultsTitle">查询结果</h2><p class="muted" id="resultSummary"></p></div><div id="cards" class="result-grid" aria-live="polite"></div><p class="note">有 IP 或 ECH 配置表示 DNS 返回了记录，不等于网站可达、TLS ECH 握手成功或手机推送已恢复。</p><p class="note">请先关闭代理（含 TUN/VPN），将当前 ECH 地址设为浏览器安全 DNS，再打开 <a href="https://www.google.com/" target="_blank" rel="noopener noreferrer">Google</a> 或 <a href="https://x.com/" target="_blank" rel="noopener noreferrer">X</a> 验证本机连接。网页不能替你关闭代理。</p><details class="raw"><summary>查看原始 JSON</summary><pre id="rawJson"></pre></details></section>
 </div>
 <aside><section class="panel" aria-labelledby="address-title"><div class="section-head"><h2 id="address-title">你的 DoH 地址</h2><p class="muted">查询域名只用于测试；复制下面的地址配置客户端，参数会随设置更新。</p></div>
-<div class="endpoint"><h3>日常稳定 · 纯 DoH</h3><p class="muted">原样转发上游，不注入 ECH 或优选 IP。</p><div class="urlrow"><code id="dohUrl"></code><button class="copy" type="button" data-copy="dohUrl">复制</button></div></div>
+<div class="endpoint"><h3>日常均衡 · 推荐</h3><p class="muted">国内阿里 / DNSPod，国际 Cloudflare / Google；原生 DNS，不强制改写 IP、ECH 或协议。</p><div class="urlrow"><code id="balancedUrl"></code><button class="copy" type="button" data-copy="balancedUrl">复制</button></div></div><div class="endpoint"><h3>纯 DoH · 兼容</h3><p class="muted">原样转发上游，不注入 ECH 或优选 IP。</p><div class="urlrow"><code id="dohUrl"></code><button class="copy" type="button" data-copy="dohUrl">复制</button></div></div>
 <div class="endpoint"><h3>ECH 增强 · 当前设置</h3><p class="muted">Cloudflare / Meta ECH，支持自定义增强规则。</p><div class="urlrow"><code id="echUrl"></code><button class="copy" type="button" data-copy="echUrl">复制</button></div></div>
 <div class="feedback" id="copyStatus" role="status" aria-live="polite"></div>
 <div class="client-help"><h3>怎么配置客户端？</h3><p class="muted"><strong>直连地址筛选：</strong>用 <a href="https://github.com/wxcvm/Doh-ECH/blob/main/scripts/direct-probe.py" target="_blank" rel="noopener noreferrer">本机检测脚本</a> 在关闭代理后测量 TCP、TLS 和 HTTP，再使用输出的专属 DoH 地址。</p><p class="muted"><strong>浏览器：</strong>安全 DNS / DNS over HTTPS，选择自定义并粘贴地址。</p><p class="muted"><strong>AdGuard：</strong>DNS 保护 → DNS 服务器 → 添加自定义服务器，粘贴 DoH 地址。</p><p class="muted"><strong>Android：</strong>系统「私人 DNS」通常使用 DoT 主机名，不接受 HTTPS URL；请用支持 DoH 的客户端。</p><p class="muted">若同时使用代理 Fake-IP DNS，建议先确认 DNS 分工，不要让多个组件重复接管。</p></div>
@@ -2956,10 +2988,11 @@ const $=id=>document.getElementById(id);
 const form=$('queryForm');
 const fields=['ip4','ip6','cf','ech','sub','exclude','area','metaIp4','metaIp6','meta','rules','clientIp'];
 const typeNames={A:'IPv4 地址',AAAA:'IPv6 地址',HTTPS:'HTTPS / ECH',CNAME:'CNAME 别名',TXT:'TXT 文本',MX:'MX 邮件',NS:'NS 服务器'};
-const modeNames={off:'默认解析',rule:'规则增强',full:'全局增强',direct:'Google / X 原生直连'};
+const modeNames={off:'默认解析',balanced:'日常均衡',rule:'规则增强',full:'全局增强',direct:'Google / X 原生直连'};
 let busy=false;
 function params(){
  const p=new URLSearchParams();
+ if($('enhance').value==='balanced'){p.set('enhance','balanced');return p;}
  for(const key of fields){const v=$(key).value.trim();if(v)p.set(key,v);}
  if($('enhance').value!=='off')p.set('enhance',$('enhance').value);
  if($('enhance').value==='direct'&&$('pins').value.trim())p.set('pins',$('pins').value.trim());
@@ -2972,7 +3005,7 @@ function params(){
  return p;
 }
 function refreshUrls(){
- const p=params();$('dohUrl').textContent=location.origin+'/doh';
+ const p=params();$('balancedUrl').textContent=location.origin+'/ech?enhance=balanced';$('dohUrl').textContent=location.origin+'/doh';
  $('echUrl').textContent=location.origin+'/ech'+(p.size?'?'+p.toString():'');
  $('advancedCount').textContent=p.size?'· '+p.size+' 项非默认设置':'· 默认';
 }
@@ -3005,7 +3038,7 @@ function cardFor(type,out){
  }else if(!Array.isArray(d.answers)||!d.answers.length){status='无此类记录';tone='warn';description='可能是域名未发布该记录，或当前解析策略屏蔽了此类型。';}
  else{description='DNS 返回 '+d.answers.length+' 条记录。';}
  title.append(el('span','status '+tone,status));card.append(title,el('p','muted',description));
- if(d){if(d.policy==='native-direct')line(card,'解析策略：原生 DNS（未替换地址）');if(d.policy==='local-pins')line(card,'解析策略：本机指定地址（服务器未验证你的网络）');if(d.policy==='x-http3')line(card,'解析策略：X HTTP/3 实验配置（浏览器自行选择协议）');if(d.alpn)line(card,'ALPN：'+d.alpn);values(card,d.answers);if(d.ipv4hints?.length){line(card,'IPv4 提示');values(card,d.ipv4hints);}if(d.ipv6hints?.length){line(card,'IPv6 提示');values(card,d.ipv6hints);}if(d.echSource)line(card,'ECH 来源：'+(d.echSource==='legacy-meta'?'Meta 兼容配置':d.echSource==='dns'?'DNS 动态配置':d.echSource));if(Number.isFinite(d.ttl))line(card,'TTL：'+d.ttl+' 秒');}
+ if(d){if(d.policy==='balanced-domestic')line(card,'解析策略：日常均衡 · 国内上游');if(d.policy==='balanced-international')line(card,'解析策略：日常均衡 · 国际上游');if(d.policy==='balanced-fallback')line(card,'解析策略：日常均衡 · 国内故障回退');if(d.policy==='native-direct')line(card,'解析策略：原生 DNS（未替换地址）');if(d.policy==='local-pins')line(card,'解析策略：本机指定地址（服务器未验证你的网络）');if(d.policy==='x-http3')line(card,'解析策略：X HTTP/3 实验配置（浏览器自行选择协议）');if(d.alpn)line(card,'ALPN：'+d.alpn);values(card,d.answers);if(d.ipv4hints?.length){line(card,'IPv4 提示');values(card,d.ipv4hints);}if(d.ipv6hints?.length){line(card,'IPv6 提示');values(card,d.ipv6hints);}if(d.echSource)line(card,'ECH 来源：'+(d.echSource==='legacy-meta'?'Meta 兼容配置':d.echSource==='dns'?'DNS 动态配置':d.echSource));if(Number.isFinite(d.ttl))line(card,'TTL：'+d.ttl+' 秒');}
  if(Number.isFinite(out.ms))line(card,'查询耗时：'+out.ms+' ms（浏览器到服务的请求时间）');
  return card;
 }

@@ -38,6 +38,12 @@ const UPSTREAM_CN_JSON_LIST = [
     'https://dns.alidns.com/resolve',          // 阿里 DNS
     'https://doh.pub/dns-query',               // DNSPod（腾讯）
 ];
+const DIRECT_JSON = ["https://cloudflare-dns.com/dns-query"];
+const DIRECT_WIRE = ["https://cloudflare-dns.com/dns-query"];
+const DIRECT_DOMAINS = ["google.com","google.com.hk","google.com.tw","google.co.jp","google.co.uk","google.de","google.fr","google.com.sg","googleapis.com","gstatic.com","googleusercontent.com","recaptcha.net","googlesource.com","gvt1.com","gvt2.com","x.com","twitter.com","t.co","twimg.com","twitterstatic.com"];
+function isNativeDirect(domain, config) {
+    return config.enhance === "direct" && DIRECT_DOMAINS.some(d => domain === d || domain.endsWith("."+d));
+}
 const SVC_PARAM_IDS = { mandatory: 0, alpn: 1, "no-default-alpn": 2, port: 3, ipv4hint: 4, ech: 5, ipv6hint: 6};// SVC PARAMS构造
 const IPV4_ONLY_DOMAINS = ["twitter.com", "x.com", "t.co", "twimg.com"];// CDN IPv4-only policy; dl.google.com is handled by an opt-in rule below.
 //Cloudflare 配置
@@ -381,6 +387,15 @@ async function handleDnsQuery(rawBuffer, config, ctx, clientIP) {
         // 但缓存体是跨客户端共享的，无法同时承载多种大小写；因此只缓存全小写(常规)查询。
         const caseNeutral = rawQName === rawQName.toLowerCase();
 
+        // Direct profile is explicit, scoped and preserves native DNS packets (including HTTPS/SVCB).
+        if (isNativeDirect(qName, config)) {
+            const res = await forwardQuery(rawBuffer, DIRECT_WIRE);
+            const packet = await res.arrayBuffer();
+            if ((new DataView(packet).getUint16(2) & 15) !== 2) return dnsResponse(packet);
+            const fallback = await forwardQuery(rawBuffer);
+            return dnsResponse(await fallback.arrayBuffer());
+        }
+
         // 假名处理
         if (qName === "cf.ech" || qName === "fb.ech") {
             if (qType === 65) {
@@ -585,6 +600,12 @@ async function handleApiQuery(url, clientIP, env) {
 // ===================== 核心调度 =====================
 async function resolveDNS(domain, type, config, clientIP) {
     domain = domain.toLowerCase().replace(/\.$/, '');
+    if (isNativeDirect(domain, config)) {
+        // Native addresses and HTTPS metadata, never random prefixes or generic CDN IPs.
+        let result = await resolveFallbackRecord(domain, type, clientIP, DIRECT_JSON);
+        if (result.rcode === 2) result = await resolveFallbackRecord(domain, type, clientIP);
+        return { ...result, policy: 'native-direct' };
+    }
     // 国内域名分流：直接返回国内上游原始解析结果
     if (!cnDomainSet) cnDomainSet = new Set(CN_DOMAIN_SUFFIXES);
     if (isCNDomain(domain)) {
@@ -2055,7 +2076,7 @@ function inspectDnsWire(buffer) {
     }
 }
 
-async function forwardQuery(body) {
+async function forwardQuery(body, upstreams = UPSTREAM_DNS_LIST) {
     const reqInit = {
         method: 'POST',
         headers: { 'Content-Type': 'application/dns-message', 'Accept': 'application/dns-message' },
@@ -2088,7 +2109,7 @@ async function forwardQuery(body) {
             });
         });
     try {
-        return await raceUpstreams(UPSTREAM_DNS_LIST, 'wire', requestUpstream, () => true);
+        return await raceUpstreams(upstreams, 'wire', requestUpstream, () => true);
     } catch {
         // Do not turn a 503 HTML page into HTTP 200 application/dns-message.
         // Return a valid SERVFAIL packet with the original uncompressed question.
@@ -2177,7 +2198,7 @@ async function resolveFallbackRecord(domain, type, clientIP, upstreamUrl = null)
     if (!data) return { domain, type, answers: [], ech: null, rcode: 2, ttl: 0 };
 
     if (type === 'HTTPS') {
-        const result = { domain, type, answers: [], rcode: data.Status === 3 ? 3 : 0 };
+        const result = { domain, type, answers: [], rcode: data.Status === 3 ? 3 : 0, ttl: upstreamAnswerTtl(data, 600) };
         if (data?.Answer) {
             const rec = data.Answer.find(r => r.type === 65);
             if (rec) {
@@ -2186,6 +2207,8 @@ async function resolveFallbackRecord(domain, type, clientIP, upstreamUrl = null)
                     result.ech = parsed.ech || null;
                     result.ipv4hints = parsed.ipv4hints || [];
                     result.ipv6hints = parsed.ipv6hints || [];
+                    result.alpn = parsed.alpn || '';
+                    if (parsed.ech) result.echSource = 'dns';
                 }
             }
         }
@@ -2834,14 +2857,17 @@ function getHtml() {
 <button type="button" class="preset" data-domain="google.com" data-type="AAAA" data-enhance="rule"><strong>Google IPv6</strong><small>启用规则增强，查询 AAAA</small></button>
 <button type="button" class="preset" data-domain="mtalk.google.com" data-type="A" data-enhance="rule"><strong>Android 推送</strong><small>FCM · 检查 IPv4 解析</small></button>
 <button type="button" class="preset" data-domain="taobao.com" data-type="A" data-enhance="off"><strong>国内解析</strong><small>淘宝 · 检查普通 A 记录</small></button>
+<button type="button" class="preset" data-domain="www.google.com" data-type="all" data-enhance="direct"><strong>Google 直连诊断</strong><small>真实 IPv4 / IPv6 / HTTPS</small></button>
+<button type="button" class="preset" data-domain="x.com" data-type="all" data-enhance="direct"><strong>X 直连诊断</strong><small>真实地址与原生 HTTPS</small></button>
 </div>
 <form id="queryForm">
 <div class="form-grid">
 <label class="field full"><span>查询域名（也可以粘贴网站网址）</span><input id="domain" value="github.com" placeholder="例如 github.com" autocomplete="off" autocapitalize="none" spellcheck="false" required></label>
 <label class="field"><span>记录类型</span><select id="type"><option value="all">全部：A / AAAA / HTTPS</option><option value="A">A · IPv4</option><option value="AAAA">AAAA · IPv6</option><option value="HTTPS">HTTPS · ECH</option><option value="CNAME">CNAME · 别名</option><option value="TXT">TXT · 文本</option><option value="MX">MX · 邮件</option><option value="NS">NS · 域名服务器</option></select></label>
-<label class="field"><span>解析模式</span><select id="enhance"><option value="off">默认解析</option><option value="rule">规则增强</option><option value="full">全局增强</option></select></label>
+<label class="field"><span>解析模式</span><select id="enhance"><option value="off">默认解析</option><option value="rule">规则增强</option><option value="full">全局增强</option><option value="direct">Google / X 原生直连</option></select></label>
 </div>
 <p class="help">默认模式仍保留 Cloudflare / Meta 的内置 ECH 策略；规则增强可能改变 DNS 地址，请在实际网络验证。纯转发请使用右侧 /doh。</p>
+<p class="help">Google / X 原生直连：仅针对 Google、X 及相关资源域名，优先真实 DNS，保留 IPv4/IPv6 和原生 HTTPS 记录，不使用随机 IP 或全局优选；其他域名保持默认策略。此模式下目标域名不应用高级地址覆盖。</p>
 <details class="advanced" id="advanced"><summary>高级设置（可选） <span id="advancedCount" class="muted"></span></summary>
 <p class="muted">以下参数都可组合使用；关闭面板不会取消设置，点击重置即可恢复默认。</p>
 <div class="advanced-group"><h3>Cloudflare 优选</h3><div class="form-grid">
@@ -2873,7 +2899,7 @@ function getHtml() {
 <div class="actions"><button class="primary" id="queryBtn" type="submit">开始查询</button><button class="secondary" id="resetBtn" type="button">重置</button></div>
 <div class="feedback" id="feedback" role="status" aria-live="polite"></div>
 </form></section>
-<section class="panel results" id="results" hidden aria-labelledby="resultsTitle"><div class="section-head"><h2 id="resultsTitle">查询结果</h2><p class="muted" id="resultSummary"></p></div><div id="cards" class="result-grid" aria-live="polite"></div><p class="note">有 IP 或 ECH 配置表示 DNS 返回了记录，不等于网站可达、TLS ECH 握手成功或手机推送已恢复。</p><details class="raw"><summary>查看原始 JSON</summary><pre id="rawJson"></pre></details></section>
+<section class="panel results" id="results" hidden aria-labelledby="resultsTitle"><div class="section-head"><h2 id="resultsTitle">查询结果</h2><p class="muted" id="resultSummary"></p></div><div id="cards" class="result-grid" aria-live="polite"></div><p class="note">有 IP 或 ECH 配置表示 DNS 返回了记录，不等于网站可达、TLS ECH 握手成功或手机推送已恢复。</p><p class="note">请先关闭代理（含 TUN/VPN），将当前 ECH 地址设为浏览器安全 DNS，再打开 <a href="https://www.google.com/" target="_blank" rel="noopener noreferrer">Google</a> 或 <a href="https://x.com/" target="_blank" rel="noopener noreferrer">X</a> 验证本机连接。网页不能替你关闭代理。</p><details class="raw"><summary>查看原始 JSON</summary><pre id="rawJson"></pre></details></section>
 </div>
 <aside><section class="panel" aria-labelledby="address-title"><div class="section-head"><h2 id="address-title">你的 DoH 地址</h2><p class="muted">查询域名只用于测试；复制下面的地址配置客户端，参数会随设置更新。</p></div>
 <div class="endpoint"><h3>日常稳定 · 纯 DoH</h3><p class="muted">原样转发上游，不注入 ECH 或优选 IP。</p><div class="urlrow"><code id="dohUrl"></code><button class="copy" type="button" data-copy="dohUrl">复制</button></div></div>
@@ -2890,7 +2916,7 @@ const $=id=>document.getElementById(id);
 const form=$('queryForm');
 const fields=['ip4','ip6','cf','ech','sub','exclude','area','metaIp4','metaIp6','meta','rules','clientIp'];
 const typeNames={A:'IPv4 地址',AAAA:'IPv6 地址',HTTPS:'HTTPS / ECH',CNAME:'CNAME 别名',TXT:'TXT 文本',MX:'MX 邮件',NS:'NS 服务器'};
-const modeNames={off:'默认解析',rule:'规则增强',full:'全局增强'};
+const modeNames={off:'默认解析',rule:'规则增强',full:'全局增强',direct:'Google / X 原生直连'};
 let busy=false;
 function params(){
  const p=new URLSearchParams();
@@ -2936,7 +2962,7 @@ function cardFor(type,out){
  }else if(!Array.isArray(d.answers)||!d.answers.length){status='无此类记录';tone='warn';description='可能是域名未发布该记录，或当前解析策略屏蔽了此类型。';}
  else{description='DNS 返回 '+d.answers.length+' 条记录。';}
  title.append(el('span','status '+tone,status));card.append(title,el('p','muted',description));
- if(d){values(card,d.answers);if(d.ipv4hints?.length){line(card,'IPv4 提示');values(card,d.ipv4hints);}if(d.ipv6hints?.length){line(card,'IPv6 提示');values(card,d.ipv6hints);}if(d.echSource)line(card,'ECH 来源：'+(d.echSource==='legacy-meta'?'Meta 兼容配置':d.echSource==='dns'?'DNS 动态配置':d.echSource));if(Number.isFinite(d.ttl))line(card,'TTL：'+d.ttl+' 秒');}
+ if(d){if(d.policy==='native-direct')line(card,'解析策略：原生 DNS（未替换地址）');values(card,d.answers);if(d.ipv4hints?.length){line(card,'IPv4 提示');values(card,d.ipv4hints);}if(d.ipv6hints?.length){line(card,'IPv6 提示');values(card,d.ipv6hints);}if(d.echSource)line(card,'ECH 来源：'+(d.echSource==='legacy-meta'?'Meta 兼容配置':d.echSource==='dns'?'DNS 动态配置':d.echSource));if(Number.isFinite(d.ttl))line(card,'TTL：'+d.ttl+' 秒');}
  if(Number.isFinite(out.ms))line(card,'查询耗时：'+out.ms+' ms（浏览器到服务的请求时间）');
  return card;
 }

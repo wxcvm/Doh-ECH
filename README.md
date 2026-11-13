@@ -252,7 +252,7 @@ DOH_ALLOWED_SUB_HOSTS = "feeds.example.com"
 
 使用 `https://你的域名/ech?enhance=balanced`：国内域名优先阿里 DNS / DNSPod，国际域名使用 Cloudflare DNS / Google Public DNS，组内继续使用已有的自适应上游选择。国内组全部失败（SERVFAIL）才回退国际组；真实 NXDOMAIN 或无该类型记录不因此改写。Google/X 已知国际域名优先于国内列表分类。
 
-本模式按原始 DNS 二进制报文转发单问题 IN 查询，包括 A、AAAA、HTTPS/SVCB、CNAME、TXT 与 DNSSEC 请求；不生成随机 IPv6，不固定 CDN 地址，不注入 ECH、不屏蔽 IPv6、不强制协议，也不读取高级地址覆盖或订阅。上游原生 ECH/HTTP3 元数据原样保留。查询台 JSON 与二进制路径使用相同上游分组，但因查询方式不同不保证逐字节/逐记录相同；本模式不额外注入客户端 ECS，保留客户端原始报文中的 EDNS。国内就近解析、ECS 与测速的进一步优化作为后续专项。
+本模式按原始 DNS 二进制报文转发单问题 IN 查询，包括 A、AAAA、HTTPS/SVCB、CNAME、TXT 与 DNSSEC 请求；不生成随机 IPv6，不固定 CDN 地址，不注入 ECH、不屏蔽 IPv6、不强制协议，也不读取高级地址覆盖或订阅。上游原生 ECH/HTTP3 元数据原样保留。查询台 JSON 与二进制路径使用相同上游分组，但因查询方式不同不保证逐字节/逐记录相同；国内 A/AAAA/HTTPS 查询默认仅在 Cloudflare 判断连接来自中国大陆时，尝试附加 IPv4 /24 或 IPv6 /56 ECS，以改善 CDN 就近调度。`cnEcs=on` 显式开启（也支持境外连接），`cnEcs=off` 关闭额外注入；代理出口可能改变检测到的位置。已有 EDNS 选项（包括 ECS）、DO、签名及复杂报文不改写。对无 OPT 或空 EDNS0 OPT 的普通查询注入 ECS；上游回包校验并移除新增 ECS/OPT，兼容性失败先用原始请求重试国内组，再按原策略回退国际组。国际上游不会收到本服务新注入的 ECS。均衡模式原生二进制报文不增加共享缓存；JSON 正向缓存继续按 ECS 网段和上游组隔离。
 
 旧 `/doh`、`/ech` 默认、`enhance=direct/rule/full` 及 X HTTP/3 实验配置保持不变。AdGuard 使用均衡地址后，可保留 DNS 过滤和正常广告拦截；不要求全局关闭 HTTPS 过滤或强制 QUIC。DNS 服务可达性、实际网站连接及 CDN 地理最优仍需在本地验证。
 
@@ -325,3 +325,7 @@ HTTP/3 专项需要能启动且 `curl --version` 的 Features 行包含 HTTP3 �
 当本机 `--http3-probe` 对 x.com 的指定 IPv4 返回 HTTP 2xx/3xx VERIFIED，而 TCP TLS 失败时，可以显式试用 `/ech?enhance=direct&xh3=172.66.0.227`（地址替换成本机最新验证成功值）。仅精确的 x.com A 和 HTTPS 记录被覆盖，TTL 30 秒；HTTPS ServiceMode 1 . alpn=h3,h2 ipv4hint=指定地址，无伪造 ECH，其他域名和记录类型保持原生策略，未配置 xh3 时行为不变。Chrome 的 DNS HTTPS ALPN 路径可尝试首次 QUIC 连接，但浏览器可回退 TCP，也可能忽略 HTTPS 记录；不保证强制 HTTP/3。保留默认 ALPN 兼容性，避免全为 no-default-alpn 的 RRset 被 Chrome 忽略。
 
 将完整 URL 设置为 Chrome 自定义安全 DNS，关闭代理/TUN，重启浏览器或清理 DNS/连接缓存，再访问 https://x.com/。可先在查询台选 X 直连诊断，展开高级设置并填写 xh3，检查 A 与 HTTPS 提示一致。首页成功仍需验证登录、API 与静态资源；不要将该地址自动用于未经实测的其他主机。该配置只基于本机测量，不是公共默认优选。
+
+### 国内就近解析专项
+
+均衡地址保持不变：`/ech?enhance=balanced`。可选 `cnEcs=off` 停止额外网段传递；`cnEcs=on` 在大陆以外也尝试。ECS 是地理提示，不保证上游采纳或获得最快 CDN。内置冷启动国内域名覆盖电商、视频、社交、支付、地图、云服务及常用静态资源，远程 direct-list 继续定期更新。下一步以同一客户端网络的 HTTPS 实测和 TTL/命中率评估为准，不根据 Worker 的境外测速自动固定 CDN IP。

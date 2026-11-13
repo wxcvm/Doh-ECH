@@ -42,13 +42,101 @@ const UPSTREAM_CN_JSON_LIST = [
 const BALANCED_CN_WIRE = UPSTREAM_DNS_LIST.slice(0, 2);
 const BALANCED_INTL_WIRE = ["https://cloudflare-dns.com/dns-query", "https://dns.google/dns-query"];
 const BALANCED_INTL_JSON = ["https://cloudflare-dns.com/dns-query", "https://dns.google/resolve"];
+// Small reliable cold-start set; the existing remote direct list remains the main classifier.
+const BALANCED_CN_SUFFIXES = new Set([
+    "baidu.com","bdstatic.com","bdimg.com","qq.com","qpic.cn","gtimg.com","weixin.qq.com","wechat.com",
+    "bilibili.com","bilivideo.com","bilivideo.cn","hdslb.com","b23.tv","douyin.com","douyinpic.com","douyinvod.com",
+    "byteimg.com","bytedance.com","toutiao.com","ixigua.com","taobao.com","tmall.com","alicdn.com","alipay.com",
+    "alipayobjects.com","jd.com","360buyimg.com","meituan.com","dianping.com","sankuai.com","163.com","126.com",
+    "netease.com","youdao.com","mi.com","miui.com","xiaomi.com","huawei.com","huaweicloud.com","honor.com",
+    "kuaishou.com","gifshow.com","ksapisrv.com","xiaohongshu.com","xhscdn.com","sina.com.cn","weibo.com",
+    "iqiyi.com","qiyi.com","youku.com","ykimg.com","amap.com","autonavi.com","12306.cn","pinduoduo.com",
+    "yangkeduo.com","bcebos.com","aliyuncs.com","myqcloud.com","qcloud.com","ctyun.cn","chinamobile.com",
+    "chinaunicom.com","chinatelecom.com.cn","mgtv.com","douyu.com","huya.com","zhihu.com","zhimg.com"
+]);
 function balancedDomestic(domain) {
     if (!cnDomainSet) cnDomainSet = new Set(CN_DOMAIN_SUFFIXES);
     if (DIRECT_DOMAINS.some(d => domain === d || domain.endsWith("." + d))) return false;
+    for (let d = domain; d; d = d.includes('.') ? d.slice(d.indexOf('.') + 1) : '') {
+        if (BALANCED_CN_SUFFIXES.has(d)) return true;
+    }
     return isCNDomain(domain);
 }
-async function forwardBalanced(rawBuffer, domain) {
+
+// Auto only for clients Cloudflare locates in mainland China; explicit on/off is available.
+// Use the existing /24 and /56 normalization. Never send an injected ECS to international upstreams.
+function balancedEcsIP(config, clientIP) {
+    if (config.cnEcs === 'off' || (config.cnEcs !== 'on' && config.clientCountry !== 'CN')) return '';
+    return ecsPrefix(clientIP) ? clientIP : '';
+}
+function addBalancedEcs(rawBuffer, clientIP) {
+    const prefix = ecsPrefix(clientIP);
+    const parsed = inspectDnsWire(rawBuffer);
+    if (!prefix || !parsed || parsed.questions.length !== 1 || parsed.questions[0].compressed ||
+        ![1,28,65].includes(parsed.questions[0].type) || parsed.questions[0].qclass !== 1) return null;
+    const src = new Uint8Array(rawBuffer), view = new DataView(rawBuffer);
+    if (view.getUint16(6) || view.getUint16(8) || (view.getUint16(2) & 0xf800)) return null;
+    const ar = view.getUint16(10), opt = parsed.opt;
+    // Only ordinary queries without OPT or with an empty EDNS0 OPT. Existing ECS,
+    // cookies, DO, signatures and other options remain untouched.
+    if (ar > 1 || (ar === 1 && (!opt || opt.start !== parsed.questionEnd ||
+        opt.end !== src.length || opt.rdlength !== 0 || opt.ttl !== 0))) return null;
+    const v6 = prefix.includes(':'), bits = v6 ? 56 : 24;
+    const address = (v6 ? ipv6ToBytes(prefix.split('/')[0]) : ipToBytes(prefix.split('/')[0])).slice(0, bits/8);
+    const option = new Uint8Array(8 + address.length);
+    const ov = new DataView(option.buffer);
+    ov.setUint16(0,8); ov.setUint16(2,4+address.length); ov.setUint16(4,v6?2:1);
+    option[6]=bits; option.set(address,8);
+    const base = ar ? src : appendOpt(src);
+    const out = new Uint8Array(base.length + option.length);
+    out.set(base); out.set(option,base.length);
+    new DataView(out.buffer).setUint16(base.length-2,option.length);
+    return {body:out.buffer, originalOpt:!!ar, option};
+}
+function stripBalancedEcs(packet, injection) {
+    const parsed=inspectDnsWire(packet);
+    if (!parsed) return null;
+    const bytes=new Uint8Array(packet), v=new DataView(packet), opt=parsed.opt;
+    // Reject temporary/EDNS errors and retry the unchanged domestic request.
+    if (![0,3].includes(v.getUint16(2)&15) || (v.getUint16(2)&0x0200)) return null;
+    if (!opt) return packet; // upstream may not support ECS
+    if (opt.end!==bytes.length || (opt.ttl>>>24)!==0 || parsed.optCount!==1) return null;
+    const kept=[]; let found=false;
+    for(let i=opt.dataStart;i<opt.end;) {
+        if(i+4>opt.end)return null;
+        const code=v.getUint16(i), n=v.getUint16(i+2), end=i+4+n;
+        if(end>opt.end)return null;
+        if(code===8) {
+            const expected=injection.option;
+            if(found || n!==expected.length-4 || bytes[i+7]>expected[6])return null;
+            for(let j=4;j<expected.length;j++) {
+                if(j!==7 && bytes[i+j]!==expected[j])return null;
+            }
+            found=true;
+        } else kept.push(bytes.subarray(i,end));
+        i=end;
+    }
+    if(!injection.originalOpt) {
+        const out=bytes.slice(0,opt.start);
+        const dv=new DataView(out.buffer);dv.setUint16(10,v.getUint16(10)-1);
+        return out.buffer;
+    }
+    const length=kept.reduce((n,b)=>n+b.length,0);
+    const out=new Uint8Array(opt.dataStart+length);out.set(bytes.subarray(0,opt.dataStart));
+    let offset=opt.dataStart;for(const b of kept){out.set(b,offset);offset+=b.length;}
+    new DataView(out.buffer).setUint16(opt.dataStart-2,length);
+    return out.buffer;
+}
+async function forwardBalanced(rawBuffer, domain, config, clientIP) {
     const domestic = balancedDomestic(domain);
+    if(domestic) {
+        const injection=addBalancedEcs(rawBuffer,balancedEcsIP(config,clientIP));
+        if(injection) {
+            const result=await forwardQuery(injection.body,BALANCED_CN_WIRE);
+            const packet=stripBalancedEcs(await result.arrayBuffer(),injection);
+            if(packet) return dnsResponse(packet);
+        }
+    }
     const result = await forwardQuery(rawBuffer, domestic ? BALANCED_CN_WIRE : BALANCED_INTL_WIRE);
     const packet = await result.arrayBuffer();
     if (domestic && (new DataView(packet).getUint16(2) & 15) === 2) {
@@ -226,7 +314,7 @@ function buildConfig(url, headers = null) {
         best: get('best', 'X-Best') || 'false', sub: get('sub', 'X-Sub'),
         exclude: get('exclude', 'X-Exclude'), shuffle: get('shuffle', 'X-Shuffle') || 'true',
         area: get('area', 'X-Area'), enhance: get('enhance', 'X-Enhance') || 'off',
-        pins: get('pins', 'X-Pins'), xh3: get('xh3', 'X-XH3'), rules: get('rules', 'X-Rules'), alpn: get('alpn', 'X-Alpn') || 'h3,h2',
+        cnEcs: get('cnEcs', 'X-CN-ECS') || 'auto', pins: get('pins', 'X-Pins'), xh3: get('xh3', 'X-XH3'), rules: get('rules', 'X-Rules'), alpn: get('alpn', 'X-Alpn') || 'h3,h2',
         clientIp: get('clientIp', 'X-ClientIP') || '',
         no6: get('no6', 'X-No6') || 'false',   
         mandatory: get('mandatory', 'X-Mandatory') || 'alpn',
@@ -260,7 +348,7 @@ export default {
                 headers: {
                     'Access-Control-Allow-Origin': '*',
                     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-                    'Access-Control-Allow-Headers': 'Content-Type, Accept, X-Ip4, X-Ip6, X-MetaIp4, X-MetaIp6, X-CF, X-Meta, X-ECH, X-Best, X-Sub, X-Exclude, X-Shuffle, X-Pins, X-XH3, X-Area, X-Enhance, X-Rules, X-Alpn, X-ClientIP, X-No6, X-Mandatory, X-NoCF6',
+                    'Access-Control-Allow-Headers': 'Content-Type, Accept, X-Ip4, X-Ip6, X-MetaIp4, X-MetaIp6, X-CF, X-Meta, X-ECH, X-Best, X-Sub, X-Exclude, X-Shuffle, X-Pins, X-XH3, X-CN-ECS, X-Area, X-Enhance, X-Rules, X-Alpn, X-ClientIP, X-No6, X-Mandatory, X-NoCF6',
                     'Access-Control-Max-Age': '86400'
                 }
             });
@@ -284,7 +372,7 @@ export default {
             });
         }
         const clientIP = url.searchParams.get('clientIp') || req.headers.get('X-ClientIP') || req.headers.get('CF-Connecting-IP') || '';
-        if (url.pathname === '/api/query') return handleApiQuery(url, clientIP, env);
+        if (url.pathname === '/api/query') return handleApiQuery(url, clientIP, env, req.cf?.country || '');
         if (url.pathname === '/ech' || url.pathname === '/dns-query') return handleDoHRequest(req, true, ctx, clientIP, env);
         if (url.pathname === '/doh') return handleDoHRequest(req, false, ctx, clientIP, env);
         if (url.pathname === '/' || url.pathname === '/index.html') {
@@ -359,6 +447,7 @@ const DOH_GET_TTL = 300000; // 5分钟
 async function handleDoHRequest(req, injectEch, ctx, clientIP, env) {
     const url = new URL(req.url);
     const config = buildConfig(url, req.headers);
+    config.clientCountry = req.cf?.country || '';
     if (!config.clientIp) config.clientIp = clientIP;
     // Pure forwarding must not fetch user-provided subscription URLs.
     if (injectEch && config.enhance !== 'balanced') await applySubConfig(config, env);
@@ -427,8 +516,8 @@ async function handleDnsQuery(rawBuffer, config, ctx, clientIP) {
         // 响应 question 与请求逐字节一致，统一转小写会导致其丢弃响应。
         const rawQName = questions[0].name.replace(/\.$/, "");
         // Balanced mode preserves complete upstream wire responses, including CNAME, HTTPS and DNSSEC.
-        if (config.enhance === 'balanced' && questions.length === 1 && questions[0].qclass === 1 &&
-            (new DataView(rawBuffer).getUint16(2) & 0x7800) === 0) return forwardBalanced(rawBuffer, qName);
+        if (config.enhance === 'balanced' && new DataView(rawBuffer).getUint16(4) === 1 && questions[0].qclass === 1 && !query.questionCompressed &&
+            (new DataView(rawBuffer).getUint16(2) & 0x7800) === 0) return forwardBalanced(rawBuffer, qName, config, clientIP);
         // Non-IN, multi-question, non-QUERY, or DNSSEC-sensitive packets must be forwarded untouched.
         const header = new DataView(rawBuffer);
         if (header.getUint16(4) !== 1 || (header.getUint16(2) & 0x7800) !== 0 ||
@@ -576,12 +665,13 @@ function isCacheableStaticRequest(domain, config, type) {
     return true;
 }
 
-async function handleApiQuery(url, clientIP, env) {
+async function handleApiQuery(url, clientIP, env, clientCountry = '') {
     const domain = url.searchParams.get('domain')?.toLowerCase().replace(/\.$/, '');
     const type = url.searchParams.get('type')?.toUpperCase() || 'A';
     if (!domain) return json({ error: '缺少 domain' }, 400);
     if (!['A', 'AAAA', 'HTTPS', 'CNAME', 'TXT', 'MX', 'NS'].includes(type)) return json({ error: '类型不支持' }, 400);
     const config = buildConfig(url);
+    config.clientCountry = clientCountry;
     if (!config.clientIp) config.clientIp = clientIP;
     if (config.enhance !== 'balanced') await applySubConfig(config, env);
 
@@ -659,8 +749,8 @@ async function resolveDNS(domain, type, config, clientIP) {
     domain = domain.toLowerCase().replace(/\.$/, '');
     if (config.enhance === 'balanced') {
         const domestic = balancedDomestic(domain);
-        // Match wire routing without adding a client ECS that the wire path does not inject.
-        let result = await resolveFallbackRecord(domain, type, '', domestic ? UPSTREAM_CN_JSON_LIST : BALANCED_INTL_JSON);
+        const ecs = domestic && ['A','AAAA','HTTPS'].includes(type) ? balancedEcsIP(config,clientIP) : '';
+        let result = await resolveFallbackRecord(domain, type, ecs, domestic ? UPSTREAM_CN_JSON_LIST : BALANCED_INTL_JSON);
         if (domestic && result.rcode === 2) {
             result = await resolveFallbackRecord(domain, type, '', BALANCED_INTL_JSON);
             return { ...result, policy: 'balanced-fallback' };
@@ -2133,15 +2223,21 @@ function inspectDnsWire(buffer) {
         }
         const questionEnd = offset;
         const recordCount = view.getUint16(6) + view.getUint16(8) + view.getUint16(10);
+        let opt=null,optCount=0;
         for (let i = 0; i < recordCount; i++) {
+            const start=offset;
             offset = readName(offset).end;
             if (offset + 10 > bytes.length) return null;
             const rdlength = view.getUint16(offset + 8);
+            if(view.getUint16(offset)===41 && i>=view.getUint16(6)+view.getUint16(8) && bytes[start]===0) {
+                opt={start,dataStart:offset+10,end:offset+10+rdlength,rdlength,ttl:view.getUint32(offset+4)};
+                optCount++;
+            }
             offset += 10 + rdlength;
             if (offset > bytes.length) return null;
         }
         if (offset !== bytes.length) return null;
-        return { id: view.getUint16(0), flags: view.getUint16(2), questions, questionEnd };
+        return { id: view.getUint16(0), flags: view.getUint16(2), questions, questionEnd, opt, optCount };
     } catch {
         return null;
     }
@@ -2941,7 +3037,7 @@ function getHtml() {
 <p class="help">Google / X 原生直连：仅针对 Google、X 及相关资源域名，优先真实 DNS，保留 IPv4/IPv6 和原生 HTTPS 记录，不使用随机 IP 或全局优选；其他域名保持默认策略。此模式下目标域名不应用高级地址覆盖。</p>
 <details class="advanced" id="advanced"><summary>高级设置（可选） <span id="advancedCount" class="muted"></span></summary>
 <p class="muted">以下参数都可组合使用；关闭面板不会取消设置，点击重置即可恢复默认。</p>
-<div class="advanced-group"><h3>Cloudflare 优选</h3><div class="form-grid">
+<div class="advanced-group"><h3>国内就近解析（均衡模式）</h3><label class="field"><span>客户端网段 ECS</span><select id="cnEcs"><option value="auto">自动（中国大陆连接）</option><option value="on">开启（国内域名）</option><option value="off">关闭额外 ECS</option></select></label><p class="help">仅向国内上游提供 IPv4 /24 或 IPv6 /56 网段；可帮助 CDN 就近调度，但透露大致位置。</p></div><div class="advanced-group"><h3>Cloudflare 优选</h3><div class="form-grid">
 <label class="field"><span>IPv4 · ip4</span><input id="ip4" placeholder="逗号分隔的 IPv4 地址"></label>
 <label class="field"><span>IPv6 · ip6</span><input id="ip6" placeholder="逗号分隔的 IPv6 地址"></label>
 <label class="field"><span>优选域名 · cf</span><input id="cf" placeholder="example.com"></label>
@@ -2992,7 +3088,7 @@ const modeNames={off:'默认解析',balanced:'日常均衡',rule:'规则增强',
 let busy=false;
 function params(){
  const p=new URLSearchParams();
- if($('enhance').value==='balanced'){p.set('enhance','balanced');return p;}
+ if($('enhance').value==='balanced'){p.set('enhance','balanced');if($('cnEcs').value!=='auto')p.set('cnEcs',$('cnEcs').value);return p;}
  for(const key of fields){const v=$(key).value.trim();if(v)p.set(key,v);}
  if($('enhance').value!=='off')p.set('enhance',$('enhance').value);
  if($('enhance').value==='direct'&&$('pins').value.trim())p.set('pins',$('pins').value.trim());

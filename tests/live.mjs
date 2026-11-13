@@ -143,4 +143,21 @@ await check('ordinary domain retains native HTTPS policy', async () => {
   const result = await api('example.com', 'HTTPS', { enhance: 'off' });
   assert.equal(result.echSource, undefined);
 });
+await check('balanced domestic routing and real wire ECS compatibility', async () => {
+  for(const domain of ['www.taobao.com','www.bilibili.com','www.baidu.com','www.jd.com','www.douyin.com']){
+    const options={enhance:'balanced',cnEcs:'on',clientIp:'223.5.5.5'};
+    const result=await api(domain,'A',options);
+    assert.equal(result.policy,'balanced-domestic');
+    assert.ok(result.answers.length>0,domain+' A');
+    const plain=await api(domain,'A',{enhance:'balanced',cnEcs:'off'});
+    assert.ok(plain.answers.length>0,domain+' A without added ECS');
+    const packet=await wire('/ech',domain,1,'POST',options);
+    assert.ok(packet.readUInt16BE(6)>0);
+    // Original test query has no OPT; injected ECS must not leak to the client.
+    assert.equal(packet.readUInt16BE(10),0);
+    console.log(domain+' domestic A: '+result.answers.join(',')+'; no ECS: '+plain.answers.join(',')+'; TTL '+result.ttl);
+  }
+  for(const type of [28,65]) await wire('/ech','www.taobao.com',type,'GET',{enhance:'balanced',cnEcs:'on',clientIp:'223.5.5.5'});
+  assert.equal((await api('www.google.com','A',{enhance:'balanced',cnEcs:'on',clientIp:'223.5.5.5'})).policy,'balanced-international');
+});
 console.log('All ' + passed + ' live Worker checks passed; this verifies DNS behavior, not end-to-end ECH/TLS connectivity.');

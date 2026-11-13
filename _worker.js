@@ -218,7 +218,7 @@ export default {
                 headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'public, max-age=3600, s-maxage=3600' }
             });
         }
-        const clientIP = url.searchParams.get('clientIp') || req.headers.get('X-ClientIP') || req.headers.get('CF-Connecting-IP') || '1.2.4.8';
+        const clientIP = url.searchParams.get('clientIp') || req.headers.get('X-ClientIP') || req.headers.get('CF-Connecting-IP') || '';
         if (url.pathname === '/api/query') return handleApiQuery(url, clientIP, env);
         if (url.pathname === '/ech' || url.pathname === '/dns-query') return handleDoHRequest(req, true, ctx, clientIP, env);
         if (url.pathname === '/doh') return handleDoHRequest(req, false, ctx, clientIP, env);
@@ -508,11 +508,11 @@ async function handleDnsQuery(rawBuffer, config, ctx, clientIP, ns = 'ech') {
 function buildDnsResponseBody(id, qName, qType, result, echoEdns = false) {
     if (qType === 65) {
         const rdata = result.httpsRecord ? [result.httpsRecord] : [];
-        return createMultiAnsResponse(id, qName, 65, rdata, rdata.length ? 300 : 60, echoEdns);
+        return createMultiAnsResponse(id, qName, 65, rdata, rdata.length ? 300 : 60, echoEdns, result.rcode || 0);
     }
     const bytes = qType === 28 ? ipv6ToBytes : ipToBytes;
     const answers = (result.answers || []).map(bytes).filter(Boolean);
-    return createMultiAnsResponse(id, qName, qType, answers, 300, echoEdns, result.rcode || 0);
+    return createMultiAnsResponse(id, qName, qType, answers, result.ttl ?? 300, echoEdns, result.rcode || 0);
 }
 
 function dnsResponseFromResult(id, qName, qType, result, echoEdns = false) {
@@ -535,7 +535,7 @@ function isCacheableStaticRequest(domain, config) {
     if (config.ip4 || config.ip6 || config.metaIp4 || config.metaIp6) return false;
     if (config.cfDomain || config.metaDomain || config.sub) return false;
     if (config.area || config.exclude) return false;
-    if (config.best === 'true') return false;
+    if (config.best === 'true' || config.shuffle === 'false') return false;
     if (config.no6 === 'true') return false;          // no6=true 屏蔽AAAA
     if (config.nocf6 === 'false') return false;       // nocf6=false 放行CF IPv6
     if (config.alpn !== 'h3,h2') return false;        // alpn 影响 HTTPS 记录
@@ -551,7 +551,7 @@ function isCacheableStaticRequest(domain, config) {
 }
 
 async function handleApiQuery(url, clientIP, env) {
-    const domain = url.searchParams.get('domain');
+    const domain = url.searchParams.get('domain')?.toLowerCase().replace(/\.$/, '');
     const type = url.searchParams.get('type')?.toUpperCase() || 'A';
     if (!domain) return json({ error: '缺少 domain' }, 400);
     if (!['A', 'AAAA', 'HTTPS', 'CNAME', 'TXT', 'MX', 'NS'].includes(type)) return json({ error: '类型不支持' }, 400);
@@ -602,7 +602,7 @@ async function handleApiQuery(url, clientIP, env) {
     try {
         const result = await resolveDNS(domain, type, config, config.clientIp);
         if (result.httpsRecord) delete result.httpsRecord;
-        const maxAge = (type === 'HTTPS') ? 600 : 300;
+        const maxAge = result.ttl ?? ((type === 'HTTPS') ? 600 : 300);
         const body = JSON.stringify(result);
         
         if (cacheable) {
@@ -619,7 +619,7 @@ async function handleApiQuery(url, clientIP, env) {
             headers: {
                 'Content-Type': 'application/json',
                 'Access-Control-Allow-Origin': '*',
-                'Cache-Control': `public, max-age=${maxAge}, s-maxage=${maxAge}`,
+                'Cache-Control': cacheable ? `public, max-age=${maxAge}, s-maxage=${maxAge}` : 'no-store',
                 'Vary': 'Accept-Encoding'
             }
         });
@@ -682,7 +682,7 @@ async function resolveDNS(domain, type, config, clientIP) {
     if (!data) return { domain, type, answers: [], ech: null, rcode: 2 };
     const answers = data?.Answer?.filter(r => r.type === dnsType).map(r => r.data) || [];
     // 透传上游 RCODE（3 = NXDOMAIN）；否则不存在的域名会被当成 NODATA 并缓存 300s
-    return { domain, type, answers, ech: null, rcode: data?.Status === 3 ? 3 : 0 };
+    return { domain, type, answers, ech: null, rcode: data.Status === 3 ? 3 : 0, ttl: upstreamAnswerTtl(data) };
     }
     // HTTPS 处理
     if (type === 'HTTPS') {
@@ -1099,14 +1099,7 @@ async function matchRule(domain, config) {
    
     // 必须新建对象：getBuiltinRulesMap() 返回的是全局共享的规则表，
     // 就地改写会把 CIDR 首次展开的随机结果永久固化，绕过 prefixCache 的 24h 轮换。
-    const merged = new Map();
-    for (const [key, rule] of await getBuiltinRulesMap()) {
-        merged.set(key, {
-            ips: rule.ips.flatMap(ip => ip.includes('/') ? getPrefixIPs(ip) : [ip]),
-            noA: rule.noA,
-            noAAAA: rule.noAAAA
-        });
-    }
+    const merged = new Map(await getBuiltinRulesMap());
     if (config.rules) {
         const user = parseRules(config.rules);
         for (const [k, v] of user) merged.set(k, v);
@@ -1123,7 +1116,8 @@ async function matchRule(domain, config) {
         return specificity(b.pattern) - specificity(a.pattern) ||
             Number(a.pattern.startsWith('*.')) - Number(b.pattern.startsWith('*.'));
     });
-    return matched[0].ruleObj;
+    const winner = matched[0].ruleObj;
+    return { ...winner, ips: winner.ips.flatMap(ip => ip.includes('/') ? getPrefixIPs(ip) : [ip]) };
 }
 
 function matchDomainPattern(domain, pattern) {
@@ -1458,11 +1452,11 @@ async function resolveDomainToIp(domain, type = 1, clientIP) {
  * 带超时的 fetch：避免单个上游挂起拖垮竞速（超时视为失败，交给 Promise.any 切换）
  * 优化：2s 快速超时，减少等待时间
  */
-async function fetchWithTimeout(url, init = {}, timeoutMs = 2000) {
+async function fetchWithTimeout(url, init = {}, timeoutMs = 2000, consume = response => response) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-        return await fetch(url, { ...init, signal: controller.signal });
+        return await consume(await fetch(url, { ...init, signal: controller.signal }));
     } finally {
         clearTimeout(timer);
     }
@@ -1471,62 +1465,77 @@ async function fetchWithTimeout(url, init = {}, timeoutMs = 2000) {
 /**
  * 上游 DNS 查询（带 ECS 支持与 Edge 缓存）
  */
-async function queryUpstreamDNS(name, type, clientIP = '',upstreamUrl = null) {
-    const params = new URLSearchParams({ name, type: String(type) });
-    let ecsCacheSuffix = '';
-    if (clientIP) {
-        if (clientIP.includes(':')) {
-            const prefix = clientIP.split(':').slice(0, 4).join(':') + '::/56';
-            params.set('edns_client_subnet', clientIP + '/56');
-            ecsCacheSuffix = '/56-' + prefix;
-        } else {
-            const parts = clientIP.split('.');
-            const prefix = parts.slice(0, 3).join('.') + '.0/24';
-            params.set('edns_client_subnet', clientIP + '/24');
-            ecsCacheSuffix = '/24-' + prefix;
-        }
+// Canonical ECS prefixes: never send the full client address to upstreams.
+function ecsPrefix(clientIP) {
+    if (!clientIP) return '';
+    const ip = String(clientIP).trim();
+    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) {
+        const bytes = ipToBytes(ip);
+        if (!bytes) return '';
+        bytes[3] = 0;
+        return bytesToIp(bytes) + '/24';
     }
-
-    const cacheKey = new Request(`https://dns-cache/${encodeURIComponent(name)}/${type}${ecsCacheSuffix}`);
+    if (!ip.includes(':')) return '';
     try {
-        if (typeof caches !== 'undefined' && caches.default) {
-            const cachedRes = await caches.default.match(cacheKey);
-            if (cachedRes) return cachedRes.json();
-        }
-    } catch (e) {}
+        const bytes = ipv6ToBytes(ip);
+        if (!bytes) return '';
+        bytes.fill(0, 7);
+        return formatIPv6(bytes) + '/56';
+    } catch { return ''; }
+}
 
-    // 上游 URL 列表：国内域名仅用国内上游，国外域名用国际上游列表竞速
+function upstreamAnswerTtl(data, cap = 300) {
+    // Negative answers require SOA-derived TTL; do not cache them blindly.
+    if (data?.Status !== 0 || !data.Answer?.length) return 0;
+    const ttls = data.Answer.map(r => r.TTL);
+    if (ttls.some(t => !Number.isInteger(t) || t < 0)) return 0;
+    return Math.min(cap, ...ttls);
+}
+
+async function queryUpstreamDNS(name, type, clientIP = '', upstreamUrl = null, preferEch = false) {
+    name = name.toLowerCase().replace(/\.$/, '');
+    const params = new URLSearchParams({ name, type: String(type) });
+    const prefix = ecsPrefix(clientIP);
+    if (prefix) params.set('edns_client_subnet', prefix);
     const upstreamList = upstreamUrl
         ? (Array.isArray(upstreamUrl) ? upstreamUrl : [upstreamUrl])
         : UPSTREAM_JSON_LIST;
+    // Different upstream policies and ECH selection semantics must not share cached answers.
+    const scope = encodeURIComponent(upstreamList.join('|'));
+    const cacheKey = new Request(`https://dns-cache/upstream-v2/${scope}/${encodeURIComponent(name)}/${type}/${encodeURIComponent(prefix || 'none')}/${preferEch ? 'ech' : 'rr'}`);
+    try {
+        if (typeof caches !== 'undefined' && caches.default) {
+            const cachedRes = await caches.default.match(cacheKey);
+            if (cachedRes) {
+                const stored = Number(cachedRes.headers.get('X-DNS-Stored-At'));
+                const data = await cachedRes.json();
+                const age = Math.max(0, Math.floor((Date.now() - stored) / 1000));
+                if (stored > 0 && isUsableDnsJson(data, type, name) && upstreamAnswerTtl(data, type === 65 ? 600 : 300) > age) {
+                    return { ...data, Answer: data.Answer.map(r => ({ ...r, TTL: Math.max(0, r.TTL - age) })) };
+                }
+            }
+        }
+    } catch {}
+
     const urls = upstreamList.map(u => u + '?' + params.toString());
     const promises = urls.map(url =>
-        fetchWithTimeout(url, { headers: { 'Accept': 'application/dns-json' } }, 2000)
-            .then(async res => {
-                if (!res.ok) throw new Error('upstream HTTP error');
-                const payload = await res.json();
-                if (!isUsableDnsJson(payload, type, name)) throw new Error('invalid upstream DNS answer');
-                return payload;
-            })
+        fetchWithTimeout(url, { headers: { Accept: 'application/dns-json' } }, 2000, async res => {
+            if (!res.ok) throw new Error('upstream HTTP error');
+            const payload = await res.json();
+            if (!isUsableDnsJson(payload, type, name)) throw new Error('invalid upstream DNS answer');
+            return payload;
+        })
     );
-
     let result;
-    // Prefer a usable answer of the requested type; retain legitimate NODATA/NXDOMAIN
-    // only when all upstreams lack that type. Never accept an HTTP-200 SERVFAIL as success.
-    try {
-        result = await firstWithType(promises, type);
-    } catch {
-        return null;
-    }
+    try { result = await firstWithType(promises, type, preferEch); } catch { return null; }
 
-    if (result && typeof caches !== 'undefined' && caches.default) {
+    const maxAge = upstreamAnswerTtl(result, type === 65 ? 600 : 300);
+    if (maxAge > 0 && typeof caches !== 'undefined' && caches.default) {
         try {
-            const maxAge = (type === 65) ? 600 : 300;
-            const resToCache = new Response(JSON.stringify(result), {
-                headers: { 'Cache-Control': `public, max-age=${maxAge}, s-maxage=${maxAge}` }
-            });
-            caches.default.put(cacheKey, resToCache).catch(() => {});
-        } catch (e) {}
+            await caches.default.put(cacheKey, new Response(JSON.stringify(result), {
+                headers: { 'Cache-Control': `public, max-age=${maxAge}`, 'X-DNS-Stored-At': String(Date.now()) }
+            }));
+        } catch {}
     }
     return result;
 }
@@ -1550,7 +1559,7 @@ function isUsableDnsJson(data, type, requestedName) {
  * 若所有上游均无该类型记录，则返回第一个成功响应（保持兜底行为）。
  * 优化：找到有效响应立即 resolve，不等待其他上游。
  */
-function firstWithType(promises, type) {
+function firstWithType(promises, type, preferEch = false) {
     return new Promise((resolve, reject) => {
         let settled = 0;
         let firstOk = null;
@@ -1566,8 +1575,9 @@ function firstWithType(promises, type) {
             p.then(data => {
                 if (resolved) return;
                 settled++;
-                if (!firstOk) firstOk = data;
-                if (data && Array.isArray(data.Answer) && data.Answer.some(a => a.type === type)) {
+                if (!firstOk || (firstOk.Status === 3 && data.Status === 0)) firstOk = data;
+                if (data.Status === 0 && Array.isArray(data.Answer) && data.Answer.some(a =>
+                    a.type === type && (!preferEch || parseHttpsRecord(a.data)?.ech))) {
                     resolved = true;
                     return resolve(data);
                 }
@@ -1604,13 +1614,13 @@ async function fetchRealEch(echDomain, clientIP) {
     // 3. 上游查询（多上游校验式竞速：优先取含 ECH 的 HTTPS 记录，
     //    不再单点依赖 dns.google；RFC3597 格式已由 parseSvcParamsFromData 兼容）
     try {
-        let data = await queryUpstreamDNS(echDomain, 65, clientIP);
+        let data = await queryUpstreamDNS(echDomain, 65, clientIP, null, true);
         if (!data) {
             await new Promise(r => setTimeout(r, 100));
-            data = await queryUpstreamDNS(echDomain, 65, clientIP);
+            data = await queryUpstreamDNS(echDomain, 65, clientIP, null, true);
         }
         if (data && data.Answer) {
-            const rec = data.Answer.find(r => r.type === 65);
+            const rec = data.Answer.find(r => r.type === 65 && parseHttpsRecord(r.data)?.ech);
             if (rec) {
                 const parsed = parseHttpsRecord(rec.data);
                 if (parsed && parsed.ech) {
@@ -2023,7 +2033,7 @@ async function forwardQuery(body) {
     // Race valid complete DNS replies, not just the first HTTP-200 header.
     // A temporary DNS SERVFAIL is not a successful upstream resolution.
     const promises = UPSTREAM_DNS_LIST.map(url =>
-        fetchWithTimeout(url, reqInit, 2000).then(async res => {
+        fetchWithTimeout(url, reqInit, 2000, async res => {
             if (!res.ok || !(res.headers.get('Content-Type') || '').toLowerCase().startsWith('application/dns-message')) {
                 throw new Error('upstream returned non-DNS response');
             }
@@ -2131,7 +2141,7 @@ async function resolveFallbackRecord(domain, type, clientIP, upstreamUrl = null)
     const dnsType = typeMap[type] || 1;
 
     const data = await queryUpstreamDNS(domain, dnsType, clientIP, upstreamUrl);
-    if (!data) return { domain, type, error: '上游查询失败' };
+    if (!data) return { domain, type, answers: [], ech: null, rcode: 2, ttl: 0 };
 
     if (type === 'HTTPS') {
         const result = { domain, type, answers: [] };
@@ -2150,7 +2160,7 @@ async function resolveFallbackRecord(domain, type, clientIP, upstreamUrl = null)
     }
 
     const answers = data?.Answer?.filter(r => r.type === dnsType).map(r => r.data) || [];
-    return { domain, type, answers, ech: null };
+    return { domain, type, answers, ech: null, rcode: data.Status === 3 ? 3 : 0, ttl: upstreamAnswerTtl(data) };
 }
 /**
  * 加载/更新国内域名集合

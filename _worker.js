@@ -135,6 +135,15 @@ let cnRetryAt = 0;
 globalThis.__workerStartTime = globalThis.__workerStartTime || Date.now();
 const CN_DOMAIN_CACHE_TTL = 7 * 24 * 3600 * 1000;   // 每7天更新CN列表
 const cacheMap = new Map();
+function rememberCacheEntry(key, entry) {
+    if (cacheMap.size > 20000) {
+        for (const k of cacheMap.keys()) {
+            cacheMap.delete(k);
+            if (cacheMap.size <= 15000) break;
+        }
+    }
+    cacheMap.set(key, entry);
+}
 const ECH_CACHE_TTL = 3600 * 1000;              //ech缓存1小时
 const SUB_CACHE_TTL =  24 * 3600 * 1000;      //订阅缓存1天
 const subCache = new Map();
@@ -1591,8 +1600,20 @@ function preferredDnsAnswer(data, type, preferEch) {
 // Meta does not consistently publish ECH in DNS. Prefer per-origin DNS data;
 // the existing legacy configuration remains a short-lived compatibility fallback.
 async function fetchMetaEch(domain, clientIP) {
+    domain = domain.toLowerCase().replace(/\.$/, '');
+    const key = `meta-legacy-v1:${domain}:${encodeURIComponent(ecsPrefix(clientIP) || 'none')}`;
+    const cached = cacheMap.get(key);
+    if (cached && cached.expire > Date.now()) {
+        return { ech: META_ECH_CONFIG, ttl: Math.max(0, Math.floor((cached.expire - Date.now()) / 1000)), legacy: true };
+    }
     const info = await fetchRealEch(domain, clientIP);
-    return info || { ech: META_ECH_CONFIG, ttl: 60, legacy: true };
+    if (info) return info;
+    // Preserve the original compatibility behavior only for named Meta services.
+    // An IP ownership probe is not evidence that a third-party origin accepts this key.
+    if (!META_DOMAINS.some(d => domain === d || domain.endsWith('.' + d))) return null;
+    // Recheck shortly; do not send three upstream requests for every Meta HTTPS lookup.
+    rememberCacheEntry(key, { expire: Date.now() + 30_000 });
+    return { ech: META_ECH_CONFIG, ttl: 30, legacy: true };
 }
 
 async function fetchRealEch(echDomain, clientIP) {
@@ -1610,7 +1631,7 @@ async function fetchRealEch(echDomain, clientIP) {
         if (cachedText) {
             const data = JSON.parse(cachedText);
             if (data?.ech && data.expire > Date.now()) {
-                cacheMap.set(cacheKey, { value: data.ech, expire: data.expire });
+                rememberCacheEntry(cacheKey, { value: data.ech, expire: data.expire });
                 return { ech: data.ech, ttl: Math.max(0, Math.floor((data.expire - Date.now()) / 1000)) };
             }
         }
@@ -1631,7 +1652,7 @@ async function fetchRealEch(echDomain, clientIP) {
                     const ttl = upstreamAnswerTtl(data, ECH_CACHE_TTL / 1000);
                     if (ttl > 0) {
                         const expire = Date.now() + ttl * 1000;
-                        cacheMap.set(cacheKey, { value: parsed.ech, expire });
+                        rememberCacheEntry(cacheKey, { value: parsed.ech, expire });
                         writeCache(cacheUrl, JSON.stringify({ ech: parsed.ech, expire }), ttl);
                     }
                     return { ech: parsed.ech, ttl };
@@ -2513,7 +2534,7 @@ async function activeProbeOwner(domain, ctx, clientIP) {
         if (text) {
             const entry = JSON.parse(text);
             if (entry.expire > Date.now()) {
-                cacheMap.set(cacheKey, entry);
+                rememberCacheEntry(cacheKey, entry);
                 return entry.value;
             }
         }
@@ -2527,14 +2548,8 @@ async function activeProbeOwner(domain, ctx, clientIP) {
     const value = owner ? { owner, ips } : null;
     const ttl = upstreamAnswerTtl(data, owner ? 300 : 60);
     if (ttl > 0) {
-        if (cacheMap.size > 20000) {
-            for (const k of cacheMap.keys()) {
-                cacheMap.delete(k);
-                if (cacheMap.size <= 15000) break;
-            }
-        }
         const entry = { value, expire: Date.now() + ttl * 1000 };
-        cacheMap.set(cacheKey, entry);
+        rememberCacheEntry(cacheKey, entry);
         await writeCache(cacheUrl, JSON.stringify(entry), ttl);
     }
     return value;

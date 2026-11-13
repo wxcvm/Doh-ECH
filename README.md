@@ -124,7 +124,7 @@ hosts文件支持两种格式：
 | `meta`          | 解析优选域名 **仅对Meta相关域名生效**        | `example.com,ip2.example.com`       |
 | `ech`         | 获取CF公共ECH配置的域名（默认 `cloudflare-ech.com`）                                      | `cloudflare-ech.com`               |
 | `best` | 全局跟随优选 所有CF/META站点都使用优选IP 默认`false`|（`true`/`false`） | `false` |
-| `clientip` |  自定义ECS,就近解析最佳结果 |默认自动获取（`/24`/ `::/26` ） |`自动获取`|
+| `clientIp` | 自定义 ECS；IPv4 /24、IPv6 /56 规范化网段 | 默认自动获取 | `192.0.2.123` |
 | `sub` | CF优选订阅链接 |格式（`ip-https://ip.txt`/ `cf-https://domain.txt` ） |``|
 | `exclude` | 返回记录排除指定ip/domain |（`1.1.1.1`/ `cf.cf` ） |``|
 | `shuffle` |  乱序返回记录 |默认`true`（`false`/`true` ） |`false`|
@@ -232,7 +232,7 @@ DOH_ALLOWED_SUB_HOSTS = "feeds.example.com"
 ## 注意事项
 - **限额**：Cloudflare Workers 的免费配额、子请求额度和缓存能力可能变化，请以当前 Cloudflare 官方文档及账号限制为准；不应将应用层缓存当作抵御大量滥用查询的手段。
 - **ECH 有效性**：Meta 的 ECH 为固定配置（可能会过期），Cloudflare 的 ECH 从指定域名动态获取，可自定义 `ech` 参数。
-- **隐私与安全**：当前上游包含阿里 DNS、DNSPod 和 Cloudflare；国内域名分流至阿里 DNS/DNSPod。客户端原始 IP 可被转成 ECS 参数发送给上游，因此默认启用时需要考虑隐私需求。可调整 `_worker.js` 顶部的上游配置。
+- **隐私与安全**：当前上游包含阿里 DNS、DNSPod 和 Cloudflare；国内域名分流至阿里 DNS/DNSPod。客户端 IP 仅转换为 IPv4 /24 或 IPv6 /56 网段后作为 ECS 发送给上游；无法获取有效地址时不发送 ECS。网段仍会透露大致网络位置，因此需考虑隐私需求。可调整 `_worker.js` 顶部的上游配置。
   
 ## 项目特性
 
@@ -241,6 +241,6 @@ DOH_ALLOWED_SUB_HOSTS = "feeds.example.com"
 - ✅ **多上游竞速**  
   同时查询 Google / Cloudflare / Quad9 / DNSPod 多家上游，取最快响应；国内域名走阿里 / DNSPod 国内上游，提高解析速度与准确性。
 - ✅ **边缘节点本地缓存**  
-  使用 Cloudflare Cache API 缓存可复用的上游 DNS 结果；缓存不是跨所有数据中心自动复制，时效也可能随记录与策略而变化。
+  使用 Cloudflare Cache API 缓存可复用的正向上游 DNS 结果，按上游组、ECS 网段及 ECH 选择策略隔离；遵守记录 TTL，命中时扣减缓存年龄，不缓存零 TTL 或负应答。缓存仅在所在边缘数据中心复用，不是全球自动复制。
 - ✅ **ECS就近解析**  
-  默认自动获取发起doh查询的用户端ClientIP（支持自定义 clientip=x.x.x.x）,实现就近解析，同时在频繁切换网络环境时仍能保证最佳解析结果。
+  默认获取 DoH 客户端 IP（可用 `clientIp` 自定义），向上游仅发送规范化的 IPv4 /24 或 IPv6 /56 网段；按网段及上游策略隔离缓存。ECS 可能帮助就近解析，但不保证最佳连接性能。

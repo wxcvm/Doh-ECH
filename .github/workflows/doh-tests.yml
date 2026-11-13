@@ -5,6 +5,7 @@ on:
     paths:
       - '_worker.js'
       - 'tests/**'
+      - 'scripts/direct-probe.py'
       - '.github/workflows/doh-tests.yml'
   workflow_dispatch:
 
@@ -23,3 +24,5 @@ jobs:
         run: node --experimental-default-type=module --check _worker.js
       - name: Run no-network DoH smoke tests
         run: node --experimental-default-type=module tests/smoke.mjs
+      - name: Test local direct probe
+        run: python3 tests/test_direct_probe.py

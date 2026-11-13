@@ -44,6 +44,21 @@ const DIRECT_DOMAINS = ["google.com","google.com.hk","google.com.tw","google.co.
 function isNativeDirect(domain, config) {
     return config.enhance === "direct" && DIRECT_DOMAINS.some(d => domain === d || domain.endsWith("."+d));
 }
+// Explicit per-client pins, never shared or inferred from another user's network.
+function localDirectPins(domain, type, config) {
+    if (!isNativeDirect(domain, config) || !config.pins || !['A','AAAA'].includes(type)) return [];
+    const result = new Set();
+    for (const entry of config.pins.split(';')) {
+        const [host, list] = entry.split('=');
+        if (host?.trim().toLowerCase().replace(/\.$/,'') !== domain || !list) continue;
+        for (const value of list.split(',')) {
+            const ip = value.trim();
+            if (type === 'AAAA' && ip.includes(':') && ipv6ToBytes(ip)) result.add(formatIPv6(ipv6ToBytes(ip)));
+            if (type === 'A' && /^\d{1,3}(\.\d{1,3}){3}$/.test(ip) && ipToBytes(ip)) result.add(bytesToIp(ipToBytes(ip)));
+        }
+    }
+    return [...result].slice(0, 8);
+}
 const SVC_PARAM_IDS = { mandatory: 0, alpn: 1, "no-default-alpn": 2, port: 3, ipv4hint: 4, ech: 5, ipv6hint: 6};// SVC PARAMS构造
 const IPV4_ONLY_DOMAINS = ["twitter.com", "x.com", "t.co", "twimg.com"];// CDN IPv4-only policy; dl.google.com is handled by an opt-in rule below.
 //Cloudflare 配置
@@ -177,7 +192,7 @@ function buildConfig(url, headers = null) {
         best: get('best', 'X-Best') || 'false', sub: get('sub', 'X-Sub'),
         exclude: get('exclude', 'X-Exclude'), shuffle: get('shuffle', 'X-Shuffle') || 'true',
         area: get('area', 'X-Area'), enhance: get('enhance', 'X-Enhance') || 'off',
-        rules: get('rules', 'X-Rules'), alpn: get('alpn', 'X-Alpn') || 'h3,h2',
+        pins: get('pins', 'X-Pins'), rules: get('rules', 'X-Rules'), alpn: get('alpn', 'X-Alpn') || 'h3,h2',
         clientIp: get('clientIp', 'X-ClientIP') || '',
         no6: get('no6', 'X-No6') || 'false',   
         mandatory: get('mandatory', 'X-Mandatory') || 'alpn',
@@ -211,7 +226,7 @@ export default {
                 headers: {
                     'Access-Control-Allow-Origin': '*',
                     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-                    'Access-Control-Allow-Headers': 'Content-Type, Accept, X-Ip4, X-Ip6, X-MetaIp4, X-MetaIp6, X-CF, X-Meta, X-ECH, X-Best, X-Sub, X-Exclude, X-Shuffle, X-Area, X-Enhance, X-Rules, X-Alpn, X-ClientIP, X-No6, X-Mandatory, X-NoCF6',
+                    'Access-Control-Allow-Headers': 'Content-Type, Accept, X-Ip4, X-Ip6, X-MetaIp4, X-MetaIp6, X-CF, X-Meta, X-ECH, X-Best, X-Sub, X-Exclude, X-Shuffle, X-Pins, X-Area, X-Enhance, X-Rules, X-Alpn, X-ClientIP, X-No6, X-Mandatory, X-NoCF6',
                     'Access-Control-Max-Age': '86400'
                 }
             });
@@ -389,6 +404,9 @@ async function handleDnsQuery(rawBuffer, config, ctx, clientIP) {
 
         // Direct profile is explicit, scoped and preserves native DNS packets (including HTTPS/SVCB).
         if (isNativeDirect(qName, config)) {
+            const type = qType === 1 ? 'A' : qType === 28 ? 'AAAA' : '';
+            const pins = localDirectPins(qName, type, config);
+            if (pins.length) return dnsResponseFromResult(id, rawQName, qType, { answers: pins, ttl: 30 }, echoEdns);
             const res = await forwardQuery(rawBuffer, DIRECT_WIRE);
             const packet = await res.arrayBuffer();
             if ((new DataView(packet).getUint16(2) & 15) !== 2) return dnsResponse(packet);
@@ -601,6 +619,8 @@ async function handleApiQuery(url, clientIP, env) {
 async function resolveDNS(domain, type, config, clientIP) {
     domain = domain.toLowerCase().replace(/\.$/, '');
     if (isNativeDirect(domain, config)) {
+        const pins = localDirectPins(domain, type, config);
+        if (pins.length) return { domain, type, answers: pins, ech: null, rcode: 0, ttl: 30, policy: 'local-pins' };
         // Native addresses and HTTPS metadata, never random prefixes or generic CDN IPs.
         let result = await resolveFallbackRecord(domain, type, clientIP, DIRECT_JSON);
         if (result.rcode === 2) result = await resolveFallbackRecord(domain, type, clientIP);
@@ -2895,6 +2915,7 @@ function getHtml() {
 <label><input type="checkbox" id="allowCF6"> 允许 CF IPv6</label>
 <label><input type="checkbox" id="shuffle" checked> 随机排列地址</label>
 </div><p class="help">全局跟随优选会主动探测 CDN 归属；CF IPv6 默认关闭。ECS 可能向上游透露大致网络位置。</p></div>
+<div class="advanced-group"><h3>本机验证地址（Google / X 原生直连模式）</h3><label class="field"><span>本机测速结果 · pins</span><input id="pins" placeholder="www.google.com=IPv6地址;x.com=IPv4地址"></label><p class="help">仅覆盖指定域名和地址族，按本机实测顺序返回；未设置的域名及地址族仍用原生 DNS。请只填自己实际通过 TLS 证书验证和 HTTP 测试的地址，网络变化后重新测试。<a href="https://github.com/wxcvm/Doh-ECH/blob/main/scripts/direct-probe.py" target="_blank" rel="noopener noreferrer">本机检测脚本</a></p></div>
 </details>
 <div class="actions"><button class="primary" id="queryBtn" type="submit">开始查询</button><button class="secondary" id="resetBtn" type="button">重置</button></div>
 <div class="feedback" id="feedback" role="status" aria-live="polite"></div>
@@ -2905,7 +2926,7 @@ function getHtml() {
 <div class="endpoint"><h3>日常稳定 · 纯 DoH</h3><p class="muted">原样转发上游，不注入 ECH 或优选 IP。</p><div class="urlrow"><code id="dohUrl"></code><button class="copy" type="button" data-copy="dohUrl">复制</button></div></div>
 <div class="endpoint"><h3>ECH 增强 · 当前设置</h3><p class="muted">Cloudflare / Meta ECH，支持自定义增强规则。</p><div class="urlrow"><code id="echUrl"></code><button class="copy" type="button" data-copy="echUrl">复制</button></div></div>
 <div class="feedback" id="copyStatus" role="status" aria-live="polite"></div>
-<div class="client-help"><h3>怎么配置客户端？</h3><p class="muted"><strong>浏览器：</strong>安全 DNS / DNS over HTTPS，选择自定义并粘贴地址。</p><p class="muted"><strong>AdGuard：</strong>DNS 保护 → DNS 服务器 → 添加自定义服务器，粘贴 DoH 地址。</p><p class="muted"><strong>Android：</strong>系统「私人 DNS」通常使用 DoT 主机名，不接受 HTTPS URL；请用支持 DoH 的客户端。</p><p class="muted">若同时使用代理 Fake-IP DNS，建议先确认 DNS 分工，不要让多个组件重复接管。</p></div>
+<div class="client-help"><h3>怎么配置客户端？</h3><p class="muted"><strong>直连地址筛选：</strong>用 <a href="https://github.com/wxcvm/Doh-ECH/blob/main/scripts/direct-probe.py" target="_blank" rel="noopener noreferrer">本机检测脚本</a> 在关闭代理后测量 TCP、TLS 和 HTTP，再使用输出的专属 DoH 地址。</p><p class="muted"><strong>浏览器：</strong>安全 DNS / DNS over HTTPS，选择自定义并粘贴地址。</p><p class="muted"><strong>AdGuard：</strong>DNS 保护 → DNS 服务器 → 添加自定义服务器，粘贴 DoH 地址。</p><p class="muted"><strong>Android：</strong>系统「私人 DNS」通常使用 DoT 主机名，不接受 HTTPS URL；请用支持 DoH 的客户端。</p><p class="muted">若同时使用代理 Fake-IP DNS，建议先确认 DNS 分工，不要让多个组件重复接管。</p></div>
 </section></aside></div>
 <footer class="footer">Doh-ECH · Cloudflare Workers · <a href="https://github.com/wxcvm/Doh-ECH" target="_blank" rel="noopener noreferrer">项目仓库</a> · <a href="https://github.com/rosenii/Doh-ECH" target="_blank" rel="noopener noreferrer">上游项目</a></footer>
 </main>
@@ -2922,6 +2943,7 @@ function params(){
  const p=new URLSearchParams();
  for(const key of fields){const v=$(key).value.trim();if(v)p.set(key,v);}
  if($('enhance').value!=='off')p.set('enhance',$('enhance').value);
+ if($('enhance').value==='direct'&&$('pins').value.trim())p.set('pins',$('pins').value.trim());
  for(const [key,def] of [['alpn','h3,h2'],['mandatory','alpn']]){const v=$(key).value.trim();if(v&&v!==def)p.set(key,v);}
  if($('best').checked)p.set('best','true');
  if($('no6').checked)p.set('no6','true');
@@ -2962,7 +2984,7 @@ function cardFor(type,out){
  }else if(!Array.isArray(d.answers)||!d.answers.length){status='无此类记录';tone='warn';description='可能是域名未发布该记录，或当前解析策略屏蔽了此类型。';}
  else{description='DNS 返回 '+d.answers.length+' 条记录。';}
  title.append(el('span','status '+tone,status));card.append(title,el('p','muted',description));
- if(d){if(d.policy==='native-direct')line(card,'解析策略：原生 DNS（未替换地址）');values(card,d.answers);if(d.ipv4hints?.length){line(card,'IPv4 提示');values(card,d.ipv4hints);}if(d.ipv6hints?.length){line(card,'IPv6 提示');values(card,d.ipv6hints);}if(d.echSource)line(card,'ECH 来源：'+(d.echSource==='legacy-meta'?'Meta 兼容配置':d.echSource==='dns'?'DNS 动态配置':d.echSource));if(Number.isFinite(d.ttl))line(card,'TTL：'+d.ttl+' 秒');}
+ if(d){if(d.policy==='native-direct')line(card,'解析策略：原生 DNS（未替换地址）');if(d.policy==='local-pins')line(card,'解析策略：本机指定地址（服务器未验证你的网络）');values(card,d.answers);if(d.ipv4hints?.length){line(card,'IPv4 提示');values(card,d.ipv4hints);}if(d.ipv6hints?.length){line(card,'IPv6 提示');values(card,d.ipv6hints);}if(d.echSource)line(card,'ECH 来源：'+(d.echSource==='legacy-meta'?'Meta 兼容配置':d.echSource==='dns'?'DNS 动态配置':d.echSource));if(Number.isFinite(d.ttl))line(card,'TTL：'+d.ttl+' 秒');}
  if(Number.isFinite(out.ms))line(card,'查询耗时：'+out.ms+' ms（浏览器到服务的请求时间）');
  return card;
 }

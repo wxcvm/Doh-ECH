@@ -288,3 +288,5 @@ python direct-probe.py --offline
 ```
 
 `--prepare` 仅保存候选 IP 到 `direct-candidates.json`，不做连通性判断；`--offline` 直接使用其中的 IP 建立连接，不再请求 DNS 服务。无候选时不会覆盖已有文件。候选来自下载时的网络和 DNS 视角，仍须本机测试，不保证覆盖所有可用地址。
+
+候选获取遇到 HTTP 403、超时或其他 DNS API 失败时，新版脚本自动尝试 Google Public DNS 和 Cloudflare DNS 的 HTTPS JSON 接口获取原生候选，并校验问题域名和记录类型。备用 DNS 不生成旧增强规则地址；若 `--legacy` 获取失败，原生候选仍可继续离线测试。此回退不会修改 Worker 安全规则，也不会证明备用解析器在关闭代理后可访问。

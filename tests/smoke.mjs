@@ -26,21 +26,21 @@ globalThis.fetch = async (input, init = {}) => {
     return new Response('203.0.113.55\n', { headers: { 'Content-Type': 'text/plain' } });
   }
   if ((init.method || 'GET') === 'POST' && init.body) {
-    const incoming=Buffer.from(init.body);
+    const incoming=Buffer.from(Buffer.from(init.body));
     wireBodies.push({host:url.hostname,body:incoming});
     const hasInjected=incoming.subarray(-11).toString('hex').startsWith('00080007000118') || incoming.subarray(-15).toString('hex').startsWith('0008000b000238');
     if(ecsReject && hasInjected) return new Response('no ECS',{status:503});
     if(ecsMismatch && hasInjected) {const reply=Buffer.from(incoming);reply.writeUInt16BE(0x8180,2);reply[reply.length-1]^=1;return new Response(reply,{headers:{'Content-Type':'application/dns-message'}});}
     if (simulateBinaryOutage || (domesticWireOutage && ['dns.alidns.com','doh.pub'].includes(url.hostname))) return new Response('temporarily unavailable', { status: 503 });
     if (binaryReplyOverride) {
-      return new Response(binaryReplyOverride(Buffer.from(init.body)), {
+      return new Response(binaryReplyOverride(Buffer.from(incoming)), {
         headers: { 'Content-Type': 'application/dns-message' }
       });
     }
     if (url.hostname === 'dns.alidns.com') {
       return new Response('not a DNS response', { headers: { 'Content-Type': 'text/html' } });
     }
-    const reply = Buffer.from(init.body);
+    const reply = Buffer.from(incoming);
     if (reply.length < 12) throw new Error('Invalid test query');
     reply.writeUInt16BE(0x8180, 2);
     reply.writeUInt16BE(0, 6);

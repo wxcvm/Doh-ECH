@@ -39,8 +39,14 @@ try {
   await page.getByRole('button',{name:'Android 推送',exact:false}).click();
   await page.locator('#cards [data-type=A] .status').filter({hasText:'已返回记录'}).waitFor();
   assert.match(await page.locator('#resultSummary').textContent(),/mtalk.google.com/);
+  for (const name of ['taobao.com','www.taobao.com','www.baidu.com','baidu.com']) {
+    const response = await page.request.get(new URL('/api/query?domain='+name+'&type=A',base).href);
+    console.log('DOMESTIC DIAGNOSTIC '+name+' '+response.status()+' '+(await response.text()).slice(0,1000));
+  }
   await page.getByRole('button',{name:'国内解析',exact:false}).click();
-  await page.locator('#cards [data-type=A] .status').filter({hasText:'已返回记录'}).waitFor();
+  await page.locator('#cards [data-type=A] .status').waitFor();
+  console.log('DOMESTIC PRESET '+await page.locator('#cards').textContent());
+  assert.match(await page.locator('#cards [data-type=A] .status').textContent(),/已返回记录/);
   assert.match(await page.locator('#resultSummary').textContent(),/taobao.com/);
   console.log('PASS real Meta, Android FCM and domestic presets');
 

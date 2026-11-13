@@ -310,3 +310,10 @@ python direct-probe.py --http3-probe --candidates direct-native.json --timeout 1
 ```
 
 HTTP/3 专项需要能启动且 `curl --version` 的 Features 行包含 HTTP3 的 curl。它以 `--http3-only`、指定 IP 和真实 TLS 主机名进行 QUIC/UDP 443 连接，不降级至 TCP，不关闭证书验证，不跟随重定向；验证实际 HTTP 版本、IP、证书及响应码。每域名每地址族最多两个候选；HTTP/3 专项结果单独写入 `direct-http3-result.json`，不自动生成 DNS pins。客户端不具备 HTTP/3 能力时明确跳过网络测试。仅 HTTP/3 成功不能保证浏览器后续会选择该协议，也不能证明整个网站可用。
+
+
+### X HTTP/3 浏览器实验配置
+
+当本机 `--http3-probe` 对 x.com 的指定 IPv4 返回 HTTP 2xx/3xx VERIFIED，而 TCP TLS 失败时，可以显式试用 `/ech?enhance=direct&xh3=172.66.0.227`（地址替换成本机最新验证成功值）。仅精确的 x.com A 和 HTTPS 记录被覆盖，TTL 30 秒；HTTPS ServiceMode 1 . alpn=h3,h2 ipv4hint=指定地址，无伪造 ECH，其他域名和记录类型保持原生策略，未配置 xh3 时行为不变。Chrome 的 DNS HTTPS ALPN 路径可尝试首次 QUIC 连接，但浏览器可回退 TCP，也可能忽略 HTTPS 记录；不保证强制 HTTP/3。保留默认 ALPN 兼容性，避免全为 no-default-alpn 的 RRset 被 Chrome 忽略。
+
+将完整 URL 设置为 Chrome 自定义安全 DNS，关闭代理/TUN，重启浏览器或清理 DNS/连接缓存，再访问 https://x.com/。可先在查询台选 X 直连诊断，展开高级设置并填写 xh3，检查 A 与 HTTPS 提示一致。首页成功仍需验证登录、API 与静态资源；不要将该地址自动用于未经实测的其他主机。该配置只基于本机测量，不是公共默认优选。

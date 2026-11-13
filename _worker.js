@@ -130,10 +130,20 @@ const CN_DOMAIN_SUFFIXES = ['jd.com','meituan.com','taobao.com', '.cn', '.com.cn
 // ===================== 缓存逻辑 =====================
 let cnDomainSet = null;
 let cnDomainLastFetch = 0;
+let cnRefreshRunning = false;
+let cnRetryAt = 0;
 globalThis.__workerStartTime = globalThis.__workerStartTime || Date.now();
 const CN_DOMAIN_CACHE_TTL = 7 * 24 * 3600 * 1000;   // 每7天更新CN列表
 const cacheMap = new Map();
-const CACHE_TTL = 7 * 24 * 3600 * 1000;         //归属探测缓存7天
+function rememberCacheEntry(key, entry) {
+    if (cacheMap.size > 20000) {
+        for (const k of cacheMap.keys()) {
+            cacheMap.delete(k);
+            if (cacheMap.size <= 15000) break;
+        }
+    }
+    cacheMap.set(key, entry);
+}
 const ECH_CACHE_TTL = 3600 * 1000;              //ech缓存1小时
 const SUB_CACHE_TTL =  24 * 3600 * 1000;      //订阅缓存1天
 const subCache = new Map();
@@ -576,7 +586,7 @@ async function handleApiQuery(url, clientIP, env) {
 async function resolveDNS(domain, type, config, clientIP) {
     domain = domain.toLowerCase().replace(/\.$/, '');
     // 国内域名分流：直接返回国内上游原始解析结果
-    ensureCNDomainSet();
+    if (!cnDomainSet) cnDomainSet = new Set(CN_DOMAIN_SUFFIXES);
     if (isCNDomain(domain)) {
         return await handleCNDomain(domain, type, config, clientIP);
     }
@@ -587,19 +597,13 @@ async function resolveDNS(domain, type, config, clientIP) {
 
     let owner = isStaticCF ? 'CF' : (isStaticMeta ? 'META' : null);
 
-    const getOwner = async () => {
-        const key = `owner:${domain}`;
-        const cached = cacheMap.get(key);
-        if (cached && Date.now() < cached.expire) return cached.value?.owner || null;
-        const probe = await activeProbeOwner(domain, null, clientIP);
-        return probe?.owner || null;
-    };
-
-    if (!owner && type === 'HTTPS') owner = await getOwner();
+    const getOwner = async () => (await activeProbeOwner(domain, null, clientIP))?.owner || null;
+    // CDN ownership alone is not permission to rewrite a third-party HTTPS record.
+    if (!owner && best) owner = await getOwner();
 
     let effectiveCF = isStaticCF, effectiveMeta = isStaticMeta;
     if (!effectiveCF && !effectiveMeta && best) {
-        const realOwner = owner || await getOwner();
+        const realOwner = owner;
         if (realOwner === 'CF') effectiveCF = true;
         else if (realOwner === 'META') effectiveMeta = true;
     }
@@ -815,6 +819,7 @@ async function buildHttpsRecord(domain, config, clientIP, options = {}) {
     // 4. 构建参数表
     const paramMap = new Map();
     let ttl = 300;
+    let echSource;
 
     if (!owner || injectEnhance) {
         try {
@@ -836,9 +841,10 @@ async function buildHttpsRecord(domain, config, clientIP, options = {}) {
     if (injectECH && owner) {
         const info = isCF
             ? await fetchRealEch(config.echDomain || 'cloudflare-ech.com', clientIP)
-            : { ech: META_ECH_CONFIG, ttl: 300 };
+            : await fetchMetaEch(domain, clientIP);
         if (info?.ech) {
             paramMap.set('ech', info.ech);
+            echSource = info.legacy ? 'legacy-meta' : 'dns';
             ttl = Math.min(ttl, info.ttl);
         } else {
             // Do not hold an ECH-less fallback for the normal synthetic lifetime.
@@ -859,7 +865,7 @@ async function buildHttpsRecord(domain, config, clientIP, options = {}) {
         injectEnhanceDefaults(finalParams, config.mandatory || 'alpn');
     }
 
-    return { ...buildHttpsRecordFromParams(domain, finalParams, ipv4, ipv6), ttl };
+    return { ...buildHttpsRecordFromParams(domain, finalParams, ipv4, ipv6), ttl, ...(echSource ? { echSource } : {}) };
 }
 
 // ===================== HTTPS 记录构建 (CF/Meta) =====================
@@ -940,10 +946,26 @@ async function collectIpHints(domain, config, clientIP, owner, source) {
 // ===================== 规则匹配 =====================
 
 let builtinRulesMap = null;
+let builtinRulesRefreshAt = 0;
+let builtinRulesRefreshing = false;
+
+function staticBuiltinRules() {
+    const map = new Map();
+    for (const group of BUILTIN_HINTS) {
+        if (!group.domains) continue;
+        const { ips = [], noA = false, noAAAA = false } = group;
+        for (const domain of group.domains) map.set(domain, { ips, noA, noAAAA });
+    }
+    return map;
+}
 
 async function getBuiltinRulesMap() {
-    if (builtinRulesMap) return builtinRulesMap;
-
+    if (builtinRulesRefreshing) return builtinRulesMap || staticBuiltinRules();
+    if (builtinRulesMap && Date.now() < builtinRulesRefreshAt) return builtinRulesMap;
+    builtinRulesRefreshing = true;
+    let retry = false;
+    let nextRefresh = Date.now() + HOSTS_CACHE_TTL;
+    try {
     const map = new Map();
     const hints = BUILTIN_HINTS;
     if (Array.isArray(hints)) {
@@ -955,7 +977,7 @@ async function getBuiltinRulesMap() {
                 const hostIpsMap = new Map();
                 for (const url of group.hosts) {
                     let data = null;
-                    const cacheKey = `https://dns-cache/hosts/${encodeURIComponent(url)}`;
+                    const cacheKey = `https://dns-cache/hosts-v2/${encodeURIComponent(url)}`;
                     const cached = hostsCache.get(url);
 
                     // 1. 内存缓存命中
@@ -966,8 +988,11 @@ async function getBuiltinRulesMap() {
                         const cachedText = await readCache(cacheKey);
                         if (cachedText) {
                             try {
-                                data = JSON.parse(cachedText);
-                                hostsCache.set(url, { data, expire: Date.now() + HOSTS_CACHE_TTL });
+                                const entry = JSON.parse(cachedText);
+                                if (Array.isArray(entry.data) && entry.expire > Date.now()) {
+                                    data = entry.data;
+                                    hostsCache.set(url, entry);
+                                }
                             } catch (e) {
                                 data = null;
                             }
@@ -975,30 +1000,24 @@ async function getBuiltinRulesMap() {
                         // 3. Cache API 未命中，远程下载（原逻辑）
                         if (!data) {
                             try {
-                                const controller = new AbortController();
-                                const timer = setTimeout(() => controller.abort(), 5000);
-                                const res = await fetch(url, { signal: controller.signal });
-                                clearTimeout(timer);
-                                if (res.ok) {
-                                    data = await res.json();
-                                    // 写入内存缓存
-                                    hostsCache.set(url, {
-                                        data: data,
-                                        expire: Date.now() + HOSTS_CACHE_TTL
-                                    });
-                                    // 异步写入 Cache API（新增）
-                                    writeCache(cacheKey, JSON.stringify(data), HOSTS_CACHE_TTL / 1000);
-                                } else if (cached) {
-                                    // 下载失败，使用过期内存缓存
-                                    data = cached.data;
-                                }
+                                data = await fetchWithTimeout(url, {}, 5000, async res => {
+                                    if (!res.ok) throw new Error('hosts HTTP error');
+                                    const result = await res.json();
+                                    if (!Array.isArray(result)) throw new Error('invalid hosts list');
+                                    return result;
+                                });
+                                const entry = { data, expire: Date.now() + HOSTS_CACHE_TTL };
+                                hostsCache.set(url, entry);
+                                await writeCache(cacheKey, JSON.stringify(entry), HOSTS_CACHE_TTL / 1000);
                             } catch (e) {
-                                console.error('Fetch hosts error:', url, e);
+                                retry = true;
                                 if (cached) data = cached.data;
                             }
                         }
                     }
 
+                    const stored = hostsCache.get(url);
+                    if (stored?.expire > Date.now()) nextRefresh = Math.min(nextRefresh, stored.expire);
                     if (data && Array.isArray(data)) {
                         for (const entry of data) {
                             let domain, ip;
@@ -1044,31 +1063,28 @@ async function getBuiltinRulesMap() {
         }
     }
     builtinRulesMap = map;
+    builtinRulesRefreshAt = retry ? Date.now() + 60_000 : nextRefresh;
     return map;
+    } finally { builtinRulesRefreshing = false; }
 }
 
 async function matchRule(domain, config) {
    
-    // 必须新建对象：getBuiltinRulesMap() 返回的是全局共享的规则表，
-    // 就地改写会把 CIDR 首次展开的随机结果永久固化，绕过 prefixCache 的 24h 轮换。
-    const merged = new Map(await getBuiltinRulesMap());
-    if (config.rules) {
-        const user = parseRules(config.rules);
-        for (const [k, v] of user) merged.set(k, v);
-    }
-    const matched = [];
-    for (const [pattern, ruleObj] of merged) {
-        if (matchDomainPattern(domain, pattern)) {
-            matched.push({ pattern, ruleObj });
+    const builtin = await getBuiltinRulesMap();
+    const user = config.rules ? parseRules(config.rules) : null;
+    // Exact match first, then longest suffix; user entries override the same pattern.
+    let winner = user?.get(domain) || builtin.get(domain);
+    if (!winner) {
+        for (let name = domain; name;) {
+            const pattern = '*.' + name;
+            winner = user?.get(pattern) || builtin.get(pattern);
+            if (winner) break;
+            const dot = name.indexOf('.');
+            if (dot < 0) break;
+            name = name.slice(dot + 1);
         }
     }
-    if (matched.length === 0) return null;
-    matched.sort((a, b) => {
-        const specificity = p => p.startsWith('*.') ? p.length - 2 : p.length;
-        return specificity(b.pattern) - specificity(a.pattern) ||
-            Number(a.pattern.startsWith('*.')) - Number(b.pattern.startsWith('*.'));
-    });
-    const winner = matched[0].ruleObj;
+    if (!winner) return null;
     return { ...winner, ips: winner.ips.flatMap(ip => ip.includes('/') ? getPrefixIPs(ip) : [ip]) };
 }
 
@@ -1170,7 +1186,7 @@ function sortAndDedupeParams(params, ipv4Hints, ipv6Hints) {
 async function buildFakeEchResponse(config, domain, clientIP, isCF) {
     const owner = isCF ? 'CF' : 'META';
     const { ipv4, ipv6 } = await collectIpHints(domain, config, clientIP, owner, 'preferred');
-    const info = isCF ? await fetchRealEch(config.echDomain || 'cloudflare-ech.com', clientIP) : { ech: META_ECH_CONFIG, ttl: 300 };
+    const info = isCF ? await fetchRealEch(config.echDomain || 'cloudflare-ech.com', clientIP) : await fetchMetaEch('www.facebook.com', clientIP);
     if (!info?.ech) return { domain, type: 'HTTPS', answers: [], rcode: 2, ttl: 0 };
     const params = [
         { key: 'alpn', val: config.alpn || 'h3,h2' },
@@ -1471,17 +1487,18 @@ async function queryUpstreamDNS(name, type, clientIP = '', upstreamUrl = null, p
         }
     } catch {}
 
-    const urls = upstreamList.map(u => u + '?' + params.toString());
-    const promises = urls.map(url =>
-        fetchWithTimeout(url, { headers: { Accept: 'application/dns-json' } }, 2000, async res => {
-            if (!res.ok) throw new Error('upstream HTTP error');
-            const payload = await res.json();
-            if (!isUsableDnsJson(payload, type, name)) throw new Error('invalid upstream DNS answer');
-            return payload;
-        })
-    );
     let result;
-    try { result = await firstWithType(promises, type, preferEch); } catch { return null; }
+    try {
+        result = await raceUpstreams(upstreamList, 'json', url =>
+            fetchWithTimeout(url + '?' + params.toString(), { headers: { Accept: 'application/dns-json' } }, 2000, async res => {
+                if (!res.ok) throw new Error('upstream HTTP error');
+                const payload = await res.json();
+                if (!isUsableDnsJson(payload, type, name)) throw new Error('invalid upstream DNS answer');
+                return payload;
+            }),
+            data => preferredDnsAnswer(data, type, preferEch),
+            (a, b) => !a || (a.Status === 3 && b.Status === 0) ? b : a);
+    } catch { return null; }
 
     const maxAge = preferEch && !result?.Answer?.some(r => r.type === 65 && parseHttpsRecord(r.data)?.ech)
         ? 0 : upstreamAnswerTtl(result, type === 65 ? 600 : 300);
@@ -1514,41 +1531,91 @@ function isUsableDnsJson(data, type, requestedName) {
  * 若所有上游均无该类型记录，则返回第一个成功响应（保持兜底行为）。
  * 优化：找到有效响应立即 resolve，不等待其他上游。
  */
-function firstWithType(promises, type, preferEch = false) {
+// Per-isolate, bounded health state for the configured upstreams only.
+// Fast valid answers avoid unnecessary subrequests; a slow/failing or incomplete answer
+// immediately or after a short hedge launches the next resolver.
+const upstreamHealth = new Map();
+function raceUpstreams(endpoints, kind, run, preferred, betterFallback = (a, b) => a ?? b) {
+    const now = Date.now();
+    const key = url => kind + ':' + url;
+    const score = url => {
+        const h = upstreamHealth.get(key(url));
+        if (!h || now - h.updated > 60_000) return 150;
+        return h.latency + h.failures * 250;
+    };
+    const ordered = [...endpoints].sort((a, b) => score(a) - score(b));
     return new Promise((resolve, reject) => {
-        let settled = 0;
-        let firstOk = null;
-        const total = promises.length;
-        let resolved = false;
-        const checkDone = () => {
-            if (settled === total && !resolved) {
-                if (firstOk) resolve(firstOk);
-                else reject(new Error('all upstreams failed'));
-            }
-        };
-        for (const p of promises) {
-            p.then(data => {
-                if (resolved) return;
-                settled++;
-                if (!firstOk || (firstOk.Status === 3 && data.Status === 0)) firstOk = data;
-                if (data.Status === 0 && Array.isArray(data.Answer) && data.Answer.some(a =>
-                    a.type === type && (!preferEch || parseHttpsRecord(a.data)?.ech))) {
-                    resolved = true;
-                    return resolve(data);
-                }
-                checkDone();
-            }).catch(() => {
-                if (resolved) return;
-                settled++;
-                checkDone();
-            });
+        let next = 0, pending = 0, timer = null, done = false, fallback = null;
+        function finish(value, error) {
+            if (done) return;
+            done = true;
+            clearTimeout(timer);
+            if (error) reject(error); else resolve(value);
         }
+        function launch() {
+            if (done || next >= ordered.length) return;
+            clearTimeout(timer);
+            const url = ordered[next++];
+            const started = Date.now();
+            pending++;
+            const record = ok => {
+                const old = upstreamHealth.get(key(url));
+                const latency = Math.max(1, Date.now() - started);
+                upstreamHealth.set(key(url), {
+                    latency: old ? old.latency * 0.75 + latency * 0.25 : latency,
+                    failures: ok ? 0 : Math.min(4, (old?.failures || 0) + 1),
+                    updated: Date.now()
+                });
+            };
+            Promise.resolve().then(() => run(url)).then(value => {
+                record(true);
+                if (done) return;
+                pending--;
+                if (preferred(value)) return finish(value);
+                fallback = betterFallback(fallback, value);
+                if (next < ordered.length) launch();
+                else if (!pending) finish(fallback);
+            }, () => {
+                record(false);
+                if (done) return;
+                pending--;
+                if (next < ordered.length) launch();
+                else if (!pending) finish(fallback, fallback ? null : new Error('all upstreams failed'));
+            });
+            if (next < ordered.length) timer = setTimeout(launch, 100);
+        }
+        if (!ordered.length) finish(null, new Error('no upstreams'));
+        else launch();
     });
+}
+
+function preferredDnsAnswer(data, type, preferEch) {
+    return data.Status === 0 && data.Answer?.some(a =>
+        a.type === type && (!preferEch || parseHttpsRecord(a.data)?.ech));
 }
 
 /**
  * 获取 Cloudflare ECH 公钥（带内存缓存）
  */
+// Meta does not consistently publish ECH in DNS. Prefer per-origin DNS data;
+// the existing legacy configuration remains a short-lived compatibility fallback.
+async function fetchMetaEch(domain, clientIP) {
+    domain = domain.toLowerCase().replace(/\.$/, '');
+    const key = `meta-legacy-v1:${domain}:${encodeURIComponent(ecsPrefix(clientIP) || 'none')}`;
+    const cached = cacheMap.get(key);
+    if (cached && cached.expire > Date.now()) {
+        return { ech: META_ECH_CONFIG, ttl: Math.max(0, Math.floor((cached.expire - Date.now()) / 1000)), legacy: true };
+    }
+    const info = await fetchRealEch(domain, clientIP);
+    if (info) return info;
+    // Preserve the original compatibility behavior only for named Meta services.
+    // An IP ownership probe is not evidence that a third-party origin accepts this key.
+    if (!META_DOMAINS.some(d => domain === d || domain.endsWith('.' + d))) return null;
+    // Recheck shortly; do not send three upstream requests for every Meta HTTPS lookup.
+    rememberCacheEntry(key, { expire: Date.now() + 30_000 });
+    return { ech: META_ECH_CONFIG, ttl: 30, legacy: true };
+}
+
 async function fetchRealEch(echDomain, clientIP) {
     echDomain = echDomain.toLowerCase().replace(/\.$/, '');
     // Cloudflare's public bootstrap is shared; custom ECH names may vary by ECS.
@@ -1564,7 +1631,7 @@ async function fetchRealEch(echDomain, clientIP) {
         if (cachedText) {
             const data = JSON.parse(cachedText);
             if (data?.ech && data.expire > Date.now()) {
-                cacheMap.set(cacheKey, { value: data.ech, expire: data.expire });
+                rememberCacheEntry(cacheKey, { value: data.ech, expire: data.expire });
                 return { ech: data.ech, ttl: Math.max(0, Math.floor((data.expire - Date.now()) / 1000)) };
             }
         }
@@ -1585,7 +1652,7 @@ async function fetchRealEch(echDomain, clientIP) {
                     const ttl = upstreamAnswerTtl(data, ECH_CACHE_TTL / 1000);
                     if (ttl > 0) {
                         const expire = Date.now() + ttl * 1000;
-                        cacheMap.set(cacheKey, { value: parsed.ech, expire });
+                        rememberCacheEntry(cacheKey, { value: parsed.ech, expire });
                         writeCache(cacheUrl, JSON.stringify({ ech: parsed.ech, expire }), ttl);
                     }
                     return { ech: parsed.ech, ttl };
@@ -1993,7 +2060,7 @@ async function forwardQuery(body) {
     const parsedQuery = inspectDnsWire(body);
     // Race valid complete DNS replies, not just the first HTTP-200 header.
     // A temporary DNS SERVFAIL is not a successful upstream resolution.
-    const promises = UPSTREAM_DNS_LIST.map(url =>
+    const requestUpstream = url =>
         fetchWithTimeout(url, reqInit, 2000, async res => {
             if (!res.ok || !(res.headers.get('Content-Type') || '').toLowerCase().startsWith('application/dns-message')) {
                 throw new Error('upstream returned non-DNS response');
@@ -2013,10 +2080,9 @@ async function forwardQuery(body) {
             return new Response(packet, {
                 headers: { 'Content-Type': 'application/dns-message' }
             });
-        })
-    );
+        });
     try {
-        return await Promise.any(promises);
+        return await raceUpstreams(UPSTREAM_DNS_LIST, 'wire', requestUpstream, () => true);
     } catch {
         // Do not turn a 503 HTML page into HTTP 200 application/dns-message.
         // Return a valid SERVFAIL packet with the original uncompressed question.
@@ -2129,56 +2195,34 @@ async function resolveFallbackRecord(domain, type, clientIP, upstreamUrl = null)
  */
 async function ensureCNDomainSet() {
     const now = Date.now();
-    // 同步兜底：确保首次调用后 cnDomainSet 永不为 null（避免冷启动竞态崩溃）
-    if (!cnDomainSet) {
-        cnDomainSet = new Set(CN_DOMAIN_SUFFIXES);
-        cnDomainLastFetch = 0;
-    }
-    // 已有有效缓存，直接返回
-    if (cnDomainSet && ( now - cnDomainLastFetch) < CN_DOMAIN_CACHE_TTL) {
-        return;
-    }
-    // 2. 从Cache API读取（新增）
-    const cacheKey = `https://dns-cache/cn/domains`;
-    const cachedText = await readCache(cacheKey);
-    if (cachedText) {
+    if (!cnDomainSet) cnDomainSet = new Set(CN_DOMAIN_SUFFIXES);
+    if (cnRefreshRunning || now < cnRetryAt || now - cnDomainLastFetch < CN_DOMAIN_CACHE_TTL) return;
+    cnRefreshRunning = true;
+    const cacheKey = 'https://dns-cache/cn/domains-v2';
+    try {
+        const cachedText = await readCache(cacheKey);
+        let data = cachedText ? JSON.parse(cachedText) : null;
+        if (!data?.text || !(data.expire > Date.now())) {
+            const text = await fetchWithTimeout(CN_DOMAIN_LIST_URL, {}, 5000, res => {
+                if (!res.ok) throw new Error('CN list HTTP error');
+                return res.text();
+            });
+            if (!text.trim()) throw new Error('empty CN list');
+            data = { text, expire: Date.now() + CN_DOMAIN_CACHE_TTL };
+            await writeCache(cacheKey, JSON.stringify(data), CN_DOMAIN_CACHE_TTL / 1000);
+        }
         const domains = new Set(CN_DOMAIN_SUFFIXES);
-        for (const line of cachedText.split(/\r?\n/)) {
-            const d = line.trim();
+        for (const line of data.text.split(/\r?\n/)) {
+            const d = line.trim().toLowerCase();
             if (d && !d.startsWith('#')) domains.add(d);
         }
         cnDomainSet = domains;
-        cnDomainLastFetch = now;
-        return;
-    }
-    // 如果集合为空，先用内置后缀创建临时集合，保证匹配立即可用
-    if (!cnDomainSet) {
-        cnDomainSet = new Set(CN_DOMAIN_SUFFIXES);
-        cnDomainLastFetch = 0; // 标记为需要更新
-    }
-
-    // 异步下载最新列表（不阻塞当前调用者）
-    try {
-        const res = await fetch(CN_DOMAIN_LIST_URL);
-        if (res.ok) {
-            const domains = new Set(CN_DOMAIN_SUFFIXES); // 内置后缀始终包含
-            const text = await res.text();
-            for (const line of text.split(/\r?\n/)) {
-                const d = line.trim();
-                if (d && !d.startsWith('#')) {
-                    domains.add(d);
-                }
-            }
-            cnDomainSet = domains;
-            cnDomainLastFetch = Date.now();
-            // 异步写入 Cache API（新增）
-            writeCache(cacheKey, text, CN_DOMAIN_CACHE_TTL / 1000);
-        }
-    } catch (e) {
-        // 远程加载失败，继续使用现有集合（临时内置集合或上次缓存）
-        // 更新时间戳，避免短时间内重复尝试
-        cnDomainLastFetch = Date.now();
-    }
+        cnDomainLastFetch = data.expire - CN_DOMAIN_CACHE_TTL;
+        cnRetryAt = 0;
+    } catch {
+        // Keep the last usable data; retry soon instead of treating failure as a 7-day success.
+        cnRetryAt = Date.now() + 60_000;
+    } finally { cnRefreshRunning = false; }
 }
 
 /**
@@ -2481,54 +2525,34 @@ function isIpInCidrs(ip, compiled) {
 
 // ===================== 归属探测 =====================
 async function activeProbeOwner(domain, ctx, clientIP) {
-    const cacheKey = `owner:${domain}`;
+    const cacheKey = `owner-v2:${domain}:${encodeURIComponent(ecsPrefix(clientIP) || 'none')}`;
     const cacheUrl = `https://dns-cache/${cacheKey}`;
-
-    // 1. 内存缓存
     const cached = cacheMap.get(cacheKey);
     if (cached && Date.now() < cached.expire) return cached.value;
-
-    // 2. Cache API（新增）
     try {
-        const cachedText = await readCache(cacheUrl);
-        if (cachedText) {
-            const result = JSON.parse(cachedText);
-            cacheMap.set(cacheKey, { value: result, expire: Date.now() + CACHE_TTL });
-            return result;
-        }
-    } catch (e) {}
-
-    // 3. 上游查询（原有逻辑）
-    try {
-        const data = await queryUpstreamDNS(domain, 1, clientIP);
-        if (data && data.Answer) {
-            const ips = data.Answer.filter(r => r.type === 1).map(r => r.data);
-            for (const ip of ips) {
-                if (isIpInCidrs(ip, getCompiledMeta())) {
-                    const result = { owner: 'META', ips };
-                    cacheMap.set(cacheKey, { value: result, expire: Date.now() + CACHE_TTL });
-                    writeCache(cacheUrl, JSON.stringify(result), CACHE_TTL / 1000); // 异步写入
-                    return result;
-                }
-                if (isIpInCidrs(ip, getCompiledCF())) {
-                    const result = { owner: 'CF', ips };
-                    cacheMap.set(cacheKey, { value: result, expire: Date.now() + CACHE_TTL });
-                    writeCache(cacheUrl, JSON.stringify(result), CACHE_TTL / 1000); // 异步写入
-                    return result;
-                }
+        const text = await readCache(cacheUrl);
+        if (text) {
+            const entry = JSON.parse(text);
+            if (entry.expire > Date.now()) {
+                rememberCacheEntry(cacheKey, entry);
+                return entry.value;
             }
         }
     } catch {}
-    // 归属探测缓存的键由请求域名决定，可被外部用随机域名构造；
-    // Map 保序，超限时按插入序淘汰最老的一批，避免 isolate 内存无界增长。
-    if (cacheMap.size > 20000) {
-        for (const k of cacheMap.keys()) {
-            cacheMap.delete(k);
-            if (cacheMap.size <= 15000) break;
-        }
+    const data = await queryUpstreamDNS(domain, 1, clientIP);
+    if (!data) return null; // transient outage must not become a negative ownership cache
+    const ips = (data.Answer || []).filter(r => r.type === 1 && ipToBytes(r.data)).map(r => r.data);
+    const owners = ips.map(ip => isIpInCidrs(ip, getCompiledMeta()) ? 'META' : isIpInCidrs(ip, getCompiledCF()) ? 'CF' : null);
+    // Mixed CDN/origin answers are not proof of a single CDN owner.
+    const owner = owners.length && owners[0] && owners.every(x => x === owners[0]) ? owners[0] : null;
+    const value = owner ? { owner, ips } : null;
+    const ttl = upstreamAnswerTtl(data, owner ? 300 : 60);
+    if (ttl > 0) {
+        const entry = { value, expire: Date.now() + ttl * 1000 };
+        rememberCacheEntry(cacheKey, entry);
+        await writeCache(cacheUrl, JSON.stringify(entry), ttl);
     }
-    cacheMap.set(cacheKey, { value: null, expire: Date.now() + 60000 });
-    return null;
+    return value;
 }
 
 // ===================== 订阅处理 =====================

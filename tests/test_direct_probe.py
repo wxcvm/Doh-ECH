@@ -112,5 +112,50 @@ class DirectProbeTests(unittest.TestCase):
             self.assertEqual(check.call_count,3)
             self.assertTrue(all(c.args[1]=="162.159.140.229" for c in check.call_args_list))
 
+    def test_expanded_native_sources_and_https(self):
+        def reply(endpoint, host, kind):
+            if kind == "HTTPS":
+                return ['1 . alpn="h3,h2"']
+            if kind == "AAAA":
+                return ["2001:4860:4860::8888"] if "dns.google" in endpoint else ["2001:4860:4860::8844"]
+            return ["8.8.8.8"]
+        with patch.object(mod, "public_dns", side_effect=reply) as dns:
+            jobs, errors, https = mod.collect_expanded(["www.google.com"], 3)
+        self.assertEqual(dns.call_count, 6)
+        self.assertEqual(len(jobs), 3)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(https), 2)
+        self.assertEqual({j[2] for j in jobs}, {"native-google", "native-cloudflare"})
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp)/"candidates.json"
+            mod.save_candidates(path, mod.DEFAULT, jobs, errors, https)
+            self.assertEqual(mod.load_candidates(path, mod.DEFAULT, mod.HOSTS, 3)[0], jobs)
+            self.assertEqual(json.loads(path.read_text())["https_records"], https)
+
+    def test_http3_only_verified_address(self):
+        response = MagicMock(returncode=0, stdout="200 3 162.159.140.229 0", stderr="")
+        with patch.object(mod.subprocess, "run", return_value=response) as run:
+            result = mod.http3_probe("x.com", "162.159.140.229", "native-google", 3)
+            self.assertTrue(result["ok"])
+            cmd = run.call_args.args[0]
+            self.assertIn("--http3-only", cmd)
+            self.assertNotIn("--insecure", cmd)
+            self.assertEqual(cmd[1], "-q")
+            self.assertIn("x.com:443:162.159.140.229", cmd)
+            self.assertIn("--noproxy", cmd)
+        for output in ("200 2 162.159.140.229 0", "200 3 8.8.8.8 0",
+                       "200 3 162.159.140.229 1", "403 3 162.159.140.229 0"):
+            response.stdout = output
+            with patch.object(mod.subprocess, "run", return_value=response):
+                self.assertFalse(mod.http3_probe("x.com", "162.159.140.229", "native", 3)["ok"])
+
+    def test_http3_feature_check(self):
+        with patch.object(mod.subprocess, "run", return_value=MagicMock(returncode=0, stdout="Features: IPv6 SSL HTTP2", stderr="")):
+            self.assertFalse(mod.curl_http3_available()[0])
+        with patch.object(mod.subprocess, "run", return_value=MagicMock(returncode=0, stdout="Features: IPv6 SSL HTTP3", stderr="")):
+            self.assertTrue(mod.curl_http3_available()[0])
+        with patch.object(mod.subprocess, "run", side_effect=OSError("missing curl")):
+            self.assertFalse(mod.curl_http3_available()[0])
+
 if __name__=="__main__":
     unittest.main()

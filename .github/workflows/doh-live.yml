@@ -28,3 +28,7 @@ jobs:
           node-version: '22'
       - name: Test the deployed staging Worker
         run: node tests/live.mjs
+      - name: Inspect live native Google and X DNS records
+        run: |
+          python3 scripts/direct-probe.py --host www.google.com --host x.com --prepare --expanded --candidates /tmp/direct-native.json
+          python3 -c "import json; d=json.load(open('/tmp/direct-native.json')); print('Native candidates:', len(d['jobs'])); print('HTTPS records:', json.dumps(d['https_records'], ensure_ascii=False)); print('Resolver errors:', json.dumps(d['dns_errors']))"

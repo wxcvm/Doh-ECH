@@ -161,7 +161,8 @@ async function monitoredDoH(req,injectEch,ctx,clientIP,env){
         if(!response.ok){m.httpErrors++;return response;}
         if((response.headers.get('Content-Type')||'').startsWith('application/dns-message')){
             const body=await response.arrayBuffer();
-            const code=body.byteLength>=12?new DataView(body).getUint16(2)&15:'invalid';
+            const packet=inspectDnsWire(body);
+            const code=packet?(packet.flags&15)|((packet.opt?.ttl>>>24)<<4):'invalid';
             m.rcode[code]=(m.rcode[code]||0)+1;
             return new Response(body,{status:response.status,headers:response.headers});
         }

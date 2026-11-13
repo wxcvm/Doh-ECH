@@ -79,12 +79,57 @@ def select_pins(results):
         hosts.setdefault(host, []).extend(list(dict.fromkeys(x["ip"] for x in ranked))[:3])
     return ";".join(host + "=" + ",".join(ips) for host, ips in hosts.items())
 
+def collect_jobs(base, hosts, legacy, timeout):
+    jobs = []
+    dns_errors = []
+    for host in hosts:
+        for kind in ("A", "AAAA"):
+            try:
+                ips = candidates(base, host, kind, "direct")
+                print(f"DNS {host} {kind}: {', '.join(ips) or 'no records'}", flush=True)
+                jobs.extend((host, ip, "native", timeout) for ip in ips[:8])
+            except (OSError, ValueError, RuntimeError) as error:
+                dns_errors.append({"host": host, "type": kind, "error": str(error)})
+                print(f"DNS {host} {kind}: FAILED {error}", flush=True)
+        if legacy and host.endswith(".google.com"):
+            try:
+                native = {job[1] for job in jobs if job[0] == host}
+                ips = candidates(base, host, "AAAA", "rule")
+                jobs.extend((host, ip, "legacy-candidate", timeout)
+                            for ip in ips[:8] if ip not in native)
+            except (OSError, ValueError, RuntimeError) as error:
+                dns_errors.append({"host": host, "type": "legacy AAAA", "error": str(error)})
+    return jobs, dns_errors
+
+def save_candidates(path, base, jobs, dns_errors):
+    # Store literal addresses only; downloading candidates is not a connectivity test.
+    with open(path, "w", encoding="utf-8") as output:
+        json.dump({"base": base, "jobs": [list(j[:3]) for j in jobs],
+                   "dns_errors": dns_errors}, output, indent=2)
+    print(f"Saved {len(jobs)} candidates to {path}. Disable proxy/VPN/TUN before --offline.")
+
+def load_candidates(path, base, hosts, timeout):
+    with open(path, encoding="utf-8") as source:
+        data = json.load(source)
+    if data.get("base") != base:
+        raise ValueError("Candidate file belongs to a different DoH origin")
+    jobs = []
+    for host, value, origin in data["jobs"]:
+        ip = ipaddress.ip_address(value)
+        if host in hosts and ip.is_global and origin in ("native", "legacy-candidate"):
+            jobs.append((host, str(ip), origin, timeout))
+    return list(dict.fromkeys(jobs)), data.get("dns_errors", [])
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base", default=DEFAULT, help="HTTPS Doh-ECH origin")
     parser.add_argument("--host", action="append", choices=HOSTS, help="repeat to select hosts")
     parser.add_argument("--legacy", action="store_true", help="also test up to 8 legacy Google IPv6 candidates; no automatic trust")
     parser.add_argument("--timeout", type=float, default=5.0)
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--prepare", action="store_true", help="download candidates only, proxy may be on")
+    modes.add_argument("--offline", action="store_true", help="test saved literal IPs without contacting the DNS service")
+    parser.add_argument("--candidates", default="direct-candidates.json", help="candidate file path")
     args = parser.parse_args()
     base = args.base.rstrip("/")
     url = urllib.parse.urlsplit(base)
@@ -92,26 +137,24 @@ def main():
         parser.error("--base must be an HTTPS origin, without a path or query")
     if not 1 <= args.timeout <= 30:
         parser.error("--timeout must be 1..30 seconds")
+    hosts = args.host or HOSTS
+    if args.prepare:
+        jobs, dns_errors = collect_jobs(base, hosts, args.legacy, args.timeout)
+        if not jobs:
+            parser.exit(1, "No candidates downloaded; existing candidate file unchanged.\n")
+        save_candidates(args.candidates, base, jobs, dns_errors)
+        return
     print("Disable proxy, VPN and TUN before running. Direct sockets bypass explicit HTTP proxies, not VPN routing.")
-    jobs = []
-    dns_errors = []
-    for host in args.host or HOSTS:
-        for kind in ("A", "AAAA"):
-            try:
-                ips = candidates(base, host, kind, "direct")
-                print(f"DNS {host} {kind}: {', '.join(ips) or 'no records'}", flush=True)
-                jobs.extend((host, ip, "native", args.timeout) for ip in ips[:8])
-            except (OSError, ValueError, RuntimeError) as error:
-                dns_errors.append({"host": host, "type": kind, "error": str(error)})
-                print(f"DNS {host} {kind}: FAILED {error}", flush=True)
-        if args.legacy and host.endswith(".google.com"):
-            try:
-                native = {job[1] for job in jobs if job[0] == host}
-                ips = candidates(base, host, "AAAA", "rule")
-                jobs.extend((host, ip, "legacy-candidate", args.timeout)
-                            for ip in ips[:8] if ip not in native)
-            except (OSError, ValueError, RuntimeError) as error:
-                dns_errors.append({"host": host, "type": "legacy AAAA", "error": str(error)})
+    if args.offline:
+        try:
+            jobs, dns_errors = load_candidates(args.candidates, base, hosts, args.timeout)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            parser.exit(1, f"Cannot load candidate file: {error}. Run --prepare first.\n")
+        print(f"Loaded {len(jobs)} saved candidates; no DNS service request will be made.")
+    else:
+        jobs, dns_errors = collect_jobs(base, hosts, args.legacy, args.timeout)
+    if not jobs:
+        print("No candidates to test. This is a DNS acquisition failure, not a target connectivity result.")
     results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
         futures = [pool.submit(probe, *job) for job in jobs]

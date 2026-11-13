@@ -42,6 +42,16 @@ globalThis.fetch = async (input, init = {}) => {
     const name = url.searchParams.get('name');
     const type = Number(url.searchParams.get('type'));
     const error = url.hostname === 'dns.alidns.com' && name === 'github.com';
+    if (name === 'alidns-object.example.cn' || name === 'ecs-rejected.example.cn' || name === 'wrong-question.example.cn') {
+      const question = {name: name === 'wrong-question.example.cn' ? 'different.example.cn.' : name + '.', type};
+      if (url.hostname === 'cloudflare-dns.com') throw new Error('Domestic DNS must not use foreign upstream');
+      if (name === 'ecs-rejected.example.cn' && url.searchParams.has('edns_client_subnet')) {
+        return Response.json({Status:2,Question:question});
+      }
+      // Only AliDNS succeeds, with its real single-object Question shape.
+      if (url.hostname !== 'dns.alidns.com') return new Response('upstream failure',{status:503});
+      return Response.json({Status:0,Question:question,Answer:[{name,type,TTL:50,data:'203.0.113.52'}]});
+    }
     if (name === 'www.facebook.com' && type === 65) {
       return Response.json({ Status: 0, Question: [{ name: name + '.', type }],
         Answer: [{ name, type, TTL: 42, data: '1 . alpn=h2 ech=AAECAw==' }] });
@@ -392,4 +402,13 @@ const ownerEntry = await cache.get(ownerKey).clone().json();
 assert.ok(ownerEntry.expire - Date.now() <= 20000, 'owner TTL must follow actual DNS');
 const nativeThirdParty = await apiAnswer('owner.example','HTTPS','enhance=off&clientIp=192.0.2.1');
 assert.equal(nativeThirdParty.echSource, undefined, 'third-party CDN detection must not rewrite default HTTPS');
+// AliDNS uses an object instead of an array; ECS fallback retains domestic routing and cache isolation.
+assert.deepEqual((await apiAnswer('alidns-object.example.cn','A','enhance=off')).answers,['203.0.113.52']);
+const recovered = await apiAnswer('ecs-rejected.example.cn','A','enhance=off&clientIp=192.0.2.15');
+assert.deepEqual(recovered.answers,['203.0.113.52']);
+const domesticCalls = ecsCalls('ecs-rejected.example.cn').map(c=>new URL(c));
+assert.ok(domesticCalls.some(u=>u.searchParams.get('edns_client_subnet')==='192.0.2.0/24'));
+assert.ok(domesticCalls.some(u=>!u.searchParams.has('edns_client_subnet')));
+assert.ok(domesticCalls.every(u=>['dns.alidns.com','doh.pub'].includes(u.hostname)));
+assert.equal((await apiAnswer('wrong-question.example.cn','A','enhance=off')).rcode,2);
 console.log('Doh-ECH smoke tests passed (including adaptive upstreams, Meta ECH, owner TTL and ECS)');

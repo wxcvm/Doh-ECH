@@ -1498,7 +1498,11 @@ async function queryUpstreamDNS(name, type, clientIP = '', upstreamUrl = null, p
             }),
             data => preferredDnsAnswer(data, type, preferEch),
             (a, b) => !a || (a.Status === 3 && b.Status === 0) ? b : a);
-    } catch { return null; }
+    } catch {
+        // Some JSON resolvers reject ECS. Retry the same upstream group without ECS;
+        // the fallback uses its own no-ECS cache key and never changes domestic routing.
+        return prefix ? queryUpstreamDNS(name, type, '', upstreamUrl, preferEch) : null;
+    }
 
     const maxAge = preferEch && !result?.Answer?.some(r => r.type === 65 && parseHttpsRecord(r.data)?.ech)
         ? 0 : upstreamAnswerTtl(result, type === 65 ? 600 : 300);
@@ -1516,10 +1520,12 @@ async function queryUpstreamDNS(name, type, clientIP = '', upstreamUrl = null, p
 function isUsableDnsJson(data, type, requestedName) {
     if (!data || typeof data !== 'object' || ![0, 3].includes(data.Status)) return false;
     if (data.Answer !== undefined && !Array.isArray(data.Answer)) return false;
-    if (data.Question !== undefined && !Array.isArray(data.Question)) return false;
-    if (Array.isArray(data.Question) && data.Question.length) {
-        const question = data.Question[0];
-        if (!question || String(question.name || '').toLowerCase().replace(/\.$/, '') !==
+    // AliDNS returns a single Question object; DNSPod and Cloudflare use an array.
+    if (data.Question !== undefined) {
+        const questions = Array.isArray(data.Question) ? data.Question : [data.Question];
+        if (questions.length !== 1) return false;
+        const question = questions[0];
+        if (!question || typeof question !== 'object' || String(question.name || '').toLowerCase().replace(/\.$/, '') !==
             requestedName.toLowerCase().replace(/\.$/, '') || Number(question.type) !== Number(type)) return false;
     }
     if (data.Answer?.some(a => !a || !Number.isInteger(a.type) || typeof a.data !== 'string')) return false;
@@ -2803,707 +2809,175 @@ function isTypeBlocked(type, ruleObj, config, isCF = false) {
     return false;
 }
 function getHtml() {
-    return `<!DOCTYPE html>
+    return `<!doctype html>
 <html lang="zh-CN">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>DOH-ECH 查询</title>
-    <style>
-        :root {
-            --bg: #0a0e17;
-            --card: #111827;
-            --text: #e2e8f0;
-            --text-secondary: #94a3b8;
-            --accent: #0A84FF;
-            --accent-glow: rgba(10, 132, 255, 0.3);
-            --border: #1e293b;
-            --input-bg: #0f172a;
-            --cf: #FF9F0A;
-            --meta: #0A84FF;
-            --enhance: #30D158;
-        }
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body {
-            background: var(--bg);
-            color: var(--text);
-            font-family: -apple-system, 'Inter', system-ui, sans-serif;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            min-height: 100vh;
-            padding: 20px;
-            background-image: radial-gradient(ellipse at top, rgba(10, 132, 255, 0.25) 0%, transparent 60%),
-                              radial-gradient(ellipse at bottom, rgba(255, 159, 10, 0.1) 0%, transparent 60%);
-            -webkit-tap-highlight-color: transparent;
-        }
-        .container {
-            background: rgba(30, 30, 30, 0.6);
-            backdrop-filter: blur(25px) saturate(140%);
-            -webkit-backdrop-filter: blur(25px) saturate(140%);
-            border-radius: 32px;
-            padding: 2rem;
-            width: 100%;
-            max-width: 700px;
-            border: 1px solid rgba(255, 255, 255, 0.15);
-            box-shadow: 0 20px 60px rgba(0,0,0,0.5), inset 0 0 0 1px rgba(255,255,255,0.08);
-            position: relative;
-            overflow: hidden;
-        }
-        .container::before {
-            content: '';
-            position: absolute;
-            top: -50%;
-            left: -30%;
-            width: 160%;
-            height: 160%;
-            background: radial-gradient(circle at 30% 20%, rgba(255,255,255,0.12) 0%, transparent 50%);
-            pointer-events: none;
-        }
-        .header {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-            margin-bottom: 1rem;
-            position: relative;
-            z-index: 1;
-        }
-        .logo {
-            width: 44px;
-            height: 44px;
-            background: linear-gradient(135deg, var(--accent), #5E5CE6);
-            border-radius: 14px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 1.4rem;
-            box-shadow: 0 4px 12px rgba(10, 132, 255, 0.4);
-        }
-        h1 { 
-            font-size: 1.5rem; 
-            font-weight: 600;
-            letter-spacing: -0.02em;
-        }
-        .subtitle { 
-            color: var(--text-secondary); 
-            font-size: 0.75rem; 
-            margin-bottom: 1.8rem;
-            margin-left: 56px;
-            position: relative;
-            z-index: 1;
-        }
-        label { 
-            font-size: 0.8rem; 
-            font-weight: 500;
-            display: block; 
-            margin-bottom: 0.4rem;
-            color: var(--text-secondary);
-            text-transform: uppercase;
-            letter-spacing: 0.05em;
-            position: relative;
-            z-index: 1;
-        }
-        input, select {
-            width: 100%;
-            padding: 0.7rem 1rem;
-            margin-bottom: 1rem;
-            background: rgba(255, 255, 255, 0.06);
-            backdrop-filter: blur(10px);
-            -webkit-backdrop-filter: blur(10px);
-            border: 1px solid rgba(255, 255, 255, 0.12);
-            border-radius: 14px;
-            color: var(--text);
-            font-size: 0.79rem;
-            transition: all 0.2s;
-            font-family: inherit;
-            outline: none;
-            position: relative;
-            z-index: 1;
-        }
-        input:focus, select:focus {
-            border-color: var(--accent);
-            box-shadow: 0 0 0 4px var(--accent-glow);
-            background: rgba(255, 255, 255, 0.12);
-        }
-        select {
-            cursor: pointer;
-            appearance: none;
-            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' fill='%23ffffff' viewBox='0 0 16 16'%3E%3Cpath d='M8 11L3 6h10l-5 5z'/%3E%3C/svg%3E");
-            background-repeat: no-repeat;
-            background-position: right 1rem center;
-            padding-right: 2.5rem;
-        }
-        .row {
-            display: flex;
-            gap: 1rem;
-            margin-bottom: 0.5rem;
-            position: relative;
-            z-index: 1;
-        }
-        .row > div {
-            flex: 1;
-        }
-        .param-grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 0 1.5rem;
-            position: relative;
-            z-index: 1;
-        }
-        @media (max-width: 400px) {
-            .param-grid {
-                grid-template-columns: 1fr;
-            }
-        }
-        .badge {
-            display: inline-block;
-            padding: 0.15rem 0.5rem;
-            border-radius: 8px;
-            font-size: 0.5rem;
-            font-weight: 600;
-            margin-left: 0.4px;
-            margin-bottom: 3.8px;
-            background: rgba(255,255,255,0.15);
-            vertical-align: middle;
-        }
-        .badge-cf { color: var(--cf); }
-        .badge-meta { color: var(--meta); }
-        .badge-enhance { color: var(--enhance); }
-        .toggle-row {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-            position: relative;
-            z-index: 1;
-        }
-        .checkbox-container {
-            display: inline-flex;
-            align-items: center;
-            gap: 8px;
-            cursor: pointer;
-            user-select: none;
-            position: relative;
-            z-index: 1;
-        }
-        .checkbox-container input {
-            display: none;
-        }
-        .checkmark {
-            width: 24px;
-            height: 24px;
-            border-radius: 50%;
-            background: rgba(255, 255, 255, 0.1);
-            border: 2px solid rgba(255, 255, 255, 0.25);
-            display: inline-block;
-            position: relative;
-            transition: all 0.2s;
-            backdrop-filter: blur(5px);
-            -webkit-backdrop-filter: blur(5px);
-            box-shadow: 0 0 8px rgba(255,255,255,0.1);
-        }
-        .checkbox-container input:checked + .checkmark {
-            background: var(--accent);
-            border-color: var(--accent);
-            box-shadow: 0 0 14px var(--accent-glow);
-        }
-        .checkmark::after {
-            content: '';
-            position: absolute;
-            top: 50%;
-            left: 50%;
-            width: 12px;
-            height: 12px;
-            border-radius: 50%;
-            background: white;
-            transform: translate(-50%, -50%) scale(0);
-            transition: transform 0.2s ease;
-        }
-        .checkbox-container input:checked + .checkmark::after {
-            transform: translate(-50%, -50%) scale(1);
-        }
-        button {
-            width: 100%;
-            padding: 0.9rem 1rem;
-            background: var(--accent);
-            color: #fff;
-            font-weight: 600;
-            font-size: 1rem;
-            border: none;
-            border-radius: 14px;
-            cursor: pointer;
-            transition: all 0.2s;
-            margin-top: 1rem;
-            backdrop-filter: blur(10px);
-            -webkit-backdrop-filter: blur(10px);
-            box-shadow: 0 4px 16px rgba(10, 132, 255, 0.4);
-            position: relative;
-            z-index: 1;
-        }
-        button:hover { 
-            background: #2a93ff;
-            box-shadow: 0 6px 24px rgba(10, 132, 255, 0.6);
-            transform: translateY(-1px);
-        }
-        button:active { transform: translateY(0); }
-        button:disabled { 
-            opacity: 0.5; 
-            cursor: not-allowed; 
-            transform: none;
-            box-shadow: none;
-        }
-        .result-box {
-            background: rgba(255, 255, 255, 0.05);
-            border-radius: 14px;
-            padding: 1.2rem;
-            margin-top: 1.2rem;
-            word-break: break-all;
-            font-family: 'JetBrains Mono', 'Fira Code', monospace;
-            font-size: 0.85rem;
-            min-height: 60px;
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            white-space: pre-wrap;
-            max-height: 400px;
-            overflow-y: auto;
-            position: relative;
-            z-index: 1;
-        }
-        .result-box.loading { 
-            color: var(--accent); 
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 8px;
-        }
-        .result-box.loading::before {
-            content: '';
-            width: 18px;
-            height: 18px;
-            border: 2px solid rgba(255,255,255,0.2);
-            border-top-color: var(--accent);
-            border-radius: 50%;
-            animation: spin 0.8s linear infinite;
-        }
-        @keyframes spin { to { transform: rotate(360deg); } }
-        .result-box.error { color: #FF453A; border-color: rgba(255,69,58,0.3); }
-        .advanced-section {
-            margin: 1.2rem 0;
-            padding: 1.2rem;
-            background: rgba(255, 255, 255, 0.04);
-            border-radius: 20px;
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            display: none;
-            position: relative;
-            z-index: 1;
-        }
-        .advanced-section.show { display: block; }
-        .footer {
-            text-align: center;
-            margin-top: 1.5rem;
-            color: var(--text-secondary);
-            font-size: 0.75rem;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 6px;
-            position: relative;
-            z-index: 1;
-        }
-        .footer a {
-            color: var(--text-secondary);
-            text-decoration: none;
-            display: inline-flex;
-            align-items: center;
-            gap: 4px;
-        }
-        .footer a:hover { color: var(--accent); }
-        .global-section {
-            margin: 1rem 0;
-            padding: 1rem;
-            background: rgba(255, 255, 255, 0.04);
-            border-radius: 14px;
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            position: relative;
-            z-index: 1;
-        }
-        .request-url-box {
-            margin-top: 1rem;
-            padding: 0.8rem 1rem;
-            background: rgba(10, 132, 255, 0.1);
-            border: 1px solid rgba(10, 132, 255, 0.3);
-            border-radius: 12px;
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-            font-size: 0.85rem;
-            position: relative;
-            z-index: 1;
-            overflow-x: auto;
-            white-space: nowrap;
-        }
-        .request-url-box span {
-            flex-shrink: 0;
-        }
-        .request-url-box code {
-            background: transparent;
-            color: var(--accent);
-            flex: 1;
-            overflow-x: auto;
-            white-space: nowrap;
-            display: inline-block;
-            padding-right: 0.5rem;
-        }
-        .copy-btn {
-            padding: 0.4rem 1rem;
-            background: var(--accent);
-            border: none;
-            border-radius: 8px;
-            color: white;
-            font-size: 0.8rem;
-            cursor: pointer;
-            white-space: nowrap;
-            box-shadow: none;
-            margin: 0;
-            width: auto;
-            flex-shrink: 0;
-        }
-        .copy-btn:active { background: #2a93ff; }
-    </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>Doh-ECH · DNS 查询测试</title>
+<style>
+:root{color-scheme:dark;--bg:#0b1120;--panel:#111a2b;--field:#0c1423;--line:#26334a;--text:#eef2fa;--muted:#9baac0;--accent:#72aaff;--blue:#2969dc;--good:#68d5a7;--warn:#f4c77a;--bad:#ff9c9c;--radius:16px}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.6 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif}main{width:min(1050px,100%);margin:auto;padding:32px 20px 48px}a{color:var(--accent)}h1,h2,h3,p{margin:0}h1{font-size:28px;line-height:1.25;letter-spacing:-.04em}h2{font-size:18px}h3{font-size:15px}.muted{color:var(--muted);font-size:13px}.head{display:flex;align-items:center;gap:14px;margin-bottom:25px}.logo{width:46px;height:46px;flex:none;border-radius:13px;background:#1a365e;display:grid;place-items:center;color:var(--accent);font-size:24px;font-weight:700}.head p{margin-top:4px}.tag{font-size:12px;border:1px solid var(--line);border-radius:20px;padding:3px 10px;color:var(--muted);margin-left:auto;white-space:nowrap}.layout{display:grid;grid-template-columns:minmax(0,1.6fr) minmax(0,1fr);gap:16px;align-items:start}.panel{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:20px;min-width:0}.panel+.panel{margin-top:16px}.section-head{margin-bottom:14px}.section-head p{margin-top:3px}.presets{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:20px}button,input,select{font:inherit}button{cursor:pointer}button:disabled{opacity:.6;cursor:wait}.preset{background:var(--field);border:1px solid var(--line);border-radius:11px;color:var(--text);text-align:left;padding:11px 12px;min-height:68px}.preset:hover,.preset:focus-visible{border-color:var(--accent)}.preset strong{display:block;font-size:14px}.preset small{color:var(--muted);font-size:12px;overflow-wrap:anywhere}label.field{display:block;min-width:0}label.field span{display:block;font-size:13px;color:var(--muted);margin-bottom:6px}input:not([type=checkbox]),select{width:100%;min-width:0;min-height:44px;padding:9px 12px;background:var(--field);border:1px solid var(--line);border-radius:9px;color:var(--text)}input:focus,select:focus,button:focus-visible,summary:focus-visible{outline:2px solid var(--accent);outline-offset:2px}.form-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(125px,.65fr);gap:12px}.full{grid-column:1/-1}.actions{display:flex;gap:9px;margin-top:16px}.primary,.secondary{border:1px solid transparent;border-radius:10px;min-height:44px;padding:9px 15px;font-weight:600}.primary{background:var(--blue);color:white;flex:1}.secondary{background:transparent;color:var(--text);border-color:var(--line)}.primary:hover{filter:brightness(1.12)}.secondary:hover{border-color:var(--accent)}details.advanced{border-top:1px solid var(--line);margin-top:16px;padding-top:14px}summary{cursor:pointer;color:var(--accent);font-weight:600}details[open]>summary{margin-bottom:12px}.advanced-group{margin-top:14px;padding-top:12px;border-top:1px solid var(--line)}.advanced-group h3{margin-bottom:10px}.checks{display:flex;flex-wrap:wrap;gap:12px;margin:12px 0 6px}.checks label{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--muted)}input[type=checkbox]{accent-color:var(--blue);width:17px;height:17px}.help{font-size:12px;color:var(--muted);margin:8px 0}.endpoint{padding:12px 0;border-bottom:1px solid var(--line)}.endpoint:last-of-type{border-bottom:0}.endpoint h3{margin-bottom:4px}.urlrow{display:flex;align-items:center;gap:8px;margin:9px 0}.urlrow code{flex:1;min-width:0;overflow-wrap:anywhere;font-size:12px;color:var(--accent);background:var(--field);border-radius:8px;padding:9px}.copy{flex:none;border:1px solid var(--line);border-radius:8px;color:var(--text);background:transparent;padding:8px 10px;font-size:13px}.client-help{margin-top:14px;padding-top:14px;border-top:1px solid var(--line)}.client-help p{margin-top:8px}.results{margin-top:16px}.result-grid{display:grid;grid-template-columns:1fr;gap:10px;margin-top:12px}.result-card{border:1px solid var(--line);border-radius:12px;background:var(--field);padding:14px;min-width:0}.result-title{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:6px}.status{font-size:12px;font-weight:600;color:var(--muted);text-align:right}.status.good{color:var(--good)}.status.warn{color:var(--warn)}.status.bad{color:var(--bad)}.values{display:flex;flex-wrap:wrap;gap:6px;margin:9px 0}.values code{font-size:12px;overflow-wrap:anywhere;max-width:100%;padding:5px 8px;border:1px solid var(--line);border-radius:7px;color:var(--text)}.data-line{font-size:13px;overflow-wrap:anywhere;color:var(--muted);margin-top:5px}.raw{margin-top:14px}pre{background:var(--field);border:1px solid var(--line);padding:12px;border-radius:10px;max-height:360px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.5 ui-monospace,monospace}.note{margin:10px 0 0;font-size:13px;color:var(--muted)}.footer{margin-top:20px;color:var(--muted);font-size:12px;text-align:center}.feedback{min-height:20px;color:var(--muted);font-size:12px;margin-top:4px}.busy{color:var(--accent)}[hidden]{display:none!important}
+@media(max-width:760px){main{padding:20px 12px 32px}.layout{grid-template-columns:1fr}.panel{padding:16px}.head{margin-bottom:18px}.tag{display:none}h1{font-size:24px}}@media(max-width:380px){.form-grid{grid-template-columns:1fr}.presets{grid-template-columns:1fr 1fr}.preset{padding:8px}.urlrow{align-items:flex-start}}@media(prefers-color-scheme:light){:root{color-scheme:light;--bg:#f2f5fa;--panel:#fff;--field:#f5f7fc;--line:#d8e0ee;--text:#17243a;--muted:#53657e;--accent:#1c5bb8;--blue:#235fc7;--good:#087b51;--warn:#946200;--bad:#b4232c}.logo{background:#e3edff}}
+</style>
 </head>
-<body>
-    <div class="container">
-        <div class="header">
-            <div class="logo">🔒</div>
-            <h1>DOH-ECH 查询测试</h1>
-        </div>
-        <p class="subtitle">智能 DNS 解析 · ECH 注入 · ECS 就近解析</p>
-        
-        <div class="row">
-            <div>
-                <label for="domain">查询域名</label>
-                <input type="text" id="domain" placeholder="输入域名，例如 twitter.com" value="twitter.com" autofocus style="margin-bottom:0">
-            </div>
-            <div>
-                <label for="type">记录类型</label>
-                <select id="type" style="margin-bottom:0">
-                    <option value="A">A (IPv4)</option>
-                    <option value="AAAA">AAAA (IPv6)</option>
-                    <option value="HTTPS">HTTPS (ECH)</option>
-                </select>
-            </div>
-        </div>
-
-        <div class="row" style="align-items: flex-end;">
-            <div>
-                <label for="mode">模式选择</label>
-                <select id="mode" onchange="onModeChange()" style="margin-bottom:0">
-                    <option value="">默认解析</option>
-                    <option value="cf">🔶 CF 优选</option>
-                    <option value="meta">🔵 Meta 优选</option>
-                    <option value="enhance">🟢 HTTPS 增强</option>
-                </select>
-            </div>
-            <div style="display:flex; align-items:center; padding-bottom:0.5rem;">
-                <label class="checkbox-container" style="margin-bottom:0;">
-                    <input type="checkbox" id="best" onchange="updateBestLabel()">
-                    <span class="checkmark"></span>
-                    <span id="bestLabel">全局跟随优选</span>
-                </label>
-            </div>
-        </div>
-
-        <!-- Cloudflare 高级参数 -->
-        <div id="cfParams" class="advanced-section">
-            <div class="param-grid">
-                <div>
-                    <label>CF IPv4 <span class="badge badge-cf">ip4</span></label>
-                    <input type="text" id="ip4" placeholder="1.2.3.4, 5.6.7.8">
-                </div>
-                <div>
-                    <label>CF IPv6 <span class="badge badge-cf">ip6</span></label>
-                    <input type="text" id="ip6" placeholder="2606:4700::, 2606:4700::1">
-                </div>
-                <div>
-                    <label>优选域名 <span class="badge badge-cf">cf</span></label>
-                    <input type="text" id="cfDomain" placeholder="example.com, example2.com">
-                </div>
-                <div>
-                    <label>ECH 来源 <span class="badge badge-cf">ech</span></label>
-                    <input type="text" id="echDomain" placeholder="cloudflare-ech.com">
-                </div>
-                <div>
-                    <label>优选订阅 <span class="badge badge-cf">sub</span></label>
-                    <input type="text" id="sub" placeholder="ip-URL 或 cf-URL，逗号分隔">
-                </div>
-                <div>
-                    <label>排除项 <span class="badge badge-cf">exclude</span></label>
-                    <input type="text" id="exclude" placeholder="1.2.3.4,bad.example.com">
-                </div>
-                <div>
-                    <label>地区筛选 <span class="badge badge-cf">area</span></label>
-                    <input type="text" id="area" placeholder="hk, hkg, 香港, sin 等，留空全部">
-                </div>
-                <div>                    
-                    <label class="checkbox-container">
-                      <input type="checkbox" id="shuffle" checked>
-                      <span class="checkmark"></span>
-                      <span>随机乱序 IP</span>
-                    </label>  
-                </div>                    
-            </div>         
-        </div>
-
-        <!-- Meta 高级参数 -->
-        <div id="metaParams" class="advanced-section">
-            <div class="param-grid">
-                <div>
-                    <label>Meta IPv4 <span class="badge badge-meta">metaIp4</span></label>
-                    <input type="text" id="metaIp4" placeholder="157.240.1.1, 157.240.2.1">
-                </div>
-                <div>
-                    <label>Meta IPv6 <span class="badge badge-meta">metaIp6</span></label>
-                    <input type="text" id="metaIp6" placeholder="2a03:2880:...">
-                </div>
-                <div>
-                    <label>优选域名<span class="badge badge-meta">meta</span></label>
-                    <input type="text" id="metaDomain" placeholder="meta-better.example.com">
-                </div>
-            </div>
-        </div>
-
-        <!-- HTTPS 增强参数 -->
-        <div id="enhanceParams" class="advanced-section">
-            <div class="param-grid">
-                <div>
-                    <label>增强模式<span class="badge badge-enhance">enhance</span></label>
-                    <select id="enhance">
-                        <option value="off">关闭</option>
-                        <option value="rule">规则模式</option>
-                        <option value="full">全局模式</option>
-                    </select>
-                </div>
-                <div>
-                    <label>规则 <span class="badge badge-enhance">rules</span></label>
-                    <input type="text" id="rules" placeholder="*.reddit.com:ip1,ip2-noA-noAAAA">
-                </div>
-            </div>
-        </div>
-
-        <!-- 全局设置 -->
-        <div class="global-section">
-            <div class="param-grid">
-                <div>
-                    <label>ALPN 列表 <span class="badge">alpn</span></label>
-                    <input type="text" id="alpn" placeholder="h3,h2" value="h3,h2">
-                </div>
-                <div>
-                    <label>ECS <span class="badge">clientIp</span></label></label>
-                    <input type="text" id="clientIp" placeholder="1.2.4.8" value="">
-                </div>
-                <div class="toggle-row" style="margin-top: 0.5rem;">
-    <label class="checkbox-container">
-        <input type="checkbox" id="no6">
-        <span class="checkmark"></span>
-        <span>全局屏蔽 AAAA</span>
-    </label>
+<body><main>
+<header class="head"><div class="logo" aria-hidden="true">↯</div><div><h1>Doh-ECH 查询测试</h1><p class="muted">一键检查 DNS、IPv4 / IPv6 与 ECH，复制自己的 DoH 地址。</p></div><span class="tag">自托管 DNS</span></header>
+<div class="layout"><div>
+<section class="panel" aria-labelledby="quick-title">
+<div class="section-head"><h2 id="quick-title">快速测试</h2><p class="muted">点击任意测试场景，立即查询；不需要填写高级参数。</p></div>
+<div class="presets">
+<button type="button" class="preset" data-domain="github.com" data-type="all" data-enhance="off"><strong>普通 DNS</strong><small>GitHub · IPv4 / IPv6 / HTTPS</small></button>
+<button type="button" class="preset" data-domain="cloudflare.com" data-type="HTTPS" data-enhance="off"><strong>Cloudflare ECH</strong><small>检查加密客户端问候配置</small></button>
+<button type="button" class="preset" data-domain="www.facebook.com" data-type="HTTPS" data-enhance="off"><strong>Meta ECH</strong><small>Facebook · ECH 来源</small></button>
+<button type="button" class="preset" data-domain="google.com" data-type="AAAA" data-enhance="rule"><strong>Google IPv6</strong><small>启用规则增强，查询 AAAA</small></button>
+<button type="button" class="preset" data-domain="mtalk.google.com" data-type="A" data-enhance="rule"><strong>Android 推送</strong><small>FCM · 检查 IPv4 解析</small></button>
+<button type="button" class="preset" data-domain="taobao.com" data-type="A" data-enhance="off"><strong>国内解析</strong><small>淘宝 · 检查普通 A 记录</small></button>
 </div>
-            </div>
-        </div>
-
-        <button id="queryBtn" onclick="doQuery()">
-            <span id="btnText">🔍 开始查询</span>
-        </button>
-
-        <div id="requestUrlContainer" style="display:none;">
-            <div class="request-url-box">
-                <span>DoH:</span>
-                <code id="requestUrlText"></code>
-                <button class="copy-btn" id="copyBtn" onclick="copyUrl()">复制</button>
-            </div>
-        </div>
-        <div id="result" class="result-box" style="display: none;"></div>
-        <div class="footer">
-            <span>DoH-ECH · Cloudflare Pages · </span>
-            <a href="https://github.com/rosenii/doh-ech" target="_blank" rel="noopener noreferrer">
-                <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" xmlns="http://www.w3.org/2000/svg">
-                    <path fill-rule="evenodd" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/>
-                </svg>
-                GitHub
-            </a>
-        </div>
-    </div>
-    <script>
-        function onModeChange() {
-            const mode = document.getElementById('mode').value;
-            document.getElementById('cfParams').classList.toggle('show', mode === 'cf');
-            document.getElementById('metaParams').classList.toggle('show', mode === 'meta');
-            document.getElementById('enhanceParams').classList.toggle('show', mode === 'enhance');
-        }
-
-        function updateBestLabel() {
-            const checked = document.getElementById('best').checked;
-            document.getElementById('bestLabel').textContent = checked ? '全局跟随优选(开)' : '全局跟随优选(关)';
-        }
-
- async function copyUrl() {
-            const url = document.getElementById('requestUrlText').textContent;
-            try {
-                await navigator.clipboard.writeText(url);
-                const btn = document.getElementById('copyBtn');
-                btn.textContent = '已复制';
-                setTimeout(() => { btn.textContent = '复制'; }, 1500);
-            } catch (err) {
-                const textArea = document.createElement('textarea');
-                textArea.value = url;
-                document.body.appendChild(textArea);
-                textArea.select();
-                document.execCommand('copy');
-                document.body.removeChild(textArea);
-                const btn = document.getElementById('copyBtn');
-                btn.textContent = '已复制';
-                setTimeout(() => { btn.textContent = '复制'; }, 1500);
-            }
-        }
-
-        function buildEchUrl() {
-            const params = new URLSearchParams();
-            const mode = document.getElementById('mode').value;
-            const bestChecked = document.getElementById('best').checked;
-            if (bestChecked) params.set('best', 'true');
-
-            const alpn = document.getElementById('alpn').value.trim();
-            if (alpn) params.set('alpn', alpn);
-            const clientIp = document.getElementById('clientIp').value.trim();
-            if (clientIp) params.set('clientIp', clientIp);
-            const no6 = document.getElementById('no6').checked;
-            if (no6) params.set('no6', 'true');
-            if (mode === 'cf') {
-                const ip4 = document.getElementById('ip4').value.trim();
-                const ip6 = document.getElementById('ip6').value.trim();
-                const cfDomain = document.getElementById('cfDomain').value.trim();
-                const echDomain = document.getElementById('echDomain').value.trim();
-                const sub = document.getElementById('sub').value.trim();
-                const exclude = document.getElementById('exclude').value.trim();
-                const area = document.getElementById('area').value.trim();
-                const shuffleChecked = document.getElementById('shuffle').checked;
-                if (ip4) params.set('ip4', ip4);
-                if (ip6) params.set('ip6', ip6);
-                if (cfDomain) params.set('cf', cfDomain);
-                if (echDomain) params.set('ech', echDomain);
-                if (sub) params.set('sub', sub);
-                if (exclude) params.set('exclude', exclude);
-                if (area) params.set('area', area);
-                if (!shuffleChecked) params.set('shuffle', 'false');
-            } else if (mode === 'meta') {
-                const metaIp4 = document.getElementById('metaIp4').value.trim();
-                const metaIp6 = document.getElementById('metaIp6').value.trim();
-                const metaDomain = document.getElementById('metaDomain').value.trim();
-                if (metaIp4) params.set('metaIp4', metaIp4);
-                if (metaIp6) params.set('metaIp6', metaIp6);
-                if (metaDomain) params.set('meta', metaDomain);
-            } else if (mode === 'enhance') {
-                const enhance = document.getElementById('enhance').value;
-                const rules = document.getElementById('rules').value.trim();
-                if (enhance !== 'off') params.set('enhance', enhance);
-                if (rules) params.set('rules', rules);
-            }
-
-            const base = window.location.origin + '/ech';
-            const qs = params.toString();
-            return qs ? base + '?' + qs : base;
-        }
-
-        async function doQuery() {
-            const domain = document.getElementById('domain').value.trim();
-            const type = document.getElementById('type').value;
-            const mode = document.getElementById('mode').value;
-            const btn = document.getElementById('queryBtn');
-            const btnText = document.getElementById('btnText');
-            const resultDiv = document.getElementById('result');
-            const requestUrlContainer = document.getElementById('requestUrlContainer');
-            const requestUrlText = document.getElementById('requestUrlText');
-
-            if (!domain) {
-                resultDiv.innerHTML = '<span class="error">请输入域名</span>';
-                resultDiv.className = 'result-box error';
-                resultDiv.style.display = 'block';
-                requestUrlContainer.style.display = 'none';
-                return;
-            }
-
-            requestUrlText.textContent = buildEchUrl();
-            requestUrlContainer.style.display = 'block';
-
-            const params = new URLSearchParams();
-            params.set('domain', domain);
-            params.set('type', type);
-
-            const bestChecked = document.getElementById('best').checked;
-            params.set('best', bestChecked ? 'true' : 'false');
-
-            // 全局参数
-            const alpn = document.getElementById('alpn').value.trim();
-            if (alpn) params.set('alpn', alpn);
-            const clientIp = document.getElementById('clientIp').value.trim();
-            if (clientIp) params.set('clientIp', clientIp);
-            const no6 = document.getElementById('no6').checked;
-            if (no6) params.set('no6', 'true');
-            if (mode === 'cf') {
-                const ip4 = document.getElementById('ip4').value.trim();
-                const ip6 = document.getElementById('ip6').value.trim();
-                const cfDomain = document.getElementById('cfDomain').value.trim();
-                const echDomain = document.getElementById('echDomain').value.trim();
-                const sub = document.getElementById('sub').value.trim();
-                const exclude = document.getElementById('exclude').value.trim();
-                const shuffleChecked = document.getElementById('shuffle').checked;
-                const area = document.getElementById('area').value.trim();
-                if (ip4) params.set('ip4', ip4);
-                if (ip6) params.set('ip6', ip6);
-                if (cfDomain) params.set('cf', cfDomain);
-                if (echDomain) params.set('ech', echDomain);
-                if (sub) params.set('sub', sub);
-                if (exclude) params.set('exclude', exclude);
-                params.set('shuffle', shuffleChecked ? 'true' : 'false');
-                if (area) params.set('area', area);
-            } else if (mode === 'meta') {
-                const metaIp4 = document.getElementById('metaIp4').value.trim();
-                const metaIp6 = document.getElementById('metaIp6').value.trim();
-                const metaDomain = document.getElementById('metaDomain').value.trim();
-                if (metaIp4) params.set('metaIp4', metaIp4);
-                if (metaIp6) params.set('metaIp6', metaIp6);
-                if (metaDomain) params.set('meta', metaDomain);
-            } else if (mode === 'enhance') {
-                const enhance = document.getElementById('enhance').value;
-                const rules = document.getElementById('rules').value.trim();
-                if (enhance !== 'off') params.set('enhance', enhance);
-                if (rules) params.set('rules', rules);
-            }
-
-            btn.disabled = true;
-            btnText.textContent = '⏳ 查询中...';
-            resultDiv.className = 'result-box loading';
-            resultDiv.textContent = '';
-            resultDiv.style.display = 'block';
-            try {
-                const res = await fetch('/api/query?' + params.toString());
-                const data = await res.json();
-                if (data.error) {
-                    resultDiv.textContent = '错误：' + data.error;
-                    resultDiv.className = 'result-box error';
-                } else {
-                    resultDiv.textContent = JSON.stringify(data, null, 2);
-                    resultDiv.className = 'result-box';
-                }
-            } catch (err) {
-                resultDiv.textContent = '网络错误：' + err.message;
-                resultDiv.className = 'result-box error';
-            } finally {
-                btn.disabled = false;
-                btnText.textContent = '🔍 开始查询';
-            }
-        }
-
-        updateBestLabel();
-    </script>
-</body>
-</html>`;
+<form id="queryForm">
+<div class="form-grid">
+<label class="field full"><span>查询域名（也可以粘贴网站网址）</span><input id="domain" value="github.com" placeholder="例如 github.com" autocomplete="off" autocapitalize="none" spellcheck="false" required></label>
+<label class="field"><span>记录类型</span><select id="type"><option value="all">全部：A / AAAA / HTTPS</option><option value="A">A · IPv4</option><option value="AAAA">AAAA · IPv6</option><option value="HTTPS">HTTPS · ECH</option><option value="CNAME">CNAME · 别名</option><option value="TXT">TXT · 文本</option><option value="MX">MX · 邮件</option><option value="NS">NS · 域名服务器</option></select></label>
+<label class="field"><span>解析模式</span><select id="enhance"><option value="off">默认解析</option><option value="rule">规则增强</option><option value="full">全局增强</option></select></label>
+</div>
+<p class="help">默认模式仍保留 Cloudflare / Meta 的内置 ECH 策略；规则增强可能改变 DNS 地址，请在实际网络验证。纯转发请使用右侧 /doh。</p>
+<details class="advanced" id="advanced"><summary>高级设置（可选） <span id="advancedCount" class="muted"></span></summary>
+<p class="muted">以下参数都可组合使用；关闭面板不会取消设置，点击重置即可恢复默认。</p>
+<div class="advanced-group"><h3>Cloudflare 优选</h3><div class="form-grid">
+<label class="field"><span>IPv4 · ip4</span><input id="ip4" placeholder="逗号分隔的 IPv4 地址"></label>
+<label class="field"><span>IPv6 · ip6</span><input id="ip6" placeholder="逗号分隔的 IPv6 地址"></label>
+<label class="field"><span>优选域名 · cf</span><input id="cf" placeholder="example.com"></label>
+<label class="field"><span>ECH 来源 · ech</span><input id="ech" placeholder="cloudflare-ech.com"></label>
+<label class="field full"><span>优选订阅 · sub</span><input id="sub" placeholder="ip-https://… 或 cf-https://…"></label>
+<label class="field"><span>排除项 · exclude</span><input id="exclude" placeholder="IP 或域名，逗号分隔"></label>
+<label class="field"><span>地区 · area</span><input id="area" placeholder="hk / jp / sg"></label>
+</div><p class="help">订阅来源需由服务端管理员授权；未授权的来源不会被下载。</p></div>
+<div class="advanced-group"><h3>Meta 优选</h3><div class="form-grid">
+<label class="field"><span>IPv4 · metaIp4</span><input id="metaIp4" placeholder="逗号分隔的 IPv4 地址"></label>
+<label class="field"><span>IPv6 · metaIp6</span><input id="metaIp6" placeholder="逗号分隔的 IPv6 地址"></label>
+<label class="field full"><span>优选域名 · meta</span><input id="meta" placeholder="example.com"></label>
+</div></div>
+<div class="advanced-group"><h3>规则与协议</h3><div class="form-grid">
+<label class="field full"><span>自定义规则 · rules（规则或全局增强时生效）</span><input id="rules" placeholder="*.example.com:1.2.3.4-noAAAA"></label>
+<label class="field"><span>ALPN · alpn</span><input id="alpn" value="h3,h2"></label>
+<label class="field"><span>必需参数 · mandatory</span><input id="mandatory" value="alpn"></label>
+<label class="field full"><span>客户端地址 · clientIp（ECS，留空自动获取）</span><input id="clientIp" placeholder="可选，IPv4 或 IPv6"></label>
+</div><div class="checks">
+<label><input type="checkbox" id="best"> 全局跟随优选</label>
+<label><input type="checkbox" id="no6"> 禁用 IPv6（规则可覆盖）</label>
+<label><input type="checkbox" id="allowCF6"> 允许 CF IPv6</label>
+<label><input type="checkbox" id="shuffle" checked> 随机排列地址</label>
+</div><p class="help">全局跟随优选会主动探测 CDN 归属；CF IPv6 默认关闭。ECS 可能向上游透露大致网络位置。</p></div>
+</details>
+<div class="actions"><button class="primary" id="queryBtn" type="submit">开始查询</button><button class="secondary" id="resetBtn" type="button">重置</button></div>
+<div class="feedback" id="feedback" role="status" aria-live="polite"></div>
+</form></section>
+<section class="panel results" id="results" hidden aria-labelledby="resultsTitle"><div class="section-head"><h2 id="resultsTitle">查询结果</h2><p class="muted" id="resultSummary"></p></div><div id="cards" class="result-grid" aria-live="polite"></div><p class="note">有 IP 或 ECH 配置表示 DNS 返回了记录，不等于网站可达、TLS ECH 握手成功或手机推送已恢复。</p><details class="raw"><summary>查看原始 JSON</summary><pre id="rawJson"></pre></details></section>
+</div>
+<aside><section class="panel" aria-labelledby="address-title"><div class="section-head"><h2 id="address-title">你的 DoH 地址</h2><p class="muted">查询域名只用于测试；复制下面的地址配置客户端，参数会随设置更新。</p></div>
+<div class="endpoint"><h3>日常稳定 · 纯 DoH</h3><p class="muted">原样转发上游，不注入 ECH 或优选 IP。</p><div class="urlrow"><code id="dohUrl"></code><button class="copy" type="button" data-copy="dohUrl">复制</button></div></div>
+<div class="endpoint"><h3>ECH 增强 · 当前设置</h3><p class="muted">Cloudflare / Meta ECH，支持自定义增强规则。</p><div class="urlrow"><code id="echUrl"></code><button class="copy" type="button" data-copy="echUrl">复制</button></div></div>
+<div class="feedback" id="copyStatus" role="status" aria-live="polite"></div>
+<div class="client-help"><h3>怎么配置客户端？</h3><p class="muted"><strong>浏览器：</strong>安全 DNS / DNS over HTTPS，选择自定义并粘贴地址。</p><p class="muted"><strong>AdGuard：</strong>DNS 保护 → DNS 服务器 → 添加自定义服务器，粘贴 DoH 地址。</p><p class="muted"><strong>Android：</strong>系统「私人 DNS」通常使用 DoT 主机名，不接受 HTTPS URL；请用支持 DoH 的客户端。</p><p class="muted">若同时使用代理 Fake-IP DNS，建议先确认 DNS 分工，不要让多个组件重复接管。</p></div>
+</section></aside></div>
+<footer class="footer">Doh-ECH · Cloudflare Workers · <a href="https://github.com/wxcvm/Doh-ECH" target="_blank" rel="noopener noreferrer">项目仓库</a> · <a href="https://github.com/rosenii/Doh-ECH" target="_blank" rel="noopener noreferrer">上游项目</a></footer>
+</main>
+<script>
+(function(){
+'use strict';
+const $=id=>document.getElementById(id);
+const form=$('queryForm');
+const fields=['ip4','ip6','cf','ech','sub','exclude','area','metaIp4','metaIp6','meta','rules','clientIp'];
+const typeNames={A:'IPv4 地址',AAAA:'IPv6 地址',HTTPS:'HTTPS / ECH',CNAME:'CNAME 别名',TXT:'TXT 文本',MX:'MX 邮件',NS:'NS 服务器'};
+const modeNames={off:'默认解析',rule:'规则增强',full:'全局增强'};
+let busy=false;
+function params(){
+ const p=new URLSearchParams();
+ for(const key of fields){const v=$(key).value.trim();if(v)p.set(key,v);}
+ if($('enhance').value!=='off')p.set('enhance',$('enhance').value);
+ for(const [key,def] of [['alpn','h3,h2'],['mandatory','alpn']]){const v=$(key).value.trim();if(v&&v!==def)p.set(key,v);}
+ if($('best').checked)p.set('best','true');
+ if($('no6').checked)p.set('no6','true');
+ if($('allowCF6').checked)p.set('nocf6','false');
+ if(!$('shuffle').checked)p.set('shuffle','false');
+ return p;
+}
+function refreshUrls(){
+ const p=params();$('dohUrl').textContent=location.origin+'/doh';
+ $('echUrl').textContent=location.origin+'/ech'+(p.size?'?'+p.toString():'');
+ $('advancedCount').textContent=p.size?'· '+p.size+' 项非默认设置':'· 默认';
+}
+function resetSettings(){form.reset();$('advanced').open=false;refreshUrls();$('feedback').textContent='';}
+function normalizedDomain(raw){
+ let value=raw.trim();
+ if(!value)return '';
+ if(/^https?:\\/\\//i.test(value)){const u=new URL(value);value=u.hostname;}
+ value=value.replace(/\\.$/,'');
+ if(/[^\\x00-\\x7f]/.test(value))value=new URL('https://'+value).hostname;
+ value=value.toLowerCase();
+ if(value.length>253||!value.split('.').every(v=>v.length>0&&v.length<=63&&/^[a-z0-9_](?:[a-z0-9_-]*[a-z0-9_])?$/i.test(v)))throw new Error('请输入有效域名，例如 github.com（不含端口或路径）');
+ return value;
+}
+function el(tag,cls,text){const n=document.createElement(tag);if(cls)n.className=cls;if(text!==undefined)n.textContent=String(text);return n;}
+function line(card,text){card.append(el('p','data-line',text));}
+function values(card,arr){if(!Array.isArray(arr)||!arr.length)return;const box=el('div','values');for(const value of arr)box.append(el('code','',value));card.append(box);}
+function cardFor(type,out){
+ const card=el('article','result-card');card.dataset.type=type;
+ const title=el('div','result-title');title.append(el('h3','',typeNames[type]||type));
+ let status='已返回记录',tone='good',description='';
+ const d=out.data;
+ if(out.error){status='查询失败';tone='bad';description=out.error;}
+ else if(d.rcode===3){status='域名不存在';tone='warn';description='上游返回 NXDOMAIN（RCODE 3）。';}
+ else if(d.rcode!==undefined&&d.rcode!==0){status='解析失败';tone='bad';description='DNS 错误码 '+d.rcode+'，可以稍后重试。';}
+ else if(type==='HTTPS'){
+  if(d.ech){status='已取得 ECH 配置';description=d.echSource==='legacy-meta'?'使用 Meta 兼容配置，需实际握手验证。':'已取得 ECH 配置，是否接受仍需实际握手验证。';}
+  else{status='未取得 ECH';tone='warn';description='未返回 ECH 配置，不一定表示域名异常。';}
+ }else if(!Array.isArray(d.answers)||!d.answers.length){status='无此类记录';tone='warn';description='可能是域名未发布该记录，或当前解析策略屏蔽了此类型。';}
+ else{description='DNS 返回 '+d.answers.length+' 条记录。';}
+ title.append(el('span','status '+tone,status));card.append(title,el('p','muted',description));
+ if(d){values(card,d.answers);if(d.ipv4hints?.length){line(card,'IPv4 提示');values(card,d.ipv4hints);}if(d.ipv6hints?.length){line(card,'IPv6 提示');values(card,d.ipv6hints);}if(d.echSource)line(card,'ECH 来源：'+(d.echSource==='legacy-meta'?'Meta 兼容配置':d.echSource==='dns'?'DNS 动态配置':d.echSource));if(Number.isFinite(d.ttl))line(card,'TTL：'+d.ttl+' 秒');}
+ if(Number.isFinite(out.ms))line(card,'查询耗时：'+out.ms+' ms（浏览器到服务的请求时间）');
+ return card;
+}
+async function queryOne(domain,type,settings){
+ const p=new URLSearchParams(settings);p.set('domain',domain);p.set('type',type);
+ const start=performance.now();const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),15000);
+ try{const r=await fetch('/api/query?'+p.toString(),{signal:controller.signal});const data=await r.json();if(!r.ok||data.error)throw new Error(data.error||'HTTP '+r.status);return {type,data,ms:Math.round(performance.now()-start)};}
+ catch(err){return {type,error:err.name==='AbortError'?'查询超时，请重试。':String(err.message||err),ms:Math.round(performance.now()-start)};}
+ finally{clearTimeout(timer);}
+}
+async function run(){
+ if(busy)return;
+ let domain;try{domain=normalizedDomain($('domain').value);if(!domain)throw new Error('请输入查询域名');}catch(err){$('feedback').textContent=err.message;$('domain').focus();return;}
+ $('domain').value=domain;
+ const settings=params();const type=$('type').value;const types=type==='all'?['A','AAAA','HTTPS']:[type];
+ const mode=$('enhance').value;busy=true;$('queryBtn').disabled=true;$('queryBtn').textContent='查询中…';
+ document.querySelectorAll('.preset,#resetBtn').forEach(b=>b.disabled=true);
+ $('feedback').textContent='正在查询 '+domain+'…';$('results').hidden=false;$('resultSummary').textContent=domain+' · '+modeNames[mode]+' · 查询中';
+ $('cards').replaceChildren();$('rawJson').textContent='';
+ try{
+  const outcomes=await Promise.all(types.map(t=>queryOne(domain,t,settings)));
+  $('cards').replaceChildren(...outcomes.map(o=>cardFor(o.type,o)));
+  $('rawJson').textContent=JSON.stringify(outcomes.map(o=>o.data||{type:o.type,error:o.error}),null,2);
+  const completed=outcomes.filter(o=>!o.error&&(!o.data.rcode||o.data.rcode===0)).length;
+  $('resultSummary').textContent=domain+' · '+modeNames[mode]+' · '+completed+'/'+types.length+' 项正常返回';
+  $('feedback').textContent='查询完成。结果在下方。';
+  if(matchMedia('(max-width:760px)').matches) $('results').scrollIntoView({block:'start',behavior:matchMedia('(prefers-reduced-motion: reduce)').matches?'instant':'smooth'});
+ }finally{busy=false;$('queryBtn').disabled=false;$('queryBtn').textContent='开始查询';document.querySelectorAll('.preset,#resetBtn').forEach(b=>b.disabled=false);}
+}
+async function copy(id){
+ const value=$(id).textContent;
+ try{await navigator.clipboard.writeText(value);}
+ catch{const input=document.createElement('textarea');input.value=value;input.style.position='fixed';input.style.opacity='0';document.body.append(input);input.select();let ok=false;try{ok=document.execCommand('copy');}finally{input.remove();}if(!ok)throw new Error('无法自动复制，请长按地址手动复制。');}
+}
+form.addEventListener('submit',e=>{e.preventDefault();run();});
+form.addEventListener('input',refreshUrls);form.addEventListener('change',refreshUrls);
+$('resetBtn').addEventListener('click',()=>{resetSettings();$('results').hidden=true;});
+document.querySelectorAll('.preset').forEach(btn=>btn.addEventListener('click',()=>{resetSettings();$('domain').value=btn.dataset.domain;$('type').value=btn.dataset.type;$('enhance').value=btn.dataset.enhance;refreshUrls();run();}));
+document.querySelectorAll('[data-copy]').forEach(btn=>btn.addEventListener('click',async()=>{try{await copy(btn.dataset.copy);$('copyStatus').textContent='已复制 DoH 地址。';}catch(e){$('copyStatus').textContent=e.message;}}));
+refreshUrls();
+})();
+</script>
+</body></html>`;
 }

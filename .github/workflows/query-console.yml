@@ -1,0 +1,30 @@
+name: Query console browser tests
+on:
+  pull_request:
+    paths:
+      - '_worker.js'
+      - 'tests/query-console.mjs'
+      - '.github/workflows/query-console.yml'
+  workflow_dispatch:
+    inputs:
+      endpoint:
+        description: "HTTPS URL of a deployed query console"
+        required: true
+        default: "https://doh-ech-test.shizuku2023.workers.dev"
+permissions:
+  contents: read
+jobs:
+  browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      DOH_ECH_TEST_URL: ${{ inputs.endpoint || 'https://doh-ech-test.shizuku2023.workers.dev' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install browser test driver
+        run: npm install --no-save --no-package-lock playwright@1.56.1
+      - name: Test the deployed query console in Chrome
+        run: node tests/query-console.mjs

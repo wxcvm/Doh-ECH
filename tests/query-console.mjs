@@ -11,7 +11,7 @@ try {
   page.on('pageerror', e => errors.push(e.message));
   await page.goto(base, {waitUntil:'domcontentloaded'});
   await page.locator('#queryForm').waitFor();
-  assert.equal(await page.locator('.preset').count(),6);
+  assert.equal(await page.locator('.preset').count(),8);
   assert.equal(await page.locator('#advanced').evaluate(e=>e.open),false);
   assert.equal(await page.locator('#dohUrl').textContent(),new URL('/doh',base).href);
   assert.equal(await page.locator('#echUrl').textContent(),new URL('/ech',base).href);
@@ -59,6 +59,22 @@ try {
   await page.locator('#copyStatus').filter({hasText:'已复制'}).waitFor();
   assert.equal(await page.evaluate(()=>navigator.clipboard.readText()),new URL('/ech?enhance=rule',base).href);
   console.log('PASS real Google IPv6 preset and clipboard');
+
+  for(const [label,domain] of [['Google 直连诊断','www.google.com'],['X 直连诊断','x.com']]){
+    await page.getByRole('button',{name:label,exact:false}).click();
+    await page.locator('#cards .result-card').last().waitFor();
+    await page.waitForFunction(()=>document.querySelector('#cards').children.length===3);
+    const raw=JSON.parse(await page.locator('#rawJson').textContent());
+    assert.equal(raw[0].policy,'native-direct');
+    assert.equal(raw[0].rcode,0,JSON.stringify(raw[0]));
+    assert.ok(raw[0].answers.length>0);
+    assert.equal(raw[0].domain,domain);
+    assert.match(await page.locator('#echUrl').textContent(),/enhance=direct/);
+    console.log('PASS native direct '+domain+' A='+raw[0].answers.length+' AAAA='+raw[1].answers.length+' ECH='+Boolean(raw[2].ech));
+  }
+  // Restore the rule preset before checking its advanced parameters.
+  await page.getByRole('button',{name:'Google IPv6',exact:false}).click();
+  await page.locator('#cards [data-type=AAAA] .status').filter({hasText:'已返回记录'}).waitFor();
 
   // Deterministic UI edge cases: validate exact query URL and safe text rendering.
   await page.route('**/api/query?*',async route=>{

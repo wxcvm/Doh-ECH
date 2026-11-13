@@ -1,0 +1,51 @@
+import importlib.util
+import io
+import pathlib
+import struct
+import unittest
+from unittest.mock import patch
+from email.message import Message
+
+spec = importlib.util.spec_from_file_location("probe", pathlib.Path(__file__).resolve().parents[1] / "scripts/balanced-probe.py")
+probe = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(probe)
+
+
+class Reply(io.BytesIO):
+    def __init__(self, data, content_type="application/dns-message"):
+        super().__init__(data)
+        self.headers = Message()
+        self.headers["Content-Type"] = content_type
+        self.headers["X-Cache"] = "INTERNATIONAL_HIT"
+
+
+class ProbeTests(unittest.TestCase):
+    def test_query(self):
+        for kind in (1, 28, 65):
+            packet = probe.query("example.com", kind)
+            self.assertEqual(struct.unpack("!5H", packet[2:12]), (256, 1, 0, 0, 0))
+            self.assertEqual(packet[12:], b"\x07example\x03com\x00" + struct.pack("!HH", kind, 1))
+
+    def test_response(self):
+        def respond(req, timeout):
+            packet = req.data
+            return Reply(packet[:2] + struct.pack("!5H", 0x8383, 1, 0, 0, 0) + packet[12:])
+        with patch.object(probe.urllib.request, "urlopen", side_effect=respond):
+            result = probe.dns_probe("https://example.com/ech", "example.com", 65, 1)
+        self.assertEqual(result["rcode_low4"], 3)
+        self.assertTrue(result["truncated"])
+        self.assertEqual(result["cache"], "INTERNATIONAL_HIT")
+
+    def test_invalid_response(self):
+        for reply in (Reply(b"short"), Reply(b"short", "text/html")):
+            with patch.object(probe.urllib.request, "urlopen", return_value=reply):
+                result = probe.measure(probe.dns_probe, "https://example.com/ech", "example.com", 1, 1)
+            self.assertIn("error", result)
+
+    def test_timeout(self):
+        with patch.object(probe.urllib.request, "urlopen", side_effect=TimeoutError("timeout")):
+            self.assertEqual(probe.measure(probe.dns_probe, "https://example.com/ech", "example.com", 1, 1), {"error": "timeout"})
+
+
+if __name__ == "__main__":
+    unittest.main()

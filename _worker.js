@@ -39,7 +39,7 @@ const UPSTREAM_CN_JSON_LIST = [
     'https://doh.pub/dns-query',               // DNSPod（腾讯）
 ];
 const SVC_PARAM_IDS = { mandatory: 0, alpn: 1, "no-default-alpn": 2, port: 3, ipv4hint: 4, ech: 5, ipv6hint: 6};// SVC PARAMS构造
-const IPV4_ONLY_DOMAINS = ["twitter.com", "x.com", "t.co", "twimg.com"];//只支持ipv4的CF/META域名列表：不返回AAAA记录和ipv6hint
+const IPV4_ONLY_DOMAINS = ["twitter.com", "x.com", "t.co", "twimg.com"];// CDN IPv4-only policy; dl.google.com is handled by an opt-in rule below.
 //Cloudflare 配置
 const DEFAULT_CF_IP = "172.64.100.1,104.27.100.1,104.25.100.1,104.21.100.1,172.67.100.1,104.18.10.118";//默认CF优选IPv4(首选实测218ms;多IP返回,客户端自动容错切换)
 const DEFAULT_CF_IP6 = "";//默认CF优选IPv6
@@ -56,6 +56,23 @@ const BUILTIN_HINTS = [
     {
         hosts:["https://raw.hellogithub.com/hosts.json"],
         noA:false, noAAAA: true
+    },
+    {
+        // Upstream: Google regional search domains, same policy as GWS.
+        domains: ["*.google.com.hk","*.google.com.tw","*.google.co.jp","*.google.co.kr","*.google.com.sg","*.google.co.id","*.google.co.in","*.google.com.my","*.google.co.th","*.google.com.vn","*.google.com.ph","*.google.com.pk","*.google.com.bd","*.google.com.kh","*.google.com.sa","*.google.ae","*.google.co.il","*.google.com.tr","*.google.kz","*.google.lt","*.google.co.uk","*.google.de","*.google.fr","*.google.it","*.google.es","*.google.pt","*.google.nl","*.google.be","*.google.ch","*.google.at","*.google.se","*.google.no","*.google.dk","*.google.fi","*.google.ie","*.google.pl","*.google.cz","*.google.gr","*.google.com.ua","*.google.ru","*.google.com","*.google.ca","*.google.com.mx","*.google.com.br","*.google.com.ar","*.google.cl","*.google.com.co","*.google.com.pe","*.google.com.ec","*.google.com.uy","*.google.co.ve","*.google.co.cr","*.google.com.au","*.google.co.nz","*.google.com.fj","*.google.co.za","*.google.com.eg","*.google.com.ng","*.google.co.ke","*.google.com.gh","*.google.co.ma","*.google.com.et"],
+        ips: ["2001:4860:4826:7700::/64", "2001:4860:4827:7700::/64", "2001:4860:4828:7700::/64", "2001:4860:4829:7700::/64", "2001:4860:482a:7700::/64", "2001:4860:482b:7700::/64", "2001:4860:482c:7700::/64", "2001:4860:482d:7700::/64"],
+        noA: true, noAAAA: false
+    },
+    {
+        // FCM: preserve real dual-stack answers instead of Google IPv6-only defaults.
+        domains: ["mobile-gtalk.l.google.com", "alt7-mtalk.google.com", "alt8-mtalk.google.com", "mtalk-dev.google.com", "mtalk-staging.google.com", "mtalk4.google.com", "alt1-mtalk.google.com", "alt2-mtalk.google.com", "alt3-mtalk.google.com", "alt4-mtalk.google.com", "alt5-mtalk.google.com", "alt6-mtalk.google.com", "mtalk.google.com"],
+        ips: [], noA: false, noAAAA: false
+    },
+    {
+        // Specific exceptions must override the broad Google/YouTube IPv6-only rules.
+        // Apply only in opt-in enhancement modes, including ordinary non-CDN DNS paths.
+        domains: ["*.music.youtube.com", "*.robinfrontend-pa.googleapis.com", "*.signaler-pa.googleapis.com", "*.dl.google.com"],
+        ips: [], noA: false, noAAAA: true
     },
     {
         // GWS (Google Web Server) 分类组：承载网页主体、核心搜索 API、人机验证和账户安全登录 && GGC
@@ -471,8 +488,10 @@ async function handleDnsQuery(rawBuffer, config, ctx, clientIP, ns = 'ech') {
             return dnsResponse(echoEdns ? appendOpt(outBody) : outBody, cacheable ? { 'X-Cache': 'DOH_MISS' } : null);
         }
 
-        // 非静态域名 + HTTPS + 无增强 → 透明转发
-        if (qType === 65 && (!config.enhance || config.enhance === 'off')) {
+        // Unmatched ordinary names in rule mode retain native HTTPS records.
+        // Explicit best=true still permits the configured CDN ownership policy.
+        if (qType === 65 && (!config.enhance || config.enhance === 'off' ||
+            (config.enhance === 'rule' && config.best !== 'true' && !(await matchRule(qName, config))))) {
             const res = await forwardQuery(rawBuffer);
             return dnsResponse(await res.arrayBuffer());
         }
@@ -642,44 +661,17 @@ async function resolveDNS(domain, type, config, clientIP) {
     }
 // A/AAAA 处理    
     if (type === 'A' || type === 'AAAA') {
-     // 独立控制的CF站点禁用IPv6 默认即禁用（可通过 nocf6=false 关闭）
-        if (type === 'AAAA' && config.nocf6 !== 'false' && effectiveCF) {
-           return { domain, type, answers: [], ech: null };
-        }     
-     // 全局 IPv6 屏蔽 (no6) 对静态域名也生效
-        if (type === 'AAAA' && config.no6 === 'true') {
-            const isEnhanceActive = config.enhance === 'rule' || config.enhance === 'full';
-            if (isEnhanceActive) {
-                const ruleObj = await matchRule(domain, config);
-                // 规则匹配且提供了 IPv6 或未屏蔽 AAAA → 放行
-                if (ruleObj && (!ruleObj.noAAAA || ruleObj.ips.some(ip => ip.includes(':')))) {  
-                } else {
-                    return { domain, type, answers: [], ech: null };
-                }
-            } else {
-                return { domain, type, answers: [], ech: null };
-            }
-     }
-    // 增强模式规则屏蔽 / 指定 IP（对所有域名生效，包括静态域名）
-    if (config.enhance === 'rule' || config.enhance === 'full') {
-        const ruleObj = await matchRule(domain, config);
-        if (ruleObj) {
-            // 规则指定了对应类型的 IP → 直接返回规则 IP
-            if (type === 'A' && ruleObj.ips.some(ip => !ip.includes(':'))) {
-                let ips = ruleObj.ips.filter(ip => !ip.includes(':'));
-                if (config.shuffle !== 'false') ips = shuffle(ips);
-                return { domain, type, answers: ips, ech: null };
-            }
-            if (type === 'AAAA' && ruleObj.ips.some(ip => ip.includes(':'))) {
-                let ips = ruleObj.ips.filter(ip => ip.includes(':'));
-                if (config.shuffle !== 'false') ips = shuffle(ips);
-                return { domain, type, answers: ips, ech: null };
-            }
-            // 规则要求屏蔽 → 直接返回空
-            if (type === 'A' && ruleObj.noA) return { domain, type, answers: [], ech: null };
-            if (type === 'AAAA' && ruleObj.noAAAA) return { domain, type, answers: [], ech: null };
+        const ruleObj = (config.enhance === 'rule' || config.enhance === 'full')
+            ? await matchRule(domain, config) : null;
+        if (isTypeBlocked(type, ruleObj, config, effectiveCF)) {
+            return { domain, type, answers: [], ech: null };
         }
-    }
+        if (ruleObj) {
+            const ips = ruleObj.ips.filter(ip => type === 'AAAA' ? ip.includes(':') : !ip.includes(':'));
+            if (ips.length) {
+                return { domain, type, answers: config.shuffle !== 'false' ? shuffle(ips) : ips, ech: null };
+            }
+        }
     // 静态域名（含 best 提升）的优选 IP
     if (effectiveCF || effectiveMeta) {
         return handleStaticDomain(domain, type, config, effectiveCF, effectiveMeta, clientIP);
@@ -702,7 +694,8 @@ async function resolveDNS(domain, type, config, clientIP) {
         }
 
         // 增强模式 (非CF/Meta)
-        if (config.enhance && config.enhance !== 'off') {
+        if (config.enhance === 'full' ||
+            (config.enhance === 'rule' && await matchRule(domain, config))) {
             const result = await buildEnhancedHttpsRecord(domain, config, clientIP);
             return cleanResult(result);
         }
@@ -861,15 +854,17 @@ async function buildHttpsRecord(domain, config, clientIP, options = {}) {
         ipv6 = hints.ipv6;
     }
 
-    // 2. 应用屏蔽标志（包括 nocf6）
-    if (isTypeBlocked('A', ruleObj, config, isCF)) ipv4 = [];
-    if (isTypeBlocked('AAAA', ruleObj, config, isCF)) ipv6 = [];
+    // 2. Apply the same address policy to hints and fallback, including CDN IPv4-only.
+    const block4 = isTypeBlocked('A', ruleObj, config, isCF);
+    const block6 = (owner && isDomainIpv4Only(domain)) || isTypeBlocked('AAAA', ruleObj, config, isCF);
+    if (block4) ipv4 = [];
+    if (block6) ipv6 = [];
 
     // 3. 安全兜底
-    if (ipv4.length === 0 && !isTypeBlocked('A', ruleObj, config, isCF)) {
+    if (ipv4.length === 0 && !block4) {
         ipv4 = await resolveRealHints(domain, 1, clientIP);
     }
-    if (ipv6.length === 0 && !isTypeBlocked('AAAA', ruleObj, config, isCF)) {
+    if (ipv6.length === 0 && !block6) {
         ipv6 = await resolveRealHints(domain, 28, clientIP);
     }
 
@@ -1123,7 +1118,11 @@ async function matchRule(domain, config) {
         }
     }
     if (matched.length === 0) return null;
-    matched.sort((a, b) => b.pattern.length - a.pattern.length);
+    matched.sort((a, b) => {
+        const specificity = p => p.startsWith('*.') ? p.length - 2 : p.length;
+        return specificity(b.pattern) - specificity(a.pattern) ||
+            Number(a.pattern.startsWith('*.')) - Number(b.pattern.startsWith('*.'));
+    });
     return matched[0].ruleObj;
 }
 

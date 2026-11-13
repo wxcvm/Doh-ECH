@@ -56,5 +56,27 @@ class DirectProbeTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 mod.load_candidates(path, "https://other.example", mod.HOSTS, 3)
 
+    def test_public_fallback_after_project_403(self):
+        denied = mod.urllib.error.HTTPError("https://dohech.dpdns.org/api/query", 403, "Forbidden", {}, None)
+        valid = {"Status": 0, "Question": [{"name": "www.google.com.", "type": 28}],
+                 "Answer": [{"type": 28, "data": "2001:4860:4860::8888"},
+                            {"type": 5, "data": "alias.example."}]}
+        with patch.object(mod, "read_dns_json", side_effect=[denied, valid]) as read:
+            self.assertEqual(mod.candidates(mod.DEFAULT, "www.google.com", "AAAA", "direct"),
+                             ["2001:4860:4860::8888"])
+            self.assertIn("https://dns.google/resolve?", read.call_args_list[1].args[0])
+        with patch.object(mod, "read_dns_json", side_effect=denied) as read:
+            with self.assertRaises(RuntimeError):
+                mod.candidates(mod.DEFAULT, "www.google.com", "AAAA", "rule")
+            self.assertEqual(read.call_count, 1)
+
+    def test_public_fallback_rejects_mismatched_question(self):
+        wrong = {"Status": 0, "Question": [{"name": "other.example.", "type": 1}],
+                 "Answer": [{"type": 1, "data": "8.8.8.8"}]}
+        valid = {"Status": 0, "Question": [{"name": "x.com.", "type": 1}],
+                 "Answer": [{"type": 1, "data": "8.8.4.4"}]}
+        with patch.object(mod, "read_dns_json", side_effect=[OSError("timeout"), wrong, valid]):
+            self.assertEqual(mod.candidates(mod.DEFAULT, "x.com", "A", "direct"), ["8.8.4.4"])
+
 if __name__=="__main__":
     unittest.main()

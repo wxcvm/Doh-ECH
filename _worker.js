@@ -127,14 +127,48 @@ function stripBalancedEcs(packet, injection) {
     new DataView(out.buffer).setUint16(opt.dataStart-2,length);
     return out.buffer;
 }
+// Small isolate-local positive cache for ordinary domestic address queries.
+const domesticWireCache = new Map();
+function domesticCacheKey(raw, prefix) {
+    const p=inspectDnsWire(raw), v=new DataView(raw);
+    if(!p || p.questions.length!==1 || p.questions[0].compressed || ![1,28].includes(p.questions[0].type) ||
+        v.getUint16(2)!==0x0100 || v.getUint16(6) || v.getUint16(8) || v.getUint16(10)) return '';
+    // Exact question bytes retain DNS 0x20 case; transaction ID alone is excluded.
+    return prefix+'|'+Array.from(new Uint8Array(raw).subarray(2)).join(',');
+}
+function domesticCacheRead(key,id) {
+    const entry=domesticWireCache.get(key);
+    if(!entry)return null;
+    const age=Math.floor((Date.now()-entry.stored)/1000);
+    if(age>=entry.ttl){domesticWireCache.delete(key);return null;}
+    const out=entry.packet.slice(0), v=new DataView(out);
+    v.setUint16(0,id);
+    for(const offset of entry.offsets)v.setUint32(offset,v.getUint32(offset)-age);
+    return out;
+}
+function domesticCacheWrite(key,packet,type) {
+    if(!key || packet.byteLength>4096)return;
+    const p=inspectDnsWire(packet),v=new DataView(packet);
+    if(!p || (p.flags&0x022f) || !v.getUint16(6) || v.getUint16(8) || v.getUint16(10) ||
+       !p.records.some(r=>r.type===type) || p.records.some(r=>![1,5,28].includes(r.type)))return;
+    const ttl=Math.min(300,...p.records.map(r=>r.ttl));
+    if(!ttl)return;
+    if(domesticWireCache.size>=512)domesticWireCache.delete(domesticWireCache.keys().next().value);
+    domesticWireCache.set(key,{packet:packet.slice(0),stored:Date.now(),ttl,offsets:p.records.map(r=>r.ttlOffset)});
+}
 async function forwardBalanced(rawBuffer, domain, config, clientIP) {
     const domestic = balancedDomestic(domain);
+    const ecs=domestic?balancedEcsIP(config,clientIP):'';
+    const key=domestic?domesticCacheKey(rawBuffer,ecsPrefix(ecs)||'none'):'';
+    const hit=key&&domesticCacheRead(key,new DataView(rawBuffer).getUint16(0));
+    if(hit)return dnsResponse(hit,{'X-Cache':'DOMESTIC_HIT'});
+    const type=key?inspectDnsWire(rawBuffer).questions[0].type:0;
     if(domestic) {
-        const injection=addBalancedEcs(rawBuffer,balancedEcsIP(config,clientIP));
+        const injection=addBalancedEcs(rawBuffer,ecs);
         if(injection) {
             const result=await forwardQuery(injection.body,BALANCED_CN_WIRE);
             const packet=stripBalancedEcs(await result.arrayBuffer(),injection);
-            if(packet) return dnsResponse(packet);
+            if(packet) {domesticCacheWrite(key,packet,type);return dnsResponse(packet);}
         }
     }
     const result = await forwardQuery(rawBuffer, domestic ? BALANCED_CN_WIRE : BALANCED_INTL_WIRE);
@@ -143,6 +177,8 @@ async function forwardBalanced(rawBuffer, domain, config, clientIP) {
         const fallback = await forwardQuery(rawBuffer, BALANCED_INTL_WIRE);
         return dnsResponse(await fallback.arrayBuffer());
     }
+    // Do not cache a no-ECS retry under a personalized ECS key, or an international fallback.
+    if(domestic&&!ecs)domesticCacheWrite(key,packet,type);
     return dnsResponse(packet);
 }
 const DIRECT_JSON = ["https://cloudflare-dns.com/dns-query"];
@@ -2211,12 +2247,13 @@ function inspectDnsWire(buffer) {
         }
         const questionEnd = offset;
         const recordCount = view.getUint16(6) + view.getUint16(8) + view.getUint16(10);
-        let opt=null,optCount=0;
+        let opt=null,optCount=0;const records=[];
         for (let i = 0; i < recordCount; i++) {
             const start=offset;
             offset = readName(offset).end;
             if (offset + 10 > bytes.length) return null;
             const rdlength = view.getUint16(offset + 8);
+            records.push({type:view.getUint16(offset),ttl:view.getUint32(offset+4),ttlOffset:offset+4});
             if(view.getUint16(offset)===41 && i>=view.getUint16(6)+view.getUint16(8) && bytes[start]===0) {
                 opt={start,dataStart:offset+10,end:offset+10+rdlength,rdlength,ttl:view.getUint32(offset+4)};
                 optCount++;
@@ -2225,7 +2262,7 @@ function inspectDnsWire(buffer) {
             if (offset > bytes.length) return null;
         }
         if (offset !== bytes.length) return null;
-        return { id: view.getUint16(0), flags: view.getUint16(2), questions, questionEnd, opt, optCount };
+        return { id: view.getUint16(0), flags: view.getUint16(2), questions, questionEnd, opt, optCount, records };
     } catch {
         return null;
     }

@@ -84,6 +84,19 @@ try {
   assert.equal(new URL(await page.locator('#echUrl').textContent()).searchParams.get('pins'),'x.com=203.0.113.88');
   console.log('PASS local pin input, real DNS response and generated URL');
 
+  // Daily balanced profile exposes native DNS, with a separate ready-to-copy URL.
+  assert.equal(await page.locator('#balancedUrl').textContent(),new URL('/ech?enhance=balanced',base).href);
+  await page.locator('#enhance').selectOption('balanced');
+  await page.locator('#domain').fill('www.baidu.com');
+  await page.locator('#type').selectOption('A');
+  await page.locator('#queryBtn').click();
+  await page.locator('#cards [data-type=A]').filter({hasText:'日常均衡 · 国内上游'}).waitFor();
+  assert.equal(new URL(await page.locator('#echUrl').textContent()).searchParams.toString(),'enhance=balanced');
+  await page.getByRole('button',{name:'X 直连诊断',exact:false}).click();
+  await page.locator('#cards [data-type=HTTPS]').waitFor();
+  await page.locator('#advanced summary').click();
+  console.log('PASS daily balanced preset and native domestic route');
+
   // Explicit QUIC profile must expose the same address in A and HTTPS hints.
   await page.locator('#pins').fill('');
   await page.locator('#xh3').fill('172.66.0.227');

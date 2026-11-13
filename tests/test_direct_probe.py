@@ -1,6 +1,7 @@
 import importlib.util
 import pathlib
 import unittest
+import tempfile
 from unittest.mock import patch, MagicMock
 import io
 import json
@@ -41,6 +42,19 @@ class DirectProbeTests(unittest.TestCase):
             result=mod.probe("x.com","8.8.8.8","native",1)
             self.assertFalse(result["ok"])
             self.assertEqual(result["stage"],"TCP")
+
+    def test_offline_candidates_roundtrip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "candidates.json"
+            jobs = [("www.google.com", "2001:4860:4860::8888", "native", 5),
+                    ("x.com", "8.8.8.8", "native", 5)]
+            mod.save_candidates(path, mod.DEFAULT, jobs, [])
+            with patch.object(mod.OPENER, "open", side_effect=AssertionError("offline DNS request")):
+                loaded, errors = mod.load_candidates(path, mod.DEFAULT, ["www.google.com"], 3)
+            self.assertEqual(loaded, [("www.google.com", "2001:4860:4860::8888", "native", 3)])
+            self.assertEqual(errors, [])
+            with self.assertRaises(ValueError):
+                mod.load_candidates(path, "https://other.example", mod.HOSTS, 3)
 
 if __name__=="__main__":
     unittest.main()

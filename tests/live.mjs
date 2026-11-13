@@ -160,4 +160,27 @@ await check('balanced domestic routing and real wire ECS compatibility', async (
   for(const type of [28,65]) await wire('/ech','www.taobao.com',type,'GET',{enhance:'balanced',cnEcs:'on',clientIp:'223.5.5.5'});
   assert.equal((await api('www.google.com','A',{enhance:'balanced',cnEcs:'on',clientIp:'223.5.5.5'})).policy,'balanced-international');
 });
+await check('domestic empty EDNS0 A queries and cache observations', async()=>{
+  const name='www.baidu.com',baseQuestion=question(name,1);
+  let hits=0;
+  for(let i=0;i<3;i++){
+    const body=Buffer.concat([baseQuestion,Buffer.from([0,0,41,4,208,0,0,0,0,0,0])]);
+    body.writeUInt16BE(1,10);body.writeUInt16BE(0x6a41+i,0);
+    const start=Date.now();
+    const response=await fetchEndpoint('/ech?enhance=balanced&cnEcs=off',{
+      method:'POST',headers:{'Content-Type':'application/dns-message'},body
+    });
+    assert.equal(response.status,200);
+    const packet=Buffer.from(await response.arrayBuffer());
+    assert.equal(packet.readUInt16BE(0),0x6a41+i);
+    assert.equal(packet.readUInt16BE(2)&15,0);
+    assert.equal(packet.readUInt16BE(4),1);
+    assert.ok(packet.readUInt16BE(6)>0);
+    assert.deepEqual(packet.subarray(12,baseQuestion.length),baseQuestion.subarray(12));
+    const cache=response.headers.get('X-Cache')||'not-hit';
+    if(cache==='DOMESTIC_HIT')hits++;
+    console.log('Domestic EDNS sample '+(i+1)+': '+cache+' '+(Date.now()-start)+' ms');
+  }
+  console.log('Domestic EDNS observed cache hits: '+hits+'/3 (isolate-local; not a guaranteed hit rate)');
+});
 console.log('All ' + passed + ' live Worker checks passed; this verifies DNS behavior, not end-to-end ECH/TLS connectivity.');

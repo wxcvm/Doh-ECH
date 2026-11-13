@@ -339,3 +339,7 @@ A/AAAA/HTTPS 并行查询，各自独立显示等待、正常记录、无记录�
 访问 `/monitor`，输入 Worker 已配置的 `DOH_ADMIN_TOKEN`，读取 `/log` 的统计。未配置或令牌不匹配时 `/log` 返回 404；监控页面本身不包含统计或令牌，令牌不存储、不进入 URL，锁定后清空。通过 Cloudflare Worker 的变量与密钥设置添加同名 Secret（不要写入仓库），无需新数据库。
 
 统计为当前 Worker isolate 自启动累计，可能因实例切换、回收或部署而重置，不能与 Cloudflare 账户 24 小时总览直接比较。客户端 DoH 与内部上游尝试分开；国内外分流仅统计均衡单问题 IN 转发；NOERROR 包含空记录，SERVFAIL/NXDOMAIN 与 HTTP 错误分开。国内地址缓存命中率只计算可缓存请求，跳过另计；JSON 缓存按内部查找计数。上游有效率包含有效负应答，耗时是 Worker 侧等待时间，ECS 兼容应答不保证上游采纳。无样本用 `null` / `—`，不存储查询域名、客户端 IP 或 ECS 网段于指标。现有 `/log` 缓存、域名库和运行信息继续保留。
+
+### 国内普通 EDNS0 性能优化
+
+均衡模式的国内 A/AAAA 正向缓存支持无 OPT 和空 EDNS0 OPT（版本 0、无 DO 和其他选项）。缓存键包含原始问题、OPT 字节及 ECS 网段，不跨 EDNS UDP payload 大小或请求大小写共享；应答保留原有空 OPT，TTL 仅扣减真正的资源记录。Cookie、已有 ECS、DNSSEC DO、非空响应 OPT、负应答及回退仍不缓存。普通国内地址查询收到 NODATA/NXDOMAIN 时继续尝试同组另一解析器，优先含请求类型地址的有效应答；若均无地址，保留真实 CNAME/NODATA/NXDOMAIN（不因 NXDOMAIN 触发国际回退）。该策略不改变国际、复杂 EDNS 或旧模式。在线重复查询记录真实 X-Cache 和往返时间；命中仅保证在同一 Worker isolate 与有效 TTL 内，不能推断手机 CDN 加速。

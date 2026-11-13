@@ -33,6 +33,15 @@
 > - `/ech` 仅对结果与自定义参数无关的静态请求缓存合成的 DNS 结果；`/doh` 直接转发上游完整 DNS 响应，不复用仅由域名和类型决定的自定义缓存。对客户端的 DNS HTTP 响应使用 `Cache-Control: no-store`。
 > - 上游返回 NXDOMAIN 时透传 RCODE=3；如果二进制 DoH 的所有上游都失败，返回 DNS SERVFAIL，而非把 HTML 错误页当作 DNS 报文。
 ## Enhance Mode 功能与使用
+
+### Google / FCM 上游规则同步（2026-11-13）
+
+- 在 `enhance=rule/full` 下扩展 Google 地区域名（如 google.co.jp、google.de、google.com.au）并沿用现有 Google IPv6 增强策略。
+- FCM 推送域名（mtalk.google.com、mobile-gtalk.l.google.com、各 alt*-mtalk 等）保留真实 A/AAAA，不套用通用 Google IPv6-only 规则。
+- YouTube Music、robinfrontend-pa.googleapis.com、signaler-pa.googleapis.com 和 dl.google.com 使用真实 IPv4，屏蔽 AAAA 与 IPv6 hints；仅在增强模式开启时生效。DNS 策略不能保证目标服务可直接访问。
+- 规则按域名具体程度匹配，同一域名的精确规则优先于通配规则；屏蔽策略同时作用于地址记录与合成 HTTPS hints。规则模式下未命中的普通域名保持原始 HTTPS 记录。
+- 默认 `enhance=off`、`nocf6=true` 不变；需要 Cloudflare IPv6 的客户端可显式设置 `nocf6=false`，并在实际网络上验证。离线测试覆盖 AAAA 和 HTTPS hints 的开关行为，但不代表真实网络端到端连接已验证。
+
 增强模式是 DoH-ECH 的一项高级功能，允许您为网站主动注入连接优化参数，例如强制 QUIC (HTTP/3)、提供自定义 IP 提示 (IP hints) 以及精确屏蔽 A/AAAA 记录。这不仅能加速网站访问，还能解决某些浏览器因协议偏好导致的连接失败问题。
 
 > **注意**：增强模式规则**不会影响**静态列表中的 Cloudflare/Meta 域名，这些站点的 ECH 注入和优选 IP 逻辑独立运行，仅在规则列表里**特意添加CF/Meta域名规则**时才会生效(优先级:`ips[不为空]`>`cf/meta优选结果`>`ips[空]`)。
@@ -42,8 +51,8 @@
 
 | 状态 | 值 | 行为 |
 |------|----|------|
-| **关闭** | `off` | 不进行任何增强，普通域名保持上游原始记录。 |
-| **规则模式** | `rule` (默认)| 仅对匹配**规则**的域名生效，未匹配域名保持原样。 |
+| **关闭** | `off` (默认) | 不进行任何增强，普通域名保持上游原始记录。 |
+| **规则模式** | `rule` | 仅对匹配**规则**的域名生效，未匹配域名保持原样。 |
 | **全局模式** | `full` | 对所有普通域名生效。规则匹配的域名优先使用规则 IP，未匹配的从上游获取。 |
 
 ### 增强内容

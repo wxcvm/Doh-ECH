@@ -214,8 +214,8 @@ DOH_ALLOWED_SUB_HOSTS = "feeds.example.com"
 ### 2. 使用方法
 - **前端网页测试查询**：直接访问首页（`/`），输入域名、选择类型，可展开高级选项填入自定义参数后查询。
 
-- **CF 静态映射范围（默认强制优选 IP）**：仅 Cloudflare 自有域名（cloudflare.com/cloudflare-dns.com/pages.dev/workers.dev）。其他网站默认保留真实 A/AAAA；对于 HTTPS 记录仍可能通过动态归属探测进行 ECH 增强。
-  - **Meta 系**：facebook.com/instagram.com/whatsapp.com/messenger.com/fb.com/meta.com（固定 ECH 注入）
+- **CF 静态映射范围（默认强制优选 IP）**：仅 Cloudflare 自有域名（cloudflare.com/cloudflare-dns.com/pages.dev/workers.dev）。其他网站默认保留真实 A/AAAA 与 HTTPS 记录；仅在 `best=true` 时尝试动态归属探测与优选增强。
+  - **Meta 系**：facebook.com/instagram.com/whatsapp.com/messenger.com/fb.com/meta.com（优先查询域名自己的 ECH 配置，必要时保留短 TTL 的兼容配置）
   - **增强规则（enhance=rule/full）**：Google 系（google.com/youtube.com/googleapis.com/gstatic.com 等 → Google IPv6 直连）、Meta 全家桶 IPv6、Medium、Pinterest
   - **best=true 全局跟随**：任意 CF 托管的网站（自动归属探测）都使用优选 IP + ECH 注入
 - **优选 IP 订阅**：`https://你的域名/sub.txt`；将订阅用于 `sub=ip-https://...` 时必须先为 Worker 配置 `DOH_ALLOWED_SUB_HOSTS`，默认不允许从外部 URL 下载。
@@ -231,7 +231,7 @@ DOH_ALLOWED_SUB_HOSTS = "feeds.example.com"
 ---
 ## 注意事项
 - **限额**：Cloudflare Workers 的免费配额、子请求额度和缓存能力可能变化，请以当前 Cloudflare 官方文档及账号限制为准；不应将应用层缓存当作抵御大量滥用查询的手段。
-- **ECH 有效性**：Meta 的 ECH 为固定配置（可能会过期），Cloudflare 的 ECH 从指定域名动态获取，可自定义 `ech` 参数。
+- **ECH 有效性**：Cloudflare 的 ECH 从指定域名动态获取，可自定义 `ech` 参数。Meta 优先使用目标域名发布的 ECH；仅已知 Meta 域名允许使用原有兼容配置，TTL 最高 30 秒，并定期重查。`echSource` 为 `dns` 或 `legacy-meta`，后者不保证所有站点长期可用。可使用 `go run scripts/probe-meta-ech.go` 或 GitHub Actions 的 `Meta ECH verification` 进行证书验证与实际 TLS ECH 握手探测，探测不会自动改写生产配置。
 - **隐私与安全**：当前上游包含阿里 DNS、DNSPod 和 Cloudflare；国内域名分流至阿里 DNS/DNSPod。客户端 IP 仅转换为 IPv4 /24 或 IPv6 /56 网段后作为 ECS 发送给上游；无法获取有效地址时不发送 ECS。网段仍会透露大致网络位置，因此需考虑隐私需求。可调整 `_worker.js` 顶部的上游配置。
   
 ## 项目特性
@@ -239,7 +239,9 @@ DOH_ALLOWED_SUB_HOSTS = "feeds.example.com"
 - ✅ **DoH 服务**  
   提供 `/ech`（注入 ECH和enhance mode）和 `/doh`（纯净转发）两个标准 DoH 端点，支持 GET/POST。
 - ✅ **多上游竞速**  
-  同时查询 Google / Cloudflare / Quad9 / DNSPod 多家上游，取最快响应；国内域名走阿里 / DNSPod 国内上游，提高解析速度与准确性。
+  阿里 DNS、DNSPod、Cloudflare 上游根据本地近期延迟与失败记录自适应排序，优先请求表现较好的上游；100ms 后仍未得到有效答案时启动下一家，遇到失败或不完整响应立即切换。国内域名继续使用阿里 / DNSPod，所有配置的上游仍保留作为回退。
+- ✅ **长时间运行的规则刷新**  
+  国内域名列表和 hosts 规则按有效期刷新，刷新失败保留最近可用数据并短期重试；CDN 归属探测按真实 DNS TTL 与 ECS 网段隔离，避免将混合 IP 记录误判成单一 CDN。
 - ✅ **边缘节点本地缓存**  
   使用 Cloudflare Cache API 缓存可复用的正向上游 DNS 结果，按上游组、ECS 网段及 ECH 选择策略隔离；遵守记录 TTL，命中时扣减缓存年龄，不缓存零 TTL 或负应答。缓存仅在所在边缘数据中心复用，不是全球自动复制。
 - ✅ **ECS就近解析**  

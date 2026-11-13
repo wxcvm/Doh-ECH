@@ -246,3 +246,21 @@ DOH_ALLOWED_SUB_HOSTS = "feeds.example.com"
   使用 Cloudflare Cache API 缓存可复用的正向上游 DNS 结果，按上游组、ECS 网段及 ECH 选择策略隔离；遵守记录 TTL，命中时扣减缓存年龄，不缓存零 TTL 或负应答。缓存仅在所在边缘数据中心复用，不是全球自动复制。
 - ✅ **ECS就近解析**  
   默认获取 DoH 客户端 IP（可用 `clientIp` 自定义），向上游仅发送规范化的 IPv4 /24 或 IPv6 /56 网段；按网段及上游策略隔离缓存。ECS 可能帮助就近解析，但不保证最佳连接性能。
+
+
+### Google / X 原生直连诊断
+
+- 查询台新增 **Google 直连诊断** 与 **X 直连诊断**，可同时检查 A、AAAA、HTTPS 记录。
+- 浏览器安全 DNS 可使用 `https://你的域名/ech?enhance=direct`；该模式仅针对 Google/X 及列出的相关资源域名，优先通过 Cloudflare DNS 返回真实记录，不使用随机 IPv6、hosts 替换或通用 CDN 优选。首选上游失败时回退至既有国际上游；其他域名仍按默认/显式高级策略解析。
+- `enhance=rule` 继续保留原 Google IPv6 增强策略，便于对照；`/doh` 保持纯转发。原生直连模式不会为不支持 ECH 的目标伪造 ECH 配置。
+- DNS 成功不等于目标可达。关闭系统代理、VPN/TUN 后再测试；不要关闭 TLS 证书验证。Google 可对照 IPv4 和 IPv6，X 若没有 AAAA 则不强制 IPv6。
+
+Windows PowerShell（测试实际直连 HTTPS，绕过显式代理；不自动关闭 TUN/VPN）：
+
+```powershell
+$dns = 'https://你的域名/ech?enhance=direct'
+curl.exe --noproxy "*" --doh-url "$dns" -6 --connect-timeout 8 --max-time 20 -I https://www.google.com/
+curl.exe --noproxy "*" --doh-url "$dns" -4 --connect-timeout 8 --max-time 20 -I https://x.com/
+```
+
+HTTP 200/3xx 表示收到网站响应；403/429 也表示 TLS/HTTP 已到达服务，但不代表网页可正常使用。若超时或 TLS 失败，检查本机 IPv6 路由、代理状态及运营商网络。curl 的实际 ECH 能力取决于其 TLS 后端，此命令不保证使用 ECH。

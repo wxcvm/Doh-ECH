@@ -411,4 +411,22 @@ assert.ok(domesticCalls.some(u=>u.searchParams.get('edns_client_subnet')==='192.
 assert.ok(domesticCalls.some(u=>!u.searchParams.has('edns_client_subnet')));
 assert.ok(domesticCalls.every(u=>['dns.alidns.com','doh.pub'].includes(u.hostname)));
 assert.equal((await apiAnswer('wrong-question.example.cn','A','enhance=off')).rcode,2);
+// Native direct profile must not apply random IPv6, hosts overrides or forced CDN addresses.
+for(const name of ['www.google.com','x.com','api.x.com','pbs.twimg.com','t.co']){
+  const a=await apiAnswer(name,'A','enhance=direct&best=true&ip4=1.2.3.4&rules='+encodeURIComponent(name+':1.2.3.4-noA'));
+  assert.equal(a.policy,'native-direct');
+  assert.deepEqual(a.answers,['203.0.113.17']);
+  const v6=await apiAnswer(name,'AAAA','enhance=direct&no6=true');
+  assert.deepEqual(v6.answers,['2001:db8::17']);
+  const start=calls.length;
+  const q=question(name,65);
+  const r=await request('/ech?enhance=direct',{method:'POST',headers:{'Content-Type':'application/dns-message'},body:q});
+  assert.equal(r.status,200);
+  assert.equal(Buffer.from(await r.arrayBuffer()).readUInt16BE(2)&15,0);
+  assert.ok(calls.slice(start).some(c=>c==='https://cloudflare-dns.com/dns-query'),'native wire forwarding');
+}
+assert.equal((await apiAnswer('notgoogle.com','A','enhance=direct')).policy,undefined);
+assert.equal((await apiAnswer('x.com.evil.example','A','enhance=direct')).policy,undefined);
+assert.deepEqual((await apiAnswer('www.google.com','A','enhance=rule')).answers,[],'legacy Google rule remains opt-in');
+assert.equal((await apiAnswer('cloudflare.com','HTTPS','enhance=direct')).policy,undefined);
 console.log('Doh-ECH smoke tests passed (including adaptive upstreams, Meta ECH, owner TTL and ECS)');

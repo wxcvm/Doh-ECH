@@ -3129,10 +3129,11 @@ function getMonitorHtml(){
 <section class="panel"><h2>上游有效响应</h2><p class="muted">包含后台预热、查询台和实际 DNS；有效应答含 NXDOMAIN、无记录。耗时为 Worker 到上游，不是客户端访问延迟。</p><div class="scroll"><table><thead><tr><th>解析器 / 类型</th><th>尝试</th><th>已完成</th><th>有效率</th><th>失败</th><th>平均耗时</th></tr></thead><tbody id="upstreams"></tbody></table></div></section></div></main>
 <script>
 (()=>{'use strict';const $=id=>document.getElementById(id),fmt=(v,s='')=>v==null?'—':String(v)+s;
-let generation=0;
+let generation=0,lastStartedAt=null;
 function rows(id,items){const node=$(id);node.replaceChildren();for(const [label,value] of items){const row=document.createElement('div');row.className='row';const a=document.createElement('span'),b=document.createElement('b');a.textContent=label;b.textContent=value;row.append(a,b);node.append(row);}}
 function show(data){const m=data.metrics,w=m.wire,r=m.routing,c=m.cache.domestic,j=m.cache.json,e=m.ecs;
-$('scope').textContent='实例启动 '+m.startedAt+' · 采样 '+m.updatedAt;
+const changed=lastStartedAt!==null&&lastStartedAt!==m.startedAt;lastStartedAt=m.startedAt;
+$('scope').textContent='实例启动 '+m.startedAt+' · 采样 '+m.updatedAt+(changed?' · 实例已切换，计数不可直接比较':'')+(w.completed===0?' · 当前实例尚无已完成 DoH 请求':'');
 rows('wire',[['请求',w.requests],['已完成',w.completed],['NOERROR',w.rcode['0']||0],['SERVFAIL',w.rcode['2']||0],['NXDOMAIN',w.rcode['3']||0],['其他 DNS 结果',Object.entries(w.rcode).filter(([k])=>!['0','2','3'].includes(k)).reduce((n,[,v])=>n+v,0)],['HTTP 错误',w.httpErrors],['未捕获异常',w.exceptions],['平均处理时间',fmt(w.avgMs,' ms')]]);
 rows('routing',[['国内',r.domestic],['国内平均',fmt(r.domesticAvgMs,' ms')],['国际',r.international],['国际平均',fmt(r.internationalAvgMs,' ms')],['国内故障回退',r.fallback]]);
 rows('cache',[['命中',c.hits],['未命中',c.misses],['跳过',c.bypasses],['命中率',fmt(c.hitRate,'%')],['当前条数',c.entries]]);
@@ -3142,7 +3143,7 @@ rows('ecs',[['尝试附加',e.wireAttempts],['兼容应答（不保证采纳）'
 rows('domains',[['域名数',data.cnList.domainCount],['最近刷新',data.cnList.lastFetch||'尚未刷新'],['ECH 预热',data.caches.memory.echCache]]);
 const body=$('upstreams');body.replaceChildren();for(const u of m.upstreams){const tr=document.createElement('tr');for(const v of [u.key,u.attempts,u.completed,fmt(u.validRate,'%'),u.failed,fmt(u.avgMs,' ms')]){const td=document.createElement('td');td.textContent=v;tr.append(td);}body.append(tr);}if(!m.upstreams.length){const tr=document.createElement('tr'),td=document.createElement('td');td.colSpan=6;td.textContent='尚无上游样本';tr.append(td);body.append(tr);}$('stats').hidden=false;}
 $('auth').addEventListener('submit',async ev=>{ev.preventDefault();const token=$('token').value.trim();if(!token)return;const id=++generation;$('refresh').disabled=true;$('status').textContent='读取中…';try{const response=await fetch('/log',{headers:{Authorization:'Bearer '+token},cache:'no-store'});if(id!==generation)return;if(!response.ok)throw new Error(response.status===404?'令牌不正确或 Worker 尚未配置 DOH_ADMIN_TOKEN。':'读取失败：HTTP '+response.status);const data=await response.json();if(id!==generation)return;if(!data.metrics)throw new Error('当前 Worker 尚未提供运行统计。');show(data);$('status').textContent='统计已更新。';}catch(err){if(id!==generation)return;$('stats').hidden=true;$('status').textContent=err.message;}finally{if(id===generation)$('refresh').disabled=false;}});
-$('lock').addEventListener('click',()=>{generation++;$('token').value='';$('stats').hidden=true;for(const id of ['wire','routing','cache','jsonCache','ecs','domains','upstreams'])$(id).replaceChildren();$('scope').textContent='';$('refresh').disabled=false;$('status').textContent='已锁定。';});})();
+$('lock').addEventListener('click',()=>{generation++;lastStartedAt=null;$('token').value='';$('stats').hidden=true;for(const id of ['wire','routing','cache','internationalCache','jsonCache','ecs','domains','upstreams'])$(id).replaceChildren();$('scope').textContent='';$('refresh').disabled=false;$('status').textContent='已锁定。';});})();
 </script></body></html>`;
 }
 function getHtml() {

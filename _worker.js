@@ -434,6 +434,7 @@ export default {
                 }
             });
         }
+        if (url.pathname === '/monitor') return new Response(getMonitorHtml(),{headers:{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store'}});
         if (url.pathname === '/log') {
             // Debug information is private: fail closed if no admin token is configured.
             if (!env?.DOH_ADMIN_TOKEN || req.headers.get('Authorization') !== 'Bearer ' + env.DOH_ADMIN_TOKEN) {
@@ -3076,6 +3077,32 @@ function isTypeBlocked(type, ruleObj, config, isCF = false) {
     }
     return false;
 }
+function getMonitorHtml(){
+    return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Doh-ECH · 运行监控</title>
+<style>
+:root{color-scheme:dark;--bg:#0b1120;--panel:#111a2b;--border:#2b3a53;--muted:#a0b0ca;--blue:#8abaff}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:#e8eef8;font:15px/1.6 system-ui,sans-serif}main{max-width:1080px;margin:auto;padding:24px 16px 48px}h1{font-size:26px;margin:8px 0}h2{font-size:17px;margin:0 0 10px}p{margin:6px 0}a{color:var(--blue)}.muted{color:var(--muted)}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,250px),1fr));gap:12px;margin:16px 0}.panel{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:16px;min-width:0}.row{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;border-top:1px solid var(--border);padding:7px 0}.row b{font-variant-numeric:tabular-nums}form{display:flex;gap:8px;flex-wrap:wrap;align-items:center}input,button{font:inherit;border:1px solid var(--border);background:#16243a;color:inherit;padding:9px 12px;border-radius:8px}input{flex:1;min-width:160px}button{cursor:pointer;background:#2459a8}button:disabled{opacity:.5}#status{min-height:26px}.scroll{overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:13px}td,th{text-align:left;padding:8px;border-bottom:1px solid var(--border);white-space:nowrap}td:first-child{white-space:normal;overflow-wrap:anywhere}th{color:var(--muted)}[hidden]{display:none!important}
+</style></head><body><main><a href="/">返回查询台</a><h1>运行监控</h1><p class="muted">当前 Worker 实例 · 自启动累计 · 不等于账户过去 24 小时。请求可能被分配到其他实例，刷新后的计数可能变化。无样本显示 —，不伪造 0% 或延迟。</p>
+<section class="panel"><h2>管理员验证</h2><form id="auth"><input id="token" type="password" placeholder="DOH_ADMIN_TOKEN" aria-label="管理员令牌" autocomplete="off" required><button id="refresh">读取统计</button><button id="lock" type="button">锁定</button></form><p class="muted">令牌只用于本次页面内请求，不保存、不写入网址。未设置令牌或验证失败时无法读取。</p><p id="status" role="status" aria-live="polite">请输入管理员令牌。</p></section>
+<div id="stats" hidden><p id="scope" class="muted"></p><div class="grid"><section class="panel"><h2>客户端 DoH</h2><div id="wire"></div></section><section class="panel"><h2>均衡国内外分流</h2><div id="routing"></div></section><section class="panel"><h2>国内地址缓存</h2><div id="cache"></div></section><section class="panel"><h2>JSON 上游缓存</h2><div id="jsonCache"></div></section><section class="panel"><h2>ECS 就近解析</h2><div id="ecs"></div></section><section class="panel"><h2>国内域名库</h2><div id="domains"></div></section></div>
+<section class="panel"><h2>上游有效响应</h2><p class="muted">包含后台预热、查询台和实际 DNS；有效应答含 NXDOMAIN、无记录。耗时为 Worker 到上游，不是客户端访问延迟。</p><div class="scroll"><table><thead><tr><th>解析器 / 类型</th><th>尝试</th><th>已完成</th><th>有效率</th><th>失败</th><th>平均耗时</th></tr></thead><tbody id="upstreams"></tbody></table></div></section></div></main>
+<script>
+(()=>{'use strict';const $=id=>document.getElementById(id),fmt=(v,s='')=>v==null?'—':String(v)+s;
+let generation=0;
+function rows(id,items){const node=$(id);node.replaceChildren();for(const [label,value] of items){const row=document.createElement('div');row.className='row';const a=document.createElement('span'),b=document.createElement('b');a.textContent=label;b.textContent=value;row.append(a,b);node.append(row);}}
+function show(data){const m=data.metrics,w=m.wire,r=m.routing,c=m.cache.domestic,j=m.cache.json,e=m.ecs;
+$('scope').textContent='实例启动 '+m.startedAt+' · 采样 '+m.updatedAt;
+rows('wire',[['请求',w.requests],['已完成',w.completed],['NOERROR',w.rcode['0']||0],['SERVFAIL',w.rcode['2']||0],['NXDOMAIN',w.rcode['3']||0],['其他 DNS 结果',Object.entries(w.rcode).filter(([k])=>!['0','2','3'].includes(k)).reduce((n,[,v])=>n+v,0)],['HTTP 错误',w.httpErrors],['未捕获异常',w.exceptions],['平均处理时间',fmt(w.avgMs,' ms')]]);
+rows('routing',[['国内',r.domestic],['国内平均',fmt(r.domesticAvgMs,' ms')],['国际',r.international],['国际平均',fmt(r.internationalAvgMs,' ms')],['国内故障回退',r.fallback]]);
+rows('cache',[['命中',c.hits],['未命中',c.misses],['跳过',c.bypasses],['命中率',fmt(c.hitRate,'%')],['当前条数',c.entries]]);
+rows('jsonCache',[['命中',j.hits],['未命中',j.misses],['命中率',fmt(j.hitRate,'%')]]);
+rows('ecs',[['尝试附加',e.wireAttempts],['兼容应答（不保证采纳）',e.wireAccepted],['原报文重试',e.wireRetries],['JSON 无 ECS 重试',e.jsonRetries]]);
+rows('domains',[['域名数',data.cnList.domainCount],['最近刷新',data.cnList.lastFetch||'尚未刷新'],['ECH 预热',data.caches.memory.echCache]]);
+const body=$('upstreams');body.replaceChildren();for(const u of m.upstreams){const tr=document.createElement('tr');for(const v of [u.key,u.attempts,u.completed,fmt(u.validRate,'%'),u.failed,fmt(u.avgMs,' ms')]){const td=document.createElement('td');td.textContent=v;tr.append(td);}body.append(tr);}if(!m.upstreams.length){const tr=document.createElement('tr'),td=document.createElement('td');td.colSpan=6;td.textContent='尚无上游样本';tr.append(td);body.append(tr);}$('stats').hidden=false;}
+$('auth').addEventListener('submit',async ev=>{ev.preventDefault();const token=$('token').value.trim();if(!token)return;const id=++generation;$('refresh').disabled=true;$('status').textContent='读取中…';try{const response=await fetch('/log',{headers:{Authorization:'Bearer '+token},cache:'no-store'});if(id!==generation)return;if(!response.ok)throw new Error(response.status===404?'令牌不正确或 Worker 尚未配置 DOH_ADMIN_TOKEN。':'读取失败：HTTP '+response.status);const data=await response.json();if(id!==generation)return;if(!data.metrics)throw new Error('当前 Worker 尚未提供运行统计。');show(data);$('status').textContent='统计已更新。';}catch(err){if(id!==generation)return;$('stats').hidden=true;$('status').textContent=err.message;}finally{if(id===generation)$('refresh').disabled=false;}});
+$('lock').addEventListener('click',()=>{generation++;$('token').value='';$('stats').hidden=true;for(const id of ['wire','routing','cache','jsonCache','ecs','domains','upstreams'])$(id).replaceChildren();$('scope').textContent='';$('refresh').disabled=false;$('status').textContent='已锁定。';});})();
+</script></body></html>`;
+}
 function getHtml() {
     return `<!doctype html>
 <html lang="zh-CN">
@@ -3153,7 +3180,7 @@ function getHtml() {
 <div class="feedback" id="copyStatus" role="status" aria-live="polite"></div>
 <div class="client-help"><h3>怎么配置客户端？</h3><p class="muted"><strong>直连地址筛选：</strong>用 <a href="https://github.com/wxcvm/Doh-ECH/blob/main/scripts/direct-probe.py" target="_blank" rel="noopener noreferrer">本机检测脚本</a> 在关闭代理后测量 TCP、TLS 和 HTTP，再使用输出的专属 DoH 地址。</p><p class="muted"><strong>浏览器：</strong>安全 DNS / DNS over HTTPS，选择自定义并粘贴地址。</p><p class="muted"><strong>AdGuard：</strong>DNS 保护 → DNS 服务器 → 添加自定义服务器，粘贴 DoH 地址。</p><p class="muted"><strong>Android：</strong>系统「私人 DNS」通常使用 DoT 主机名，不接受 HTTPS URL；请用支持 DoH 的客户端。</p><p class="muted">若同时使用代理 Fake-IP DNS，建议先确认 DNS 分工，不要让多个组件重复接管。</p></div>
 </section></aside></div>
-<footer class="footer">Doh-ECH · Cloudflare Workers · <a href="https://github.com/wxcvm/Doh-ECH" target="_blank" rel="noopener noreferrer">项目仓库</a> · <a href="https://github.com/rosenii/Doh-ECH" target="_blank" rel="noopener noreferrer">上游项目</a></footer>
+<footer class="footer">Doh-ECH · Cloudflare Workers · <a href="/monitor">运行监控</a> · <a href="https://github.com/wxcvm/Doh-ECH" target="_blank" rel="noopener noreferrer">项目仓库</a> · <a href="https://github.com/rosenii/Doh-ECH" target="_blank" rel="noopener noreferrer">上游项目</a></footer>
 </main>
 <script>
 (function(){

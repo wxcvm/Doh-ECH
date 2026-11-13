@@ -19,14 +19,15 @@ DEFAULT = "https://dohech.dpdns.org"
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 CONTEXT = ssl.create_default_context()
 
-def candidates(base, host, kind, profile):
-    query = urllib.parse.urlencode({"domain": host, "type": kind, "enhance": profile})
-    with OPENER.open(base.rstrip("/") + "/api/query?" + query, timeout=10) as response:
-        data = json.load(response)
-    if data.get("rcode", 0) != 0 or data.get("error"):
-        raise RuntimeError(str(data.get("error") or "DNS RCODE " + str(data["rcode"])))
+def read_dns_json(url):
+    request = urllib.request.Request(url, headers={"Accept": "application/dns-json",
+                                                    "User-Agent": "Doh-ECH-Direct-Probe/1.1"})
+    with OPENER.open(request, timeout=10) as response:
+        return json.load(response)
+
+def valid_addresses(values, kind):
     result = []
-    for value in data.get("answers", []):
+    for value in values:
         try:
             ip = ipaddress.ip_address(value)
             if ip.is_global and ip.version == (6 if kind == "AAAA" else 4):
@@ -34,6 +35,43 @@ def candidates(base, host, kind, profile):
         except ValueError:
             pass
     return list(dict.fromkeys(result))
+
+def candidates(base, host, kind, profile):
+    query = urllib.parse.urlencode({"domain": host, "type": kind, "enhance": profile})
+    errors = []
+    try:
+        data = read_dns_json(base.rstrip("/") + "/api/query?" + query)
+        if data.get("rcode", 0) != 0 or data.get("error"):
+            raise RuntimeError(str(data.get("error") or "DNS RCODE " + str(data["rcode"])))
+        if not isinstance(data.get("answers"), list):
+            raise ValueError("invalid Doh-ECH response")
+        return valid_addresses(data["answers"], kind)
+    except (OSError, ValueError, RuntimeError) as error:
+        errors.append("Doh-ECH: " + str(error))
+    # Public recursive resolvers supply native DNS only; never label their answers as legacy.
+    if profile != "direct":
+        raise RuntimeError("; ".join(errors))
+    dns_type = 28 if kind == "AAAA" else 1
+    query = urllib.parse.urlencode({"name": host, "type": kind})
+    for label, endpoint in (("Google Public DNS", "https://dns.google/resolve"),
+                            ("Cloudflare DNS", "https://cloudflare-dns.com/dns-query")):
+        try:
+            data = read_dns_json(endpoint + "?" + query)
+            question = data.get("Question")
+            if (not isinstance(question, list) or len(question) != 1
+                    or question[0].get("name", "").rstrip(".").lower() != host.lower()
+                    or question[0].get("type") != dns_type):
+                raise ValueError("DNS question mismatch")
+            if data.get("Status") != 0:
+                raise RuntimeError("DNS RCODE " + str(data.get("Status")))
+            answers = valid_addresses([r["data"] for r in data.get("Answer", [])
+                                       if r.get("type") == dns_type and "data" in r], kind)
+            print(f"DNS fallback {host} {kind}: {label} (Doh-ECH unavailable)", flush=True)
+            return answers
+        except (OSError, ValueError, RuntimeError, TypeError, AttributeError) as error:
+            errors.append(label + ": " + str(error))
+    raise RuntimeError("; ".join(errors))
+
 
 def probe(host, ip, source, timeout):
     result = {"host": host, "ip": ip, "source": source, "stage": "TCP",
@@ -79,12 +117,58 @@ def select_pins(results):
         hosts.setdefault(host, []).extend(list(dict.fromkeys(x["ip"] for x in ranked))[:3])
     return ";".join(host + "=" + ",".join(ips) for host, ips in hosts.items())
 
+def collect_jobs(base, hosts, legacy, timeout):
+    jobs = []
+    dns_errors = []
+    for host in hosts:
+        for kind in ("A", "AAAA"):
+            try:
+                ips = candidates(base, host, kind, "direct")
+                print(f"DNS {host} {kind}: {', '.join(ips) or 'no records'}", flush=True)
+                jobs.extend((host, ip, "native", timeout) for ip in ips[:8])
+            except (OSError, ValueError, RuntimeError) as error:
+                dns_errors.append({"host": host, "type": kind, "error": str(error)})
+                print(f"DNS {host} {kind}: FAILED {error}", flush=True)
+        if legacy and host.endswith(".google.com"):
+            try:
+                native = {job[1] for job in jobs if job[0] == host}
+                ips = candidates(base, host, "AAAA", "rule")
+                jobs.extend((host, ip, "legacy-candidate", timeout)
+                            for ip in ips[:8] if ip not in native)
+            except (OSError, ValueError, RuntimeError) as error:
+                dns_errors.append({"host": host, "type": "legacy AAAA", "error": str(error)})
+                print(f"DNS {host} legacy AAAA: unavailable ({error}); native candidates retained", flush=True)
+    return jobs, dns_errors
+
+def save_candidates(path, base, jobs, dns_errors):
+    # Store literal addresses only; downloading candidates is not a connectivity test.
+    with open(path, "w", encoding="utf-8") as output:
+        json.dump({"base": base, "jobs": [list(j[:3]) for j in jobs],
+                   "dns_errors": dns_errors}, output, indent=2)
+    print(f"Saved {len(jobs)} candidates to {path}. Disable proxy/VPN/TUN before --offline.")
+
+def load_candidates(path, base, hosts, timeout):
+    with open(path, encoding="utf-8") as source:
+        data = json.load(source)
+    if data.get("base") != base:
+        raise ValueError("Candidate file belongs to a different DoH origin")
+    jobs = []
+    for host, value, origin in data["jobs"]:
+        ip = ipaddress.ip_address(value)
+        if host in hosts and ip.is_global and origin in ("native", "legacy-candidate"):
+            jobs.append((host, str(ip), origin, timeout))
+    return list(dict.fromkeys(jobs)), data.get("dns_errors", [])
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base", default=DEFAULT, help="HTTPS Doh-ECH origin")
     parser.add_argument("--host", action="append", choices=HOSTS, help="repeat to select hosts")
     parser.add_argument("--legacy", action="store_true", help="also test up to 8 legacy Google IPv6 candidates; no automatic trust")
     parser.add_argument("--timeout", type=float, default=5.0)
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--prepare", action="store_true", help="download candidates only, proxy may be on")
+    modes.add_argument("--offline", action="store_true", help="test saved literal IPs without contacting the DNS service")
+    parser.add_argument("--candidates", default="direct-candidates.json", help="candidate file path")
     args = parser.parse_args()
     base = args.base.rstrip("/")
     url = urllib.parse.urlsplit(base)
@@ -92,26 +176,24 @@ def main():
         parser.error("--base must be an HTTPS origin, without a path or query")
     if not 1 <= args.timeout <= 30:
         parser.error("--timeout must be 1..30 seconds")
+    hosts = args.host or HOSTS
+    if args.prepare:
+        jobs, dns_errors = collect_jobs(base, hosts, args.legacy, args.timeout)
+        if not jobs:
+            parser.exit(1, "No candidates downloaded; existing candidate file unchanged.\n")
+        save_candidates(args.candidates, base, jobs, dns_errors)
+        return
     print("Disable proxy, VPN and TUN before running. Direct sockets bypass explicit HTTP proxies, not VPN routing.")
-    jobs = []
-    dns_errors = []
-    for host in args.host or HOSTS:
-        for kind in ("A", "AAAA"):
-            try:
-                ips = candidates(base, host, kind, "direct")
-                print(f"DNS {host} {kind}: {', '.join(ips) or 'no records'}", flush=True)
-                jobs.extend((host, ip, "native", args.timeout) for ip in ips[:8])
-            except (OSError, ValueError, RuntimeError) as error:
-                dns_errors.append({"host": host, "type": kind, "error": str(error)})
-                print(f"DNS {host} {kind}: FAILED {error}", flush=True)
-        if args.legacy and host.endswith(".google.com"):
-            try:
-                native = {job[1] for job in jobs if job[0] == host}
-                ips = candidates(base, host, "AAAA", "rule")
-                jobs.extend((host, ip, "legacy-candidate", args.timeout)
-                            for ip in ips[:8] if ip not in native)
-            except (OSError, ValueError, RuntimeError) as error:
-                dns_errors.append({"host": host, "type": "legacy AAAA", "error": str(error)})
+    if args.offline:
+        try:
+            jobs, dns_errors = load_candidates(args.candidates, base, hosts, args.timeout)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            parser.exit(1, f"Cannot load candidate file: {error}. Run --prepare first.\n")
+        print(f"Loaded {len(jobs)} saved candidates; no DNS service request will be made.")
+    else:
+        jobs, dns_errors = collect_jobs(base, hosts, args.legacy, args.timeout)
+    if not jobs:
+        print("No candidates to test. This is a DNS acquisition failure, not a target connectivity result.")
     results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
         futures = [pool.submit(probe, *job) for job in jobs]

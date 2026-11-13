@@ -36,7 +36,7 @@ function question(name, type = 1) {
   tail.writeUInt16BE(1, 3);
   return Buffer.concat([header, ...labels, tail]);
 }
-async function wire(path, name, type, method = 'POST', params = {}) {
+async function wire(path, name, type, method = 'POST', params = {}, expectedRcode = 0) {
   const body = question(name, type);
   const query = new URLSearchParams(params);
   if (method === 'GET') query.set('dns', body.toString('base64url'));
@@ -51,7 +51,7 @@ async function wire(path, name, type, method = 'POST', params = {}) {
   assert.ok(data.length >= body.length, 'DNS reply truncated');
   assert.equal(data.readUInt16BE(0), 0x6a41, 'transaction ID mismatch');
   assert.equal(data.readUInt16BE(2) & 0x8000, 0x8000, 'not a DNS response');
-  assert.equal(data.readUInt16BE(2) & 15, 0, 'DNS RCODE');
+  assert.equal(data.readUInt16BE(2) & 15, expectedRcode, 'DNS RCODE');
   assert.equal(data.readUInt16BE(4), 1, 'question count');
   assert.deepEqual(data.subarray(12, body.length), body.subarray(12), 'question mismatch');
   return data;
@@ -89,5 +89,26 @@ await check('Cloudflare AAAA explicit opt-in and default suppression', async () 
 await check('public log remains private and malformed DoH rejected', async () => {
   assert.equal((await fetchEndpoint('/log')).status, 404);
   assert.equal((await fetchEndpoint('/doh?dns=AA')).status, 400);
+});
+await check('real A TTL and ECS-compatible requests', async () => {
+  for (const clientIp of ['192.0.2.123', '192.0.2.222', '2001:db8:abcd:12ff::42']) {
+    const result = await api('example.com', 'A', { enhance: 'off', clientIp });
+    assert.ok(result.answers.length > 0);
+    assert.ok(Number.isInteger(result.ttl) && result.ttl >= 0 && result.ttl <= 300, 'invalid TTL');
+  }
+  const response = await fetchEndpoint('/api/query?domain=example.com&type=A&enhance=off&clientIp=192.0.2.123');
+  assert.equal(response.headers.get('cache-control'), 'no-store');
+  const packet = await wire('/ech', 'example.com', 1, 'POST', { enhance: 'off', clientIp: '192.0.2.123' });
+  assert.ok(packet.readUInt16BE(6) > 0);
+  assert.ok(packet.readUInt32BE(question('example.com').length + 6) <= 300);
+});
+await check('NXDOMAIN preserved in JSON and wire DNS', async () => {
+  const name = 'nonexistent-doh-ech.invalid';
+  const response = await fetchEndpoint('/api/query?domain=' + name + '&type=A&enhance=off');
+  assert.equal(response.status, 200);
+  const result = await response.json();
+  assert.equal(result.rcode, 3);
+  assert.deepEqual(result.answers, []);
+  assert.equal((await wire('/ech', name, 1, 'POST', { enhance: 'off' }, 3)).readUInt16BE(6), 0);
 });
 console.log('All ' + passed + ' live Worker checks passed; this verifies DNS behavior, not end-to-end ECH/TLS connectivity.');

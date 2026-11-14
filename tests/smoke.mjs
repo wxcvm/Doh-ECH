@@ -794,10 +794,11 @@ binaryReplyOverride=q=>{
   const p=Buffer.from(q);p.writeUInt16BE(attempts++===0?0x8380:0x8180,2);
   p.writeUInt16BE(1,6);return Buffer.concat([p,nativeRR]);
 };
-nativeResult=await cacheReq(daily,question('native-tc.example.com',65));
+const nativeTc=question('native-tc.example.com',65);
+nativeResult=await cacheReq(daily,nativeTc);
 assert.equal(attempts,2);
 assert.equal(nativeResult.packet.readUInt16BE(2)&0x0200,0);
-assert.deepEqual(nativeResult.packet.subarray(nativeHttps.length),nativeRR);
+assert.deepEqual(nativeResult.packet.subarray(nativeTc.length),nativeRR);
 assert.equal(nativeResult.hit,null);
 const nativeCached=await cacheReq(daily,nativeHttps);
 assert.equal(nativeCached.hit,'INTERNATIONAL_HIT');

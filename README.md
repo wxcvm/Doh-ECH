@@ -357,3 +357,5 @@ python scripts/balanced-probe.py --url 'https://你的域名/ech?enhance=balance
 ```
 
 输出国内外 A/AAAA/HTTPS 二进制 DoH 往返时间、基础 RCODE、截断标志和 X-Cache，以及当前系统网络的 TCP 连接、TLS 和首字节时间。首轮不保证冷缓存；只有 X-Cache 明确命中才视为已观察到命中。HTTPS 使用系统 DNS 和当前路由，不保证使用被测 DoH；若要比较 AdGuard 实际体验，先自行确认系统 DNS 路径，保持网络和代理状态一致。脚本不修改配置、不上传报告、不证明 ECH 握手。错误保留在报告中，不计为成功测速。
+
+测速工具可加 `--doh-connect`，额外使用被测 DoH 返回的每种地址族首个地址连接网站，保留原域名 SNI、Host 和证书验证，分别输出 TLS/TTFB 与系统 DNS 基线。此为直接 TCP/TLS 测试，不代表浏览器 QUIC/ECH 或代理路径，也不保证选中最佳 CDN 地址。

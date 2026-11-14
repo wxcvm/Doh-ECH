@@ -228,15 +228,30 @@ async function forwardBalanced(rawBuffer, domain, config, clientIP) {
     try{return await forwardBalancedCore(rawBuffer,domain,config,clientIP,domestic);}
     finally{m[group+'Completed']++;m[group+'Ms']+=Math.max(0,Date.now()-start);}
 }
+const balancedPending = new Map();
 async function forwardBalancedCore(rawBuffer, domain, config, clientIP, domestic) {
     const ecs=domestic?balancedEcsIP(config,clientIP):'';
     const parsed=inspectDnsWire(rawBuffer);
     const cache=domestic?domesticWireCache:internationalWireCache;
     const key=balancedCacheKey(rawBuffer,ecsPrefix(ecs)||'none',parsed,domestic?[1,28]:[1,28,65]);
-    const hit=key&&balancedCacheRead(cache,key,new DataView(rawBuffer).getUint16(0));
+    const id=new DataView(rawBuffer).getUint16(0);
+    let hit=key&&balancedCacheRead(cache,key,id);
+    const pendingKey=key&&(domestic?'cn|':'intl|')+key;
+    // Workers cannot safely share request-owned fetch promises across requests.
+    // Wait briefly on our own timer, then read only the validated positive cache.
+    if(!hit && pendingKey && balancedPending.has(pendingKey)) {
+        for(let i=0;i<5 && balancedPending.has(pendingKey);i++) {
+            await new Promise(resolve=>setTimeout(resolve,10));
+            hit=balancedCacheRead(cache,key,id);
+            if(hit)break;
+        }
+    }
     const c=runtimeMetrics.cache[domestic?'domestic':'international'];
     if(!key)c.bypasses++;else if(hit)c.hits++;else c.misses++;
     if(hit)return dnsResponse(hit,{'X-Cache':domestic?'DOMESTIC_HIT':'INTERNATIONAL_HIT'});
+    const owner=pendingKey && !balancedPending.has(pendingKey);
+    if(owner)balancedPending.set(pendingKey,true);
+    try {
     // Native HTTPS records need complete replies; only ordinary international queries are cacheable.
     const preferRecord=!!key || !!balancedCacheKey(rawBuffer,'none',parsed,[65]);
     const type=key?parsed.questions[0].type:0;
@@ -262,6 +277,7 @@ async function forwardBalancedCore(rawBuffer, domain, config, clientIP, domestic
     // Do not cache a no-ECS retry under a personalized ECS key, or an international fallback.
     if(!ecs)balancedCacheWrite(cache,key,packet,type,clientOpt);
     return dnsResponse(packet);
+    } finally {if(owner)balancedPending.delete(pendingKey);}
 }
 const DIRECT_JSON = ["https://cloudflare-dns.com/dns-query"];
 const DIRECT_WIRE = ["https://cloudflare-dns.com/dns-query"];

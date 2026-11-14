@@ -187,6 +187,9 @@ function balancedCacheRead(cache,key,id) {
     if(!entry)return null;
     const age=Math.floor((Date.now()-entry.stored)/1000);
     if(age>=entry.ttl){cache.delete(key);return null;}
+    // Refresh recency without extending the DNS TTL.
+    cache.delete(key);
+    cache.set(key,entry);
     const out=entry.packet.slice(0), v=new DataView(out);
     v.setUint16(0,id);
     for(const offset of entry.offsets)v.setUint32(offset,v.getUint32(offset)-age);
@@ -205,6 +208,8 @@ function balancedCacheWrite(cache,key,packet,type,clientOpt) {
     if(!records.some(r=>r.type===type) || records.some(r=>![1,5,28].includes(r.type)))return;
     const ttl=Math.min(300,...records.map(r=>r.ttl));
     if(!ttl)return;
+    // Replacing an existing entry must not evict an unrelated hot name.
+    cache.delete(key);
     if(cache.size>=512)cache.delete(cache.keys().next().value);
     cache.set(key,{packet:packet.slice(0),stored:Date.now(),ttl,offsets:records.map(r=>r.ttlOffset)});
 }

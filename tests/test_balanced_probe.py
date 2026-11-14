@@ -36,6 +36,19 @@ class ProbeTests(unittest.TestCase):
         self.assertTrue(result["truncated"])
         self.assertEqual(result["cache"], "INTERNATIONAL_HIT")
 
+    def test_addresses(self):
+        for kind, raw, expected in ((1, bytes([203, 0, 113, 7]), "203.0.113.7"),
+                                    (28, bytes.fromhex("20010db8000000000000000000000001"), "2001:db8::1")):
+            def respond(req, timeout):
+                packet = req.data
+                rr = b"\xc0\x0c" + struct.pack("!HHIH", kind, 1, 60, len(raw)) + raw
+                return Reply(packet[:2] + struct.pack("!5H", 0x8180, 1, 1, 0, 0) + packet[12:] + rr)
+            with patch.object(probe.urllib.request, "urlopen", side_effect=respond):
+                result = probe.dns_probe("https://example.com/ech", "example.com", kind, 1)
+            self.assertEqual(result["addresses"], [expected])
+        with self.assertRaises(ValueError):
+            probe.answer_addresses(b"\xc0", 0, 1, 1)
+
     def test_invalid_response(self):
         for reply in (Reply(b"short"), Reply(b"short", "text/html")):
             with patch.object(probe.urllib.request, "urlopen", return_value=reply):

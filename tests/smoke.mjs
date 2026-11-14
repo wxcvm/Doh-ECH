@@ -642,6 +642,19 @@ assert.ok(afterMetrics.cache.json.hits>0);
 assert.ok(afterMetrics.ecs.wireAttempts>0&&afterMetrics.ecs.wireRetries>0);
 assert.ok(afterMetrics.upstreams.some(u=>u.failed>0));
 assert.ok(!JSON.stringify(afterMetrics).includes(cacheDomain));
+// Optional global analytics records final DNS outcomes, never names or addresses.
+const points=[];
+const analyticsEnv={...admin,DOH_ANALYTICS:{writeDataPoint(p){points.push(p);}}};
+await request('/doh',{method:'POST',headers:{'Content-Type':'application/dns-message'},body:question('analytics.example')},analyticsEnv);
+await request('/doh?dns=AA',{},analyticsEnv);
+assert.equal(points.length,2);
+assert.deepEqual(points[0].indexes,['doh']);
+assert.deepEqual(points[0].blobs,['0','none']);
+assert.deepEqual(points[1].blobs,['http_error','none']);
+assert.ok(points.every(p=>p.doubles.length===1&&p.doubles[0]>=0));
+assert.ok(!JSON.stringify(points).includes('analytics.example'));
+const failedAnalytics={...admin,DOH_ANALYTICS:{writeDataPoint(){throw new Error('analytics unavailable');}}};
+assert.equal((await request('/doh',{method:'POST',headers:{'Content-Type':'application/dns-message'},body:question('analytics.example')},failedAnalytics)).status,200);
 // Empty EDNS0 queries get a distinct cache entry; OPT flags are never aged.
 const ednsDomain='edns-cache.example.cn', ednsBase=question(ednsDomain,1);
 const ednsPlain=Buffer.concat([ednsBase,Buffer.from([0,0,41,4,208,0,0,0,0,0,0])]);

@@ -156,19 +156,28 @@ function metricsSnapshot(){
 // Observe final client DNS replies once, not internal upstream attempts or the JSON console.
 async function monitoredDoH(req,injectEch,ctx,clientIP,env){
     const m=runtimeMetrics.wire,start=Date.now();m.requests++;
+    let outcome='other',cache='none';
     try{
         const response=await handleDoHRequest(req,injectEch,ctx,clientIP,env);
-        if(!response.ok){m.httpErrors++;return response;}
+        if(!response.ok){m.httpErrors++;outcome='http_error';return response;}
         if((response.headers.get('Content-Type')||'').startsWith('application/dns-message')){
             const body=await response.arrayBuffer();
             const packet=inspectDnsWire(body);
             const code=packet?(packet.flags&15)|((packet.opt?.ttl>>>24)<<4):'invalid';
             m.rcode[code]=(m.rcode[code]||0)+1;
+            outcome=String(code);
+            const hit=response.headers.get('X-Cache');
+            if(hit==='DOMESTIC_HIT'||hit==='INTERNATIONAL_HIT')cache=hit;
             return new Response(body,{status:response.status,headers:response.headers});
         }
         return response;
-    }catch(e){m.exceptions++;throw e;}
-    finally{m.completed++;m.ms+=Math.max(0,Date.now()-start);}
+    }catch(e){m.exceptions++;outcome='exception';throw e;}
+    finally{
+        const elapsed=Math.max(0,Date.now()-start);
+        m.completed++;m.ms+=elapsed;
+        // Optional native Analytics Engine binding: no network await or query identifiers.
+        try{env?.DOH_ANALYTICS?.writeDataPoint({indexes:['doh'],blobs:[outcome,cache],doubles:[elapsed]});}catch{}
+    }
 }
 function balancedCacheKey(raw, prefix, p, types=[1,28]) {
     const v=new DataView(raw);

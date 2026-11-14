@@ -794,11 +794,17 @@ binaryReplyOverride=q=>{
   const p=Buffer.from(q);p.writeUInt16BE(attempts++===0?0x8380:0x8180,2);
   p.writeUInt16BE(1,6);return Buffer.concat([p,nativeRR]);
 };
-nativeResult=await cacheReq(daily,nativeHttps);
+nativeResult=await cacheReq(daily,question('native-tc.example.com',65));
 assert.equal(attempts,2);
 assert.equal(nativeResult.packet.readUInt16BE(2)&0x0200,0);
 assert.deepEqual(nativeResult.packet.subarray(nativeHttps.length),nativeRR);
 assert.equal(nativeResult.hit,null);
+const nativeCached=await cacheReq(daily,nativeHttps);
+assert.equal(nativeCached.hit,'INTERNATIONAL_HIT');
+assert.deepEqual(nativeCached.packet.subarray(nativeHttps.length),nativeRR);
+Date.now=()=>realNow()+61000;
+assert.equal((await cacheReq(daily,nativeHttps)).hit,null);
+Date.now=realNow;
 binaryReplyOverride=null;
 // An incompatible ECS answer must not win over another compatible domestic resolver.
 const ecsRaceBase=question('ecs-race.example.cn',1);

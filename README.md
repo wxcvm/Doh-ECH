@@ -361,3 +361,17 @@ python scripts/balanced-probe.py --url 'https://你的域名/ech?enhance=balance
 输出国内外 A/AAAA/HTTPS 二进制 DoH 往返时间、基础 RCODE、截断标志和 X-Cache，以及当前系统网络的 TCP 连接、TLS 和首字节时间。首轮不保证冷缓存；只有 X-Cache 明确命中才视为已观察到命中。HTTPS 使用系统 DNS 和当前路由，不保证使用被测 DoH；若要比较 AdGuard 实际体验，先自行确认系统 DNS 路径，保持网络和代理状态一致。脚本不修改配置、不上传报告、不证明 ECH 握手。错误保留在报告中，不计为成功测速。
 
 测速工具可加 `--doh-connect`，额外使用被测 DoH 返回的每种地址族首个地址连接网站，保留原域名 SNI、Host 和证书验证，分别输出 TLS/TTFB 与系统 DNS 基线。此为直接 TCP/TLS 测试，不代表浏览器 QUIC/ECH 或代理路径，也不保证选中最佳 CDN 地址。
+
+
+### 跨实例 DNS 统计（可选）
+
+生产 Worker 默认不启用额外数据采集。需要全局 DNS 指标时，在 Cloudflare Workers & Pages 的对应 Worker → Bindings 添加 Analytics Engine 绑定，变量名 `DOH_ANALYTICS`，数据集 `doh_ech`，保留现有 Secret 和其他绑定。部署包含采集代码的版本后，发送少量正常 DoH 查询，再查看数据集；数据写入可能有延迟。不要为此升级付费计划。免费额度及计费状态以 [官方价格说明](https://developers.cloudflare.com/analytics/analytics-engine/pricing/) 为准。
+
+使用只读 Account Analytics API Token（通过本地环境变量 `CF_ANALYTICS_TOKEN` 和 `CF_ACCOUNT_ID` 提供，不提交仓库、不放入浏览器）：
+
+```bash
+python scripts/global-dns-summary.py --sql-only
+python scripts/global-dns-summary.py --dataset doh_ech --hours 24
+```
+
+全局工具按采样权重估算请求量、DNS RCODE、缓存命中及平均耗时；缓存命中率分母为全部记录的 DoH 请求，与单实例可缓存请求命中率不同。空窗口返回 null 比例，不代表服务无故障。HTTP 403 表示查询未获授权，不是空数据；检查账号角色、数据集及 Token 权限。绑定未启用时仍使用原有单实例监控，不影响 DNS。移除该绑定即可停止新增采集；历史数据按 Cloudflare 保留策略处理。

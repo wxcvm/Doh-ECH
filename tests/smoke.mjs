@@ -789,6 +789,24 @@ const intlNegative=question('cache-negative.example.com',1);
 binaryReplyOverride=q=>addressReply(q,intlNegative.length,3,false);
 assert.equal((await cacheReq(daily,intlNegative)).hit,null);
 assert.equal((await cacheReq(daily,intlNegative)).hit,null);
+// Concurrent equivalent misses reuse only a validated positive cache entry.
+const coalesceBase=question('coalesce.example.com',1);
+const coalesceOther=Buffer.from(coalesceBase);coalesceOther.writeUInt16BE(0x9876,0);
+binaryReplyOverride=q=>addressReply(q,coalesceBase.length);
+const coalesceStart=wireBodies.length;
+const coalesced=await Promise.all([cacheReq(daily,coalesceBase),cacheReq(daily,coalesceOther)]);
+assert.equal(coalesced[0].packet.readUInt16BE(0),0x1234);
+assert.equal(coalesced[1].packet.readUInt16BE(0),0x9876);
+assert.equal(coalesced.filter(x=>x.hit==='INTERNATIONAL_HIT').length,1);
+assert.ok(wireBodies.slice(coalesceStart).every(x=>x.body.readUInt16BE(0)===0x1234));
+// Negative responses must not be shared; both callers independently resolve.
+const coalesceNegative=question('coalesce-negative.example.com',1);
+const coalesceNegativeOther=Buffer.from(coalesceNegative);coalesceNegativeOther.writeUInt16BE(0x9876,0);
+binaryReplyOverride=q=>addressReply(q,coalesceNegative.length,3,false);
+const negativeStart=wireBodies.length;
+const negativePair=await Promise.all([cacheReq(daily,coalesceNegative),cacheReq(daily,coalesceNegativeOther)]);
+assert.ok(negativePair.every(x=>x.hit===null && (x.packet.readUInt16BE(2)&15)===3));
+assert.ok(wireBodies.slice(negativeStart).some(x=>x.body.readUInt16BE(0)===0x9876));
 // Native HTTPS replies retain their original wire records and recover from NODATA/TC.
 const nativeHttps=question('native-quality.example.com',65);
 const nativeRR=Buffer.from([0xc0,0x0c,0,65,0,1,0,0,0,60,0,3,0,1,0]);

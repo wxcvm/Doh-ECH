@@ -340,13 +340,15 @@ A/AAAA/HTTPS 并行查询，各自独立显示等待、正常记录、无记录�
 
 统计为当前 Worker isolate 自启动累计，可能因实例切换、回收或部署而重置，不能与 Cloudflare 账户 24 小时总览直接比较。客户端 DoH 与内部上游尝试分开；国内外分流仅统计均衡单问题 IN 转发；NOERROR 包含空记录，SERVFAIL/NXDOMAIN 与 HTTP 错误分开。国内地址缓存命中率只计算可缓存请求，跳过另计；JSON 缓存按内部查找计数。上游有效率包含有效负应答，耗时是 Worker 侧等待时间，ECS 兼容应答不保证上游采纳。无样本用 `null` / `—`，不存储查询域名、客户端 IP 或 ECS 网段于指标。现有 `/log` 缓存、域名库和运行信息继续保留。
 
+跨实例总览：在 Cloudflare Dashboard → Workers & Pages → 对应 Worker → Metrics 查看选定时间范围内的请求量、错误及运行指标。这些是 Worker 级聚合，包含非 DoH 路径；HTTP 成功不等于 DNS NOERROR，不能从这些指标推算 DNS RCODE、ECS 成功率或缓存命中率。细分 DNS 指标仍以 `/monitor` 的单实例样本为准。此方式无需额外数据库或每次查询写入。
+
 ### 国内普通 EDNS0 性能优化
 
 均衡模式的国内 A/AAAA 正向缓存支持无 OPT 和空 EDNS0 OPT（版本 0、无 DO 和其他选项）。缓存键包含原始问题、OPT 字节及 ECS 网段，不跨 EDNS UDP payload 大小或请求大小写共享；应答保留原有空 OPT，TTL 仅扣减真正的资源记录。Cookie、已有 ECS、DNSSEC DO、非空响应 OPT、负应答及回退仍不缓存。普通国内地址查询收到 NODATA/NXDOMAIN 时继续尝试同组另一解析器，优先含请求类型地址的有效应答；若均无地址，保留真实 CNAME/NODATA/NXDOMAIN（不因 NXDOMAIN 触发国际回退）。该策略不改变国际、复杂 EDNS 或旧模式。在线重复查询记录真实 X-Cache 和往返时间；命中仅保证在同一 Worker isolate 与有效 TTL 内，不能推断手机 CDN 加速。
 
-### 均衡模式：国际地址缓存
+### 均衡模式：国际地址与原生 HTTPS 缓存
 
-国际 A/AAAA 普通查询采用独立的 512 条 isolate 内正向报文缓存，并与国内缓存共享相同的 TTL、事务 ID 和空 EDNS0 处理规则。命中返回 `X-Cache: INTERNATIONAL_HIT`；国际查询不会注入国内 ECS。仅缓存完整、含请求类型地址的正常应答，不缓存负应答、DNSSEC DO、非空 OPT、回退结果或 HTTPS/ECH 记录。国内外缓存独立计数，`/monitor` 可查看各自的命中率。国际地址查询也优先完整有效地址，国内规则和其他模式不变。缓存降低 DNS 重复查询耗时，不保证实际网站/CDN 连接速度。
+国际 A/AAAA/HTTPS 普通查询采用独立的 512 条 isolate 内正向报文缓存，并与国内缓存共享相同的 TTL、事务 ID 和空 EDNS0 处理规则。命中返回 `X-Cache: INTERNATIONAL_HIT`；国际查询不会注入国内 ECS。仅缓存完整、含请求类型地址的正常应答，不缓存负应答、DNSSEC DO、非空 OPT 或回退结果；国际 HTTPS 仅缓存符合条件的原生 HTTPS/CNAME 应答，国内 HTTPS 仍不缓存。国内外缓存独立计数，`/monitor` 可查看各自的命中率。国际地址查询也优先完整有效地址，国内规则和其他模式不变。缓存降低 DNS 重复查询耗时，不保证实际网站/CDN 连接速度。
 
 ### 国内外均衡模式实测
 

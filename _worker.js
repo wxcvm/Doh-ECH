@@ -205,7 +205,7 @@ function balancedCacheWrite(cache,key,packet,type,clientOpt) {
     if(ar>1 || (ar===1 && (!clientOpt || !opt || opt.end!==packet.byteLength ||
         opt.rdlength!==0 || opt.ttl!==0)))return;
     const records=p.records.slice(0,v.getUint16(6));
-    if(!records.some(r=>r.type===type) || records.some(r=>![1,5,28].includes(r.type)))return;
+    if(!records.some(r=>r.type===type) || records.some(r=>!(type===65?[5,65]:[1,5,28]).includes(r.type)))return;
     const ttl=Math.min(300,...records.map(r=>r.ttl));
     if(!ttl)return;
     // Replacing an existing entry must not evict an unrelated hot name.
@@ -223,12 +223,12 @@ async function forwardBalancedCore(rawBuffer, domain, config, clientIP, domestic
     const ecs=domestic?balancedEcsIP(config,clientIP):'';
     const parsed=inspectDnsWire(rawBuffer);
     const cache=domestic?domesticWireCache:internationalWireCache;
-    const key=balancedCacheKey(rawBuffer,ecsPrefix(ecs)||'none',parsed);
+    const key=balancedCacheKey(rawBuffer,ecsPrefix(ecs)||'none',parsed,domestic?[1,28]:[1,28,65]);
     const hit=key&&balancedCacheRead(cache,key,new DataView(rawBuffer).getUint16(0));
     const c=runtimeMetrics.cache[domestic?'domestic':'international'];
     if(!key)c.bypasses++;else if(hit)c.hits++;else c.misses++;
     if(hit)return dnsResponse(hit,{'X-Cache':domestic?'DOMESTIC_HIT':'INTERNATIONAL_HIT'});
-    // Native HTTPS records also need complete, usable replies, but are not cached.
+    // Native HTTPS records need complete replies; only ordinary international queries are cacheable.
     const preferRecord=!!key || !!balancedCacheKey(rawBuffer,'none',parsed,[65]);
     const type=key?parsed.questions[0].type:0;
     const clientOpt=!!parsed?.opt;

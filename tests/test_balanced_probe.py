@@ -60,5 +60,12 @@ class ProbeTests(unittest.TestCase):
             self.assertEqual(probe.measure(probe.dns_probe, "https://example.com/ech", "example.com", 1, 1), {"error": "timeout"})
 
 
+# Include global analytics regression tests in the existing benchmark CI job.
+_summary_spec = importlib.util.spec_from_file_location(
+    "global_summary_tests", pathlib.Path(__file__).resolve().parents[1] / "scripts" / "test-global-dns-summary.py")
+_summary_tests = importlib.util.module_from_spec(_summary_spec)
+_summary_spec.loader.exec_module(_summary_tests)
+SummaryTests = _summary_tests.SummaryTests
+
 if __name__ == "__main__":
     unittest.main()

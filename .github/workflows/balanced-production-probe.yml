@@ -19,6 +19,9 @@ jobs:
       - name: Compare GET transport
         run: |
           python3 scripts/balanced-probe.py --url 'https://dohech.dpdns.org/ech?enhance=balanced&cnEcs=auto' --method GET --rounds 1 --timeout 5 | tee balanced-production-get.json
+      - name: Compare existing Worker hostname (diagnostic only)
+        run: |
+          python3 scripts/balanced-probe.py --url 'https://doh-ech.shizuku2023.workers.dev/ech?enhance=balanced&cnEcs=auto' --rounds 1 --timeout 5 | tee balanced-worker-direct.json
       - name: Upload raw measurements
         uses: actions/upload-artifact@v4
         with:
@@ -26,6 +29,7 @@ jobs:
           path: |
             balanced-production.json
             balanced-production-get.json
+            balanced-worker-direct.json
       - name: Verify DNS responses
         run: |
           python3 - <<'PY'

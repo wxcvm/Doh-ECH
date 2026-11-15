@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - '.github/workflows/balanced-production-probe.yml'
+      - 'scripts/balanced-probe.py'
 permissions:
   contents: read
 jobs:
@@ -15,11 +16,16 @@ jobs:
       - name: Measure public DoH and website connections
         run: |
           python3 scripts/balanced-probe.py --url 'https://dohech.dpdns.org/ech?enhance=balanced&cnEcs=auto' --rounds 3 --timeout 5 --doh-connect | tee balanced-production.json
+      - name: Compare GET transport
+        run: |
+          python3 scripts/balanced-probe.py --url 'https://dohech.dpdns.org/ech?enhance=balanced&cnEcs=auto' --method GET --rounds 1 --timeout 5 | tee balanced-production-get.json
       - name: Upload raw measurements
         uses: actions/upload-artifact@v4
         with:
           name: balanced-production
-          path: balanced-production.json
+          path: |
+            balanced-production.json
+            balanced-production-get.json
       - name: Verify DNS responses
         run: |
           python3 - <<'PY'

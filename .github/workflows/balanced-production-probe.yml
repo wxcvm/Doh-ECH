@@ -1,0 +1,33 @@
+name: Balanced production probe
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/balanced-production-probe.yml'
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Measure public DoH and website connections
+        run: |
+          python3 scripts/balanced-probe.py --url 'https://dohech.dpdns.org/ech?enhance=balanced&cnEcs=auto' --rounds 3 --timeout 5 --doh-connect | tee balanced-production.json
+      - name: Upload raw measurements
+        uses: actions/upload-artifact@v4
+        with:
+          name: balanced-production
+          path: balanced-production.json
+      - name: Verify DNS responses
+        run: |
+          python3 - <<'PY'
+          import json
+          rows = json.load(open('balanced-production.json'))['samples']
+          dns = [r for r in rows if isinstance(r['type'], int)]
+          failures = [r for r in dns if 'error' in r or r.get('rcode_low4') != 0 or r.get('truncated')]
+          print(f'DNS samples: {len(dns)}, failures: {len(failures)}')
+          if not dns or failures:
+              raise SystemExit(1)
+          PY

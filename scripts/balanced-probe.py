@@ -1,5 +1,6 @@
 """Client-side balanced DoH benchmark; Python 3 standard library only."""
 import argparse
+import base64
 import json
 import secrets
 import socket
@@ -7,6 +8,8 @@ import ssl
 import struct
 import time
 import urllib.request
+import urllib.error
+import urllib.parse
 
 HOSTS = ("www.baidu.com", "www.bilibili.com", "www.jd.com",
          "www.google.com", "www.youtube.com", "www.cloudflare.com")
@@ -50,10 +53,19 @@ def answer_addresses(data, offset, count, kind):
     return addresses
 
 
-def dns_probe(url, host, kind, timeout):
+def dns_probe(url, host, kind, timeout, method="POST"):
     packet = query(host, kind)
-    req = urllib.request.Request(url, data=packet, headers={
-        "Content-Type": "application/dns-message", "Accept": "application/dns-message"})
+    headers = {"Accept": "application/dns-message"}
+    if method == "GET":
+        parts = urllib.parse.urlsplit(url)
+        params = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+        params = [(k, v) for k, v in params if k != "dns"]
+        params.append(("dns", base64.urlsafe_b64encode(packet).decode("ascii").rstrip("=")))
+        url = urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(params)))
+        req = urllib.request.Request(url, headers=headers)
+    else:
+        headers["Content-Type"] = "application/dns-message"
+        req = urllib.request.Request(url, data=packet, headers=headers)
     start = time.monotonic()
     with urllib.request.urlopen(req, timeout=timeout) as response:
         data = response.read(65536)
@@ -93,6 +105,12 @@ def https_probe(host, timeout, address=None):
 def measure(fn, *args):
     try:
         return fn(*args)
+    except urllib.error.HTTPError as exc:
+        # Keep only diagnostic response headers; never record credentials or cookies.
+        return {"error": str(exc), "http_status": exc.code,
+                "response_headers": {k: exc.headers.get(k) for k in
+                                     ("Server", "CF-Ray", "CF-Mitigated", "Content-Type")
+                                     if exc.headers.get(k) is not None}}
     except (OSError, ValueError) as exc:
         return {"error": str(exc)}
 
@@ -100,6 +118,7 @@ def measure(fn, *args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", required=True)
+    parser.add_argument("--method", choices=("GET", "POST"), default="POST")
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--timeout", type=float, default=8)
     parser.add_argument("--doh-connect", action="store_true", help="Also test TLS/TTFB using one returned address per family")
@@ -111,7 +130,7 @@ def main():
         addresses = {}
         for kind in (1, 28, 65):
             for i in range(args.rounds):
-                sample = measure(dns_probe, args.url, host, kind, args.timeout)
+                sample = measure(dns_probe, args.url, host, kind, args.timeout, args.method)
                 rows.append({"host": host, "type": kind, "round": i+1, **sample})
                 if sample.get("addresses"):
                     addresses.setdefault(kind, sample["addresses"][0])
@@ -120,7 +139,7 @@ def main():
                 rows.append({"host": host, "type": "doh_https", "family": kind, "address": address,
                              **measure(https_probe, host, args.timeout, address)})
         rows.append({"host": host, "type": "system_https", **measure(https_probe, host, args.timeout)})
-    print(json.dumps({"note": "First query is not guaranteed cold; X-Cache identifies observed hits. HTTPS uses system DNS, not necessarily tested DoH. Optional doh_https connects to a returned address with original hostname/SNI and certificate verification; no ECH verification.", "samples": rows}, indent=2))
+    print(json.dumps({"method": args.method, "note": "First query is not guaranteed cold; X-Cache identifies observed hits. HTTPS uses system DNS, not necessarily tested DoH. Optional doh_https connects to a returned address with original hostname/SNI and certificate verification; no ECH verification.", "samples": rows}, indent=2))
 
 
 if __name__ == "__main__":

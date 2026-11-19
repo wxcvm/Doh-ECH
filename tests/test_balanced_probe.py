@@ -34,6 +34,32 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual({r["host"] for r in rows}, {"www.jd.com", "www.cloudflare.com"})
         self.assertEqual(dns.call_count, 6)
 
+    def test_interleaved_baseline_preserves_target_address_and_default(self):
+        argv = ["probe", "--url", "https://target.example/ech", "--baseline-url",
+                "https://baseline.example/dns-query", "--hosts", "www.jd.com",
+                "--rounds", "2", "--dns-only", "--doh-connect"]
+        def fake_dns(url, host, kind, timeout, method):
+            return {"ms": 1, "rcode_low4": 0,
+                    "addresses": ["203.0.113.1"] if url.startswith("https://target") and kind == 1 else
+                                 ["198.51.100.2"] if kind == 1 else []}
+        with patch.object(sys, "argv", argv), \
+             patch.object(probe, "dns_probe", side_effect=fake_dns) as dns, \
+             patch.object(probe, "https_probe", side_effect=AssertionError("website probe called")), \
+             patch("sys.stdout", new_callable=io.StringIO) as out:
+            probe.main()
+        rows = json.loads(out.getvalue())["samples"]
+        self.assertEqual(dns.call_count, 12)
+        self.assertEqual([r["endpoint"] for r in rows],
+                         ["target", "baseline"] * 6)
+        self.assertEqual({r["host"] for r in rows}, {"www.jd.com"})
+
+    def test_reject_non_https_baseline(self):
+        with patch.object(sys, "argv", ["probe", "--url", "https://example.com/ech",
+                                        "--baseline-url", "http://insecure.example/dns-query"]):
+            with self.assertRaises(SystemExit) as error:
+                probe.main()
+        self.assertEqual(error.exception.code, 2)
+
     def test_dns_only_skips_website_connections(self):
         argv = ["probe", "--url", "https://example.com/ech", "--rounds", "2",
                 "--hosts", "www.jd.com", "--dns-only", "--doh-connect"]

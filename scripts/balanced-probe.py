@@ -120,13 +120,16 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", required=True)
     parser.add_argument("--method", choices=("GET", "POST"), default="POST")
+    parser.add_argument("--baseline-url", help="Optional second DoH endpoint for interleaved comparison (no device DNS changes)")
     parser.add_argument("--hosts", default=",".join(HOSTS), help="Comma-separated domains to probe; default is the six baseline sites")
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--timeout", type=float, default=8)
     parser.add_argument("--doh-connect", action="store_true", help="Also test TLS/TTFB using one returned address per family")
     parser.add_argument("--dns-only", action="store_true", help="Skip unrelated website TLS/TTFB probes when measuring DNS only")
     args = parser.parse_args()
-    if not args.url.startswith("https://") or args.rounds < 1 or args.timeout <= 0:
+    if (not args.url.startswith("https://") or
+            (args.baseline_url is not None and not args.baseline_url.startswith("https://")) or
+            args.rounds < 1 or args.timeout <= 0):
         parser.error("HTTPS URL, positive rounds and timeout required")
     hosts = [host.strip().lower().rstrip(".") for host in args.hosts.split(",")]
     if not hosts or any(not host or len(host) > 253 or any(
@@ -134,21 +137,26 @@ def main():
             for label in host.split(".")) for host in hosts):
         parser.error("--hosts requires comma-separated DNS hostnames")
     rows = []
+    endpoints = (("target", args.url), ("baseline", args.baseline_url)) if args.baseline_url else (("target", args.url),)
     for host in hosts:
         addresses = {}
         for kind in (1, 28, 65):
             for i in range(args.rounds):
-                sample = measure(dns_probe, args.url, host, kind, args.timeout, args.method)
-                rows.append({"host": host, "type": kind, "round": i+1, **sample})
-                if sample.get("addresses"):
-                    addresses.setdefault(kind, sample["addresses"][0])
+                for endpoint, endpoint_url in endpoints:
+                    sample = measure(dns_probe, endpoint_url, host, kind, args.timeout, args.method)
+                    row = {"host": host, "type": kind, "round": i+1, **sample}
+                    if args.baseline_url:
+                        row["endpoint"] = endpoint
+                    rows.append(row)
+                    if endpoint == "target" and sample.get("addresses"):
+                        addresses.setdefault(kind, sample["addresses"][0])
         if args.doh_connect and not args.dns_only:
             for kind, address in addresses.items():
                 rows.append({"host": host, "type": "doh_https", "family": kind, "address": address,
                              **measure(https_probe, host, args.timeout, address)})
         if not args.dns_only:
             rows.append({"host": host, "type": "system_https", **measure(https_probe, host, args.timeout)})
-    print(json.dumps({"method": args.method, "note": "First query is not guaranteed cold; X-Cache identifies observed hits. HTTPS uses system DNS, not necessarily tested DoH. Optional doh_https connects to a returned address with original hostname/SNI and certificate verification; no ECH verification.", "samples": rows}, indent=2))
+    print(json.dumps({"method": args.method, "note": "First query is not guaranteed cold; X-Cache identifies observed hits. Optional baseline queries are interleaved, not identical cache or network conditions, and may differ in ECS/ECH policy. HTTPS uses system DNS, not necessarily tested DoH. Optional doh_https connects to a target-returned address with original hostname/SNI and certificate verification; no ECH verification.", "samples": rows}, indent=2))
 
 
 if __name__ == "__main__":

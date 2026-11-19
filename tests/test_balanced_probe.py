@@ -26,6 +26,21 @@ class ProbeTests(unittest.TestCase):
             self.assertEqual(struct.unpack("!5H", packet[2:12]), (256, 1, 0, 0, 0))
             self.assertEqual(packet[12:], b"\x07example\x03com\x00" + struct.pack("!HH", kind, 1))
 
+    def test_explicit_user_agent_for_get_and_post(self):
+        def respond(req, timeout):
+            self.assertEqual(req.get_header("User-agent"), "Doh-ECH-DoH-Probe/1.0")
+            if req.data is None:
+                encoded = probe.urllib.parse.parse_qs(probe.urllib.parse.urlsplit(req.full_url).query)["dns"][0]
+                packet = probe.base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+            else:
+                packet = req.data
+            return Reply(packet[:2] + struct.pack("!5H", 0x8180, 1, 0, 0, 0) + packet[12:])
+
+        with patch.object(probe.urllib.request, "urlopen", side_effect=respond):
+            for method in ("POST", "GET"):
+                result = probe.dns_probe("https://example.com/ech?enhance=balanced", "example.com", 1, 1, method)
+                self.assertEqual(result["rcode_low4"], 0)
+
     def test_response(self):
         def respond(req, timeout):
             packet = req.data

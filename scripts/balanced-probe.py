@@ -124,6 +124,7 @@ def main():
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--timeout", type=float, default=8)
     parser.add_argument("--doh-connect", action="store_true", help="Also test TLS/TTFB using one returned address per family")
+    parser.add_argument("--dns-only", action="store_true", help="Skip unrelated website TLS/TTFB probes when measuring DNS only")
     args = parser.parse_args()
     if not args.url.startswith("https://") or args.rounds < 1 or args.timeout <= 0:
         parser.error("HTTPS URL, positive rounds and timeout required")
@@ -141,11 +142,12 @@ def main():
                 rows.append({"host": host, "type": kind, "round": i+1, **sample})
                 if sample.get("addresses"):
                     addresses.setdefault(kind, sample["addresses"][0])
-        if args.doh_connect:
+        if args.doh_connect and not args.dns_only:
             for kind, address in addresses.items():
                 rows.append({"host": host, "type": "doh_https", "family": kind, "address": address,
                              **measure(https_probe, host, args.timeout, address)})
-        rows.append({"host": host, "type": "system_https", **measure(https_probe, host, args.timeout)})
+        if not args.dns_only:
+            rows.append({"host": host, "type": "system_https", **measure(https_probe, host, args.timeout)})
     print(json.dumps({"method": args.method, "note": "First query is not guaranteed cold; X-Cache identifies observed hits. HTTPS uses system DNS, not necessarily tested DoH. Optional doh_https connects to a returned address with original hostname/SNI and certificate verification; no ECH verification.", "samples": rows}, indent=2))
 
 

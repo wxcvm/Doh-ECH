@@ -17,15 +17,19 @@ jobs:
         run: |
           python3 scripts/balanced-probe.py --url 'https://dohech.dpdns.org/ech?enhance=balanced&cnEcs=auto' --rounds 3 --timeout 5 --doh-connect | tee balanced-production.json
       - name: Compare GET transport
+        if: ${{ always() }}
         run: |
           python3 scripts/balanced-probe.py --url 'https://dohech.dpdns.org/ech?enhance=balanced&cnEcs=auto' --method GET --rounds 1 --timeout 5 | tee balanced-production-get.json
       - name: Compare existing Worker hostname (diagnostic only)
+        if: ${{ always() }}
         run: |
           python3 scripts/balanced-probe.py --url 'https://doh-ech.shizuku2023.workers.dev/ech?enhance=balanced&cnEcs=auto' --rounds 1 --timeout 5 | tee balanced-worker-direct.json
       - name: Upload raw measurements
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: balanced-production
+          if-no-files-found: warn
           path: |
             balanced-production.json
             balanced-production-get.json

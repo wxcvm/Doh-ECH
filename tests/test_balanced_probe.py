@@ -42,9 +42,9 @@ class ProbeTests(unittest.TestCase):
             return {"ms": 1, "rcode_low4": 0,
                     "addresses": ["203.0.113.1"] if url.startswith("https://target") and kind == 1 else
                                  ["198.51.100.2"] if kind == 1 else []}
-        with patch.object(sys, "argv", argv), \\
+        with patch.object(sys, "argv", argv), \
              patch.object(probe, "dns_probe", side_effect=fake_dns) as dns, \\
-             patch.object(probe, "https_probe", side_effect=AssertionError("website probe called")), \\
+             patch.object(probe, "https_probe", side_effect=AssertionError("website probe called")), \
              patch("sys.stdout", new_callable=io.StringIO) as out:
             probe.main()
         rows = json.loads(out.getvalue())["samples"]

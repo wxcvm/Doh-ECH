@@ -1,5 +1,7 @@
 import importlib.util
 import io
+import json
+import sys
 import pathlib
 import struct
 import unittest
@@ -20,6 +22,25 @@ class Reply(io.BytesIO):
 
 
 class ProbeTests(unittest.TestCase):
+    def test_custom_hosts_without_network(self):
+        argv = ["probe", "--url", "https://example.com/ech", "--rounds", "1",
+                "--hosts", "www.jd.com, www.cloudflare.com."]
+        with patch.object(sys, "argv", argv), \
+             patch.object(probe, "dns_probe", return_value={"ms": 1, "rcode_low4": 0}) as dns, \
+             patch.object(probe, "https_probe", return_value={"tls_ms": 1}), \
+             patch("sys.stdout", new_callable=io.StringIO) as out:
+            probe.main()
+        rows = json.loads(out.getvalue())["samples"]
+        self.assertEqual({r["host"] for r in rows}, {"www.jd.com", "www.cloudflare.com"})
+        self.assertEqual(dns.call_count, 6)
+
+    def test_reject_invalid_custom_host(self):
+        with patch.object(sys, "argv", ["probe", "--url", "https://example.com/ech",
+                                         "--hosts", "valid.example,invalid_domain"]):
+            with self.assertRaises(SystemExit) as error:
+                probe.main()
+        self.assertEqual(error.exception.code, 2)
+
     def test_query(self):
         for kind in (1, 28, 65):
             packet = probe.query("example.com", kind)

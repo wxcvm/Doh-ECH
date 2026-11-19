@@ -120,14 +120,20 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", required=True)
     parser.add_argument("--method", choices=("GET", "POST"), default="POST")
+    parser.add_argument("--hosts", default=",".join(HOSTS), help="Comma-separated domains to probe; default is the six baseline sites")
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--timeout", type=float, default=8)
     parser.add_argument("--doh-connect", action="store_true", help="Also test TLS/TTFB using one returned address per family")
     args = parser.parse_args()
     if not args.url.startswith("https://") or args.rounds < 1 or args.timeout <= 0:
         parser.error("HTTPS URL, positive rounds and timeout required")
+    hosts = [host.strip().lower().rstrip(".") for host in args.hosts.split(",")]
+    if not hosts or any(not host or len(host) > 253 or any(
+            not label or len(label) > 63 or not all(ch.isascii() and (ch.isalnum() or ch == "-") for ch in label)
+            for label in host.split(".")) for host in hosts):
+        parser.error("--hosts requires comma-separated DNS hostnames")
     rows = []
-    for host in HOSTS:
+    for host in hosts:
         addresses = {}
         for kind in (1, 28, 65):
             for i in range(args.rounds):

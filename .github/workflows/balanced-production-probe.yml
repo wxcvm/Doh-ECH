@@ -38,10 +38,26 @@ jobs:
         run: |
           python3 - <<'PY'
           import json
-          rows = json.load(open('balanced-production.json'))['samples']
-          dns = [r for r in rows if isinstance(r['type'], int)]
-          failures = [r for r in dns if 'error' in r or r.get('rcode_low4') != 0 or r.get('truncated')]
-          print(f'DNS samples: {len(dns)}, failures: {len(failures)}')
-          if not dns or failures:
+          failed = False
+          for label, path, required in (
+              ('public POST', 'balanced-production.json', True),
+              ('public GET', 'balanced-production-get.json', True),
+              ('Worker direct POST (diagnostic)', 'balanced-worker-direct.json', False),
+          ):
+              try:
+                  with open(path) as source:
+                      rows = json.load(source)['samples']
+                  dns = [r for r in rows if isinstance(r['type'], int)]
+                  failures = [r for r in dns if 'error' in r or r.get('rcode_low4') != 0 or r.get('truncated')]
+                  print(f'{label}: DNS samples={len(dns)}, failures={len(failures)}')
+                  if failures:
+                      print('  first failure:', failures[0])
+                  bad = not dns or bool(failures)
+              except (OSError, ValueError, KeyError) as exc:
+                  print(f'{label}: measurements unavailable: {exc}')
+                  bad = True
+              if required and bad:
+                  failed = True
+          if failed:
               raise SystemExit(1)
           PY

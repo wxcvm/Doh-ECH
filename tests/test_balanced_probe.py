@@ -34,6 +34,19 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual({r["host"] for r in rows}, {"www.jd.com", "www.cloudflare.com"})
         self.assertEqual(dns.call_count, 6)
 
+    def test_dns_only_skips_website_connections(self):
+        argv = ["probe", "--url", "https://example.com/ech", "--rounds", "2",
+                "--hosts", "www.jd.com", "--dns-only", "--doh-connect"]
+        with patch.object(sys, "argv", argv), \
+             patch.object(probe, "dns_probe", return_value={"ms": 1, "rcode_low4": 0}) as dns, \
+             patch.object(probe, "https_probe", side_effect=AssertionError("website probe called")), \
+             patch("sys.stdout", new_callable=io.StringIO) as out:
+            probe.main()
+        rows = json.loads(out.getvalue())["samples"]
+        self.assertEqual(len(rows), 6)
+        self.assertTrue(all(isinstance(row["type"], int) for row in rows))
+        self.assertEqual(dns.call_count, 6)
+
     def test_reject_invalid_custom_host(self):
         with patch.object(sys, "argv", ["probe", "--url", "https://example.com/ech",
                                          "--hosts", "valid.example,invalid_domain"]):

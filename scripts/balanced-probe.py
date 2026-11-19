@@ -55,7 +55,8 @@ def answer_addresses(data, offset, count, kind):
 
 def dns_probe(url, host, kind, timeout, method="POST"):
     packet = query(host, kind)
-    headers = {"Accept": "application/dns-message"}
+    # workers.dev rejects some default library user agents before Worker execution.
+    headers = {"Accept": "application/dns-message", "User-Agent": "Doh-ECH-DoH-Probe/1.0"}
     if method == "GET":
         parts = urllib.parse.urlsplit(url)
         params = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)

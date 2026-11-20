@@ -31,6 +31,8 @@ def answer_addresses(data, offset, count, kind):
             size = data[offset]
             offset += 1
             if size & 0xc0 == 0xc0:
+                if offset >= len(data):
+                    raise ValueError("truncated DNS compression pointer")
                 offset += 1
                 break
             if size == 0:

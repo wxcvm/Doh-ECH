@@ -50,7 +50,7 @@ class ProbeTests(unittest.TestCase):
         rows = json.loads(out.getvalue())["samples"]
         self.assertEqual(dns.call_count, 12)
         self.assertEqual([r["endpoint"] for r in rows],
-                         ["target", "baseline"] * 6)
+                         ["target", "baseline", "baseline", "target"] * 3)
         self.assertEqual({r["host"] for r in rows}, {"www.jd.com"})
 
     def test_reject_non_https_baseline(self):

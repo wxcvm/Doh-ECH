@@ -146,7 +146,9 @@ def main():
         addresses = {}
         for kind in (1, 28, 65):
             for i in range(args.rounds):
-                for endpoint, endpoint_url in endpoints:
+                # Rotate first endpoint to avoid always favoring the same cache/warm-up order.
+                ordered_endpoints = endpoints if i % 2 == 0 else endpoints[::-1]
+                for endpoint, endpoint_url in ordered_endpoints:
                     sample = measure(dns_probe, endpoint_url, host, kind, args.timeout, args.method)
                     row = {"host": host, "type": kind, "round": i+1, **sample}
                     if args.baseline_url:

@@ -125,6 +125,8 @@ class ProbeTests(unittest.TestCase):
             probe.answer_addresses(b"\xc0", 0, 1, 1)
         with self.assertRaisesRegex(ValueError, "truncated DNS compression pointer"):
             probe.answer_addresses(b"\x00\xc0", 1, 1, 1)
+        with self.assertRaisesRegex(ValueError, "truncated DNS label"):
+            probe.answer_addresses(b"\x03ab", 0, 1, 1)
 
     def test_invalid_response(self):
         for reply in (Reply(b"short"), Reply(b"short", "text/html")):

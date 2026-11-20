@@ -39,6 +39,8 @@ def answer_addresses(data, offset, count, kind):
                 break
             if size > 63:
                 raise ValueError("invalid DNS label")
+            if offset + size > len(data):
+                raise ValueError("truncated DNS label")
             offset += size
         if offset + 10 > len(data):
             raise ValueError("truncated DNS record")

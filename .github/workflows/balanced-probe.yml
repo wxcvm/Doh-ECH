@@ -12,3 +12,4 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -m unittest discover -s tests -p test_balanced_probe.py
+      - run: python scripts/test-direct-probe-timing.py

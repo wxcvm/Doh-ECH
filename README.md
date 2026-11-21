@@ -374,4 +374,6 @@ python scripts/global-dns-summary.py --sql-only
 python scripts/global-dns-summary.py --dataset doh_ech --hours 24
 ```
 
+全局汇总还按路由给出 `routes`：`domestic`（国内）、`international`（国际）、`domestic_fallback`（国内上游故障后由国际上游应答）、`other`（非均衡模式或 HTTP 错误）、`unclassified`（升级前没有路由标签的历史数据）。此处均为采样估计，不是各地区实测时延，也不会记录域名或客户端 IP。单次 DoH 响应附带 `X-DNS-Route` 用于诊断。
+
 全局工具按采样权重估算请求量、DNS RCODE、缓存命中及平均耗时；缓存命中率分母为全部记录的 DoH 请求，与单实例可缓存请求命中率不同。空窗口返回 null 比例，不代表服务无故障。HTTP 403 表示查询未获授权，不是空数据；检查账号角色、数据集及 Token 权限。绑定未启用时仍使用原有单实例监控，不影响 DNS。移除该绑定即可停止新增采集；历史数据按 Cloudflare 保留策略处理。

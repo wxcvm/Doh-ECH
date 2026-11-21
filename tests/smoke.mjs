@@ -570,6 +570,38 @@ Object.defineProperty(autoReq,'cf',{value:{country:'CN'}});
 startEcs=wireBodies.length;
 await worker.fetch(autoReq,env,ctx);
 assert.ok(wireBodies.slice(startEcs).some(x=>x.body.subarray(-11).toString('hex')==='0008000700011800c00002'));
+
+// cnEcs=auto must follow Cloudflare's country metadata: mainland clients receive
+// a normalized ECS prefix, while overseas clients using the same URL do not.
+// Explicit cnEcs=on remains an intentional override for overseas clients.
+async function countryWire(name,country,ip,params=daily) {
+  const req=new Request('https://resolver.example/ech?'+params,{
+    method:'POST',
+    headers:{'Content-Type':'application/dns-message','CF-Connecting-IP':ip},
+    body:question(name,1)
+  });
+  Object.defineProperty(req,'cf',{value:{country}});
+  const start=wireBodies.length;
+  const response=await worker.fetch(req,env,ctx);
+  assert.equal(response.status,200);
+  const packet=Buffer.from(await response.arrayBuffer());
+  const sent=wireBodies.slice(start);
+  assert.ok(sent.length>0,'country-scoped request must reach an upstream');
+  return {packet,sent};
+}
+const autoOverseas=await countryWire('auto-overseas.example.cn','US','198.51.100.123');
+assert.ok(autoOverseas.sent.every(x=>x.body.readUInt16BE(10)===0),
+  'cnEcs=auto must not inject ECS for a non-mainland client');
+assert.ok(autoOverseas.sent.every(x=>['dns.alidns.com','doh.pub'].includes(x.host)),
+  'country metadata must not change domestic-domain upstream routing');
+const explicitOverseas=await countryWire('explicit-overseas.example.cn','US','198.51.100.123',daily+'&cnEcs=on');
+assert.ok(explicitOverseas.sent.some(x=>x.body.subarray(-11).toString('hex')==='00080007000118c63364'),
+  'cnEcs=on must remain an explicit overseas override');
+const autoInternational=await countryWire('www.google.com','CN','192.0.2.123');
+assert.ok(autoInternational.sent.every(x=>x.body.readUInt16BE(10)===0),
+  'cnEcs=auto must never inject ECS into international upstream queries');
+assert.ok(autoInternational.sent.every(x=>['cloudflare-dns.com','dns.google'].includes(x.host)),
+  'mainland client country must not reroute international domains');
 const jsonStart=calls.length;
 await apiAnswer('www.taobao.com','A',ecsDaily);
 assert.ok(calls.slice(jsonStart).some(u=>new URL(u).searchParams.get('edns_client_subnet')==='192.0.2.0/24'));

@@ -83,10 +83,13 @@ def probe(host, ip, source, timeout):
         with socket.socket(family, socket.SOCK_STREAM) as raw:
             raw.settimeout(timeout)
             raw.connect((ip, 443, 0, 0) if family == socket.AF_INET6 else (ip, 443))
-            result["tcp_ms"] = round((time.monotonic() - start) * 1000)
+            tcp_done = time.monotonic()
+            result["tcp_ms"] = round((tcp_done - start) * 1000)
             result["stage"] = "TLS"
             with CONTEXT.wrap_socket(raw, server_hostname=host) as tls:
-                result["tls_ms"] = round((time.monotonic() - start) * 1000)
+                # TLS phase excludes the preceding TCP connect time.
+                tls_done = time.monotonic()
+                result["tls_ms"] = round((tls_done - tcp_done) * 1000)
                 result["stage"] = "HTTP"
                 request = ("GET / HTTP/1.1\r\nHost: " + host +
                            "\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n")
@@ -97,7 +100,9 @@ def probe(host, ip, source, timeout):
                 if len(parts) < 2 or not parts[0].startswith("HTTP/"):
                     raise ValueError("invalid HTTP status line")
                 status = int(parts[1])
-                result.update(http_status=status, total_ms=round((time.monotonic()-start)*1000),
+                http_done = time.monotonic()
+                result.update(http_status=status, ttfb_after_tls_ms=round((http_done-tls_done)*1000),
+                              total_ms=round((http_done-start)*1000),
                               ok=200 <= status < 400)
                 result["stage"] = "HTTP response"
     except (OSError, ValueError) as error:

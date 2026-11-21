@@ -19,6 +19,7 @@ class Reply(io.BytesIO):
         self.headers = Message()
         self.headers["Content-Type"] = content_type
         self.headers["X-Cache"] = "INTERNATIONAL_HIT"
+        self.headers["X-DNS-Route"] = "international"
 
 
 class ProbeTests(unittest.TestCase):
@@ -110,6 +111,32 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(result["rcode_low4"], 3)
         self.assertTrue(result["truncated"])
         self.assertEqual(result["cache"], "INTERNATIONAL_HIT")
+        self.assertEqual(result["route"], "international")
+        self.assertEqual(result["outcome"], "truncated")
+
+    def test_dns_error_is_not_reported_as_success(self):
+        for flags, expected in ((0x8182, "servfail"), (0x8183, "nxdomain"),
+                                (0x8181, "dns_error"), (0x8380, "truncated")):
+            def respond(req, timeout):
+                packet = req.data
+                return Reply(packet[:2] + struct.pack("!5H", flags, 1, 0, 0, 0) + packet[12:])
+            with patch.object(probe.urllib.request, "urlopen", side_effect=respond):
+                result = probe.dns_probe("https://example.com/ech", "example.com", 1, 1)
+            self.assertEqual(result["outcome"], expected)
+            self.assertEqual(result["addresses"], [])
+
+    def test_missing_route_and_cache_are_unknown(self):
+        def respond(req, timeout):
+            packet = req.data
+            reply = Reply(packet[:2] + struct.pack("!5H", 0x8180, 1, 0, 0, 0) + packet[12:])
+            del reply.headers["X-Cache"]
+            del reply.headers["X-DNS-Route"]
+            return reply
+        with patch.object(probe.urllib.request, "urlopen", side_effect=respond):
+            result = probe.dns_probe("https://example.com/ech", "example.com", 1, 1)
+        self.assertIsNone(result["cache"])
+        self.assertIsNone(result["route"])
+        self.assertEqual(result["outcome"], "noerror")
 
     def test_addresses(self):
         for kind, raw, expected in ((1, bytes([203, 0, 113, 7]), "203.0.113.7"),
@@ -121,6 +148,7 @@ class ProbeTests(unittest.TestCase):
             with patch.object(probe.urllib.request, "urlopen", side_effect=respond):
                 result = probe.dns_probe("https://example.com/ech", "example.com", kind, 1)
             self.assertEqual(result["addresses"], [expected])
+            self.assertEqual(result["outcome"], "noerror")
         with self.assertRaises(ValueError):
             probe.answer_addresses(b"\xc0", 0, 1, 1)
         with self.assertRaisesRegex(ValueError, "truncated DNS compression pointer"):

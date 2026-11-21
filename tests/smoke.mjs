@@ -595,7 +595,7 @@ assert.ok(autoOverseas.sent.every(x=>x.body.readUInt16BE(10)===0),
 assert.ok(autoOverseas.sent.every(x=>['dns.alidns.com','doh.pub'].includes(x.host)),
   'country metadata must not change domestic-domain upstream routing');
 const explicitOverseas=await countryWire('explicit-overseas.example.cn','US','198.51.100.123',daily+'&cnEcs=on');
-assert.ok(explicitOverseas.sent.some(x=>x.body.subarray(-11).toString('hex')==='00080007000118c63364'),
+assert.ok(explicitOverseas.sent.some(x=>x.body.subarray(-11).toString('hex')==='0008000700011800c63364'),
   'cnEcs=on must remain an explicit overseas override');
 const autoInternational=await countryWire('www.google.com','CN','192.0.2.123');
 assert.ok(autoInternational.sent.every(x=>x.body.readUInt16BE(10)===0),

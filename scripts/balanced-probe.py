@@ -111,11 +111,24 @@ def https_probe(host, timeout, address=None):
             secured = time.monotonic()
             tls.sendall(("GET / HTTP/1.1\r\nHost: " + host +
                          "\r\nConnection: close\r\n\r\n").encode("ascii"))
+            # Read the HTTP status line, not just one byte: an edge 403/503
+            # has a real TTFB but must not be mistaken for a successful page.
             first = tls.recv(1)
             received = time.monotonic()
             if not first:
                 raise ValueError("empty HTTP response")
-            return {"resolve_connect_ms": round((connected-start)*1000, 2),
+            status_line = bytearray(first)
+            while b"\r\n" not in status_line and len(status_line) < 4096:
+                chunk = tls.recv(1)
+                if not chunk:
+                    raise ValueError("incomplete HTTP status line")
+                status_line.extend(chunk)
+            status = bytes(status_line).split(b"\r\n", 1)[0].split()
+            if len(status) < 2 or not status[0].startswith(b"HTTP/") or not (
+                    len(status[1]) == 3 and status[1].isdigit()):
+                raise ValueError("invalid HTTP status line")
+            return {"http_status": int(status[1]),
+                    "resolve_connect_ms": round((connected-start)*1000, 2),
                     "tls_ms": round((secured-connected)*1000, 2),
                     "ttfb_after_tls_ms": round((received-secured)*1000, 2),
                     "total_first_byte_ms": round((received-start)*1000, 2),

@@ -156,9 +156,12 @@ function metricsSnapshot(){
 // Observe final client DNS replies once, not internal upstream attempts or the JSON console.
 async function monitoredDoH(req,injectEch,ctx,clientIP,env){
     const m=runtimeMetrics.wire,start=Date.now();m.requests++;
-    let outcome='other',cache='none';
+    let outcome='other',cache='none',route='other';
     try{
         const response=await handleDoHRequest(req,injectEch,ctx,clientIP,env);
+        // This routing label comes only from our forwarding code, never client input.
+        const taggedRoute=response.headers.get('X-DNS-Route');
+        if(['domestic','international','domestic_fallback'].includes(taggedRoute))route=taggedRoute;
         if(!response.ok){m.httpErrors++;outcome='http_error';return response;}
         if((response.headers.get('Content-Type')||'').startsWith('application/dns-message')){
             const body=await response.arrayBuffer();
@@ -176,7 +179,7 @@ async function monitoredDoH(req,injectEch,ctx,clientIP,env){
         const elapsed=Math.max(0,Date.now()-start);
         m.completed++;m.ms+=elapsed;
         // Optional native Analytics Engine binding: no network await or query identifiers.
-        try{env?.DOH_ANALYTICS?.writeDataPoint({indexes:['doh'],blobs:[outcome,cache],doubles:[elapsed]});}catch{}
+        try{env?.DOH_ANALYTICS?.writeDataPoint({indexes:['doh'],blobs:[outcome,cache,route],doubles:[elapsed]});}catch{}
     }
 }
 function balancedCacheKey(raw, prefix, p, types=[1,28]) {
@@ -225,7 +228,11 @@ function balancedCacheWrite(cache,key,packet,type,clientOpt) {
 async function forwardBalanced(rawBuffer, domain, config, clientIP) {
     const domestic=balancedDomestic(domain),group=domestic?'domestic':'international',start=Date.now(),m=runtimeMetrics.routing;
     m[group]++;
-    try{return await forwardBalancedCore(rawBuffer,domain,config,clientIP,domestic);}
+    try {
+        const response=await forwardBalancedCore(rawBuffer,domain,config,clientIP,domestic);
+        if(!response.headers.has('X-DNS-Route'))response.headers.set('X-DNS-Route',group);
+        return response;
+    }
     finally{m[group+'Completed']++;m[group+'Ms']+=Math.max(0,Date.now()-start);}
 }
 const balancedPending = new Map();
@@ -272,7 +279,7 @@ async function forwardBalancedCore(rawBuffer, domain, config, clientIP, domestic
     if (domestic && (new DataView(packet).getUint16(2) & 15) === 2) {
         runtimeMetrics.routing.fallback++;
         const fallback = await forwardQuery(rawBuffer, BALANCED_INTL_WIRE,preferRecord);
-        return dnsResponse(await fallback.arrayBuffer());
+        return dnsResponse(await fallback.arrayBuffer(),{'X-DNS-Route':'domestic_fallback'});
     }
     // Do not cache a no-ECS retry under a personalized ECS key, or an international fallback.
     if(!ecs)balancedCacheWrite(cache,key,packet,type,clientOpt);

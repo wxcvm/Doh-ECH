@@ -172,6 +172,42 @@ class ProbeTests(unittest.TestCase):
                 result = probe.measure(probe.dns_probe, "https://example.com/ech", "example.com", 1, 1)
             self.assertIn("error", result)
 
+    def test_https_probe_reports_http_status_without_conflating_ttfb(self):
+        class FakeTLS:
+            def __init__(self, reply):
+                self.reply = iter(reply)
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+            def sendall(self, data):
+                self.sent = data
+            def recv(self, count):
+                return next(self.reply, b"")
+            def getpeername(self):
+                return ("203.0.113.7", 443)
+        class FakeRaw:
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+        class FakeContext:
+            def __init__(self, reply):
+                self.reply = reply
+            def wrap_socket(self, raw, server_hostname):
+                self.hostname = server_hostname
+                return FakeTLS(self.reply)
+        for line, expected in ((b"HTTP/1.1 200 OK\\r\\n", 200),
+                               (b"HTTP/1.1 503 Unavailable\\r\\n", 503)):
+            with patch.object(probe.socket, "create_connection", return_value=FakeRaw()), \\
+                 patch.object(probe.ssl, "create_default_context", return_value=FakeContext(line)):
+                result = probe.https_probe("example.com", 1)
+            self.assertEqual(result["http_status"], expected)
+            self.assertIn("ttfb_after_tls_ms", result)
+        with patch.object(probe.socket, "create_connection", return_value=FakeRaw()), \\
+             patch.object(probe.ssl, "create_default_context", return_value=FakeContext(b"BAD\\r\\n")):
+            self.assertIn("error", probe.measure(probe.https_probe, "example.com", 1))
+
     def test_timeout(self):
         with patch.object(probe.urllib.request, "urlopen", side_effect=TimeoutError("timeout")):
             self.assertEqual(probe.measure(probe.dns_probe, "https://example.com/ech", "example.com", 1, 1), {"error": "timeout"})

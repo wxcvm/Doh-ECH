@@ -813,6 +813,29 @@ binaryReplyOverride=q=>{
 quality=await cacheReq(daily,allTruncated);
 assert.equal(quality.packet.readUInt16BE(2)&15,2);
 assert.equal(attempts,4);
+// Non-cacheable DNS types must also reject TC=1 and retry the other resolver.
+const txtQuery=question('quality-truncated-txt.example.com',16);
+attempts=0;
+binaryReplyOverride=q=>{
+  const p=Buffer.from(q);
+  p.writeUInt16BE(attempts++===0?0x8380:0x8180,2);
+  return p;
+};
+const txtResult=await cacheReq(daily,txtQuery);
+assert.equal(attempts,2);
+assert.equal(txtResult.packet.readUInt16BE(2)&0x0200,0);
+assert.equal(txtResult.packet.readUInt16BE(2)&15,0);
+assert.equal(txtResult.hit,null);
+const allTxtTruncated=question('quality-all-truncated-txt.example.com',16);
+attempts=0;
+binaryReplyOverride=q=>{
+  attempts++;
+  const p=Buffer.from(q);p.writeUInt16BE(0x8380,2);return p;
+};
+const txtFailure=await cacheReq(daily,allTxtTruncated);
+assert.equal(attempts,2);
+assert.equal(txtFailure.packet.readUInt16BE(2)&15,2);
+assert.equal(txtFailure.packet.readUInt16BE(2)&0x0200,0);
 // International balanced A/AAAA uses a separate native positive cache without ECS injection.
 const intlBase=question('cache-international.example.com',1);
 const intlQuery=Buffer.concat([intlBase,ednsPlain.subarray(-11)]);intlQuery.writeUInt16BE(1,10);

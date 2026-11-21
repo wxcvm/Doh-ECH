@@ -81,7 +81,7 @@ def dns_probe(url, host, kind, timeout, method="POST"):
     if len(data) < 12 or data[:2] != packet[:2]:
         raise ValueError("invalid DNS response")
     _, flags, qd, an, _, _ = struct.unpack("!6H", data[:12])
-    if not flags & 0x8000 or qd != 1 or data[12:len(packet)] != packet[12:]:
+    if not flags & 0x8000 or (flags & 0x7800) or qd != 1 or data[12:len(packet)] != packet[12:]:
         raise ValueError("DNS question mismatch")
     # A successful HTTP request can still carry SERVFAIL, NXDOMAIN or a truncated DNS
     # reply. Preserve the actual outcome instead of counting it as a fast DNS success.
@@ -89,7 +89,7 @@ def dns_probe(url, host, kind, timeout, method="POST"):
     if flags & 0x200:
         outcome = "truncated"
     elif rcode == 0:
-        outcome = "noerror"
+        outcome = "noerror" if an else "nodata"
     elif rcode == 3:
         outcome = "nxdomain"
     elif rcode == 2:
@@ -177,7 +177,7 @@ def main():
                              **measure(https_probe, host, args.timeout, address)})
         if not args.dns_only:
             rows.append({"host": host, "type": "system_https", **measure(https_probe, host, args.timeout)})
-    print(json.dumps({"method": args.method, "note": "First query is not guaranteed cold; X-Cache identifies observed hits. DNS latency alone is not proof of DNS success: inspect outcome, rcode_low4 and truncated, and treat missing cache/route headers as unknown rather than misses. Optional baseline queries are interleaved, not identical cache or network conditions, and may differ in ECS/ECH policy. HTTPS uses system DNS, not necessarily tested DoH. Optional doh_https connects to a target-returned address with original hostname/SNI and certificate verification; no ECH verification.", "samples": rows}, indent=2))
+    print(json.dumps({"method": args.method, "note": "First query is not guaranteed cold; X-Cache identifies observed hits. DNS latency alone is not proof of DNS success: inspect outcome (including nodata for NOERROR with no answer), rcode_low4 and truncated, and treat missing cache/route headers as unknown rather than misses. Optional baseline queries are interleaved, not identical cache or network conditions, and may differ in ECS/ECH policy. HTTPS uses system DNS, not necessarily tested DoH. Optional doh_https connects to a target-returned address with original hostname/SNI and certificate verification; no ECH verification.", "samples": rows}, indent=2))
 
 
 if __name__ == "__main__":

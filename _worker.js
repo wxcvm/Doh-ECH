@@ -2415,7 +2415,10 @@ async function forwardQuery(body, upstreams = UPSTREAM_DNS_LIST, preferRecord = 
             // A partial packet or an EDNS extended error is not a usable address
             // answer. Mark it failed so the normal resolver/fallback path can recover.
             const code=(reply.flags&15)|((reply.opt?.ttl>>>24)<<4);
-            if(preferRecord && ((reply.flags&0x0200) || ![0,3].includes(code))) {
+            // DoH uses reliable transport: a truncated DNS response is never
+            // a complete answer, including TXT/MX/DNSSEC and other uncached types.
+            // Retry another upstream rather than returning TC=1 to AdGuard.
+            if((reply.flags&0x0200) || (preferRecord && ![0,3].includes(code))) {
                 throw new Error('incomplete or erroneous DNS record reply');
             }
             // Validate injected ECS before selecting a winner; an incompatible

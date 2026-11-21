@@ -197,15 +197,15 @@ class ProbeTests(unittest.TestCase):
             def wrap_socket(self, raw, server_hostname):
                 self.hostname = server_hostname
                 return FakeTLS(self.reply)
-        for line, expected in ((b"HTTP/1.1 200 OK\\r\\n", 200),
-                               (b"HTTP/1.1 503 Unavailable\\r\\n", 503)):
-            with patch.object(probe.socket, "create_connection", return_value=FakeRaw()), \\
+        for line, expected in ((b"HTTP/1.1 200 OK\r\n", 200),
+                               (b"HTTP/1.1 503 Unavailable\r\n", 503)):
+            with patch.object(probe.socket, "create_connection", return_value=FakeRaw()), \
                  patch.object(probe.ssl, "create_default_context", return_value=FakeContext(line)):
                 result = probe.https_probe("example.com", 1)
             self.assertEqual(result["http_status"], expected)
             self.assertIn("ttfb_after_tls_ms", result)
-        with patch.object(probe.socket, "create_connection", return_value=FakeRaw()), \\
-             patch.object(probe.ssl, "create_default_context", return_value=FakeContext(b"BAD\\r\\n")):
+        with patch.object(probe.socket, "create_connection", return_value=FakeRaw()), \
+             patch.object(probe.ssl, "create_default_context", return_value=FakeContext(b"BAD\r\n")):
             self.assertIn("error", probe.measure(probe.https_probe, "example.com", 1))
 
     def test_timeout(self):

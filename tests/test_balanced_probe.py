@@ -183,7 +183,10 @@ class ProbeTests(unittest.TestCase):
             def sendall(self, data):
                 self.sent = data
             def recv(self, count):
-                return next(self.reply, b"")
+                try:
+                    return bytes([next(self.reply)])
+                except StopIteration:
+                    return b""
             def getpeername(self):
                 return ("203.0.113.7", 443)
         class FakeRaw:

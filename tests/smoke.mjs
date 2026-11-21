@@ -681,10 +681,27 @@ await request('/doh',{method:'POST',headers:{'Content-Type':'application/dns-mes
 await request('/doh?dns=AA',{},analyticsEnv);
 assert.equal(points.length,2);
 assert.deepEqual(points[0].indexes,['doh']);
-assert.deepEqual(points[0].blobs,['0','none']);
-assert.deepEqual(points[1].blobs,['http_error','none']);
+assert.deepEqual(points[0].blobs,['0','none','other']);
+assert.deepEqual(points[1].blobs,['http_error','none','other']);
 assert.ok(points.every(p=>p.doubles.length===1&&p.doubles[0]>=0));
 assert.ok(!JSON.stringify(points).includes('analytics.example'));
+// The optional global write records routes, including safe international fallback.
+const metricOpts={method:'POST',headers:{'Content-Type':'application/dns-message'}};
+const domesticMetric=await request('/ech?enhance=balanced',
+  {...metricOpts,body:question('analytics-domestic.example.cn')},analyticsEnv);
+assert.equal(domesticMetric.headers.get('X-DNS-Route'),'domestic');
+const internationalMetric=await request('/ech?enhance=balanced',
+  {...metricOpts,body:question('analytics-international.example.com')},analyticsEnv);
+assert.equal(internationalMetric.headers.get('X-DNS-Route'),'international');
+domesticWireOutage=true;
+const fallbackMetric=await request('/ech?enhance=balanced',
+  {...metricOpts,body:question('analytics-fallback.example.cn')},analyticsEnv);
+domesticWireOutage=false;
+assert.equal(fallbackMetric.headers.get('X-DNS-Route'),'domestic_fallback');
+assert.equal(points.length,5);
+assert.deepEqual(points.slice(2).map(p=>p.blobs[2]),['domestic','international','domestic_fallback']);
+assert.ok(points.every(p=>p.blobs.length===3));
+assert.ok(!JSON.stringify(points).includes('analytics-domestic.example.cn'));
 const failedAnalytics={...admin,DOH_ANALYTICS:{writeDataPoint(){throw new Error('analytics unavailable');}}};
 assert.equal((await request('/doh',{method:'POST',headers:{'Content-Type':'application/dns-message'},body:question('analytics.example')},failedAnalytics)).status,200);
 // Empty EDNS0 queries get a distinct cache entry; OPT flags are never aged.

@@ -101,6 +101,7 @@ class ProbeTests(unittest.TestCase):
             for method in ("POST", "GET"):
                 result = probe.dns_probe("https://example.com/ech?enhance=balanced", "example.com", 1, 1, method)
                 self.assertEqual(result["rcode_low4"], 0)
+                self.assertEqual(result["outcome"], "nodata")
 
     def test_response(self):
         def respond(req, timeout):
@@ -125,6 +126,15 @@ class ProbeTests(unittest.TestCase):
             self.assertEqual(result["outcome"], expected)
             self.assertEqual(result["addresses"], [])
 
+    def test_reject_non_query_opcode_even_with_matching_question(self):
+        def respond(req, timeout):
+            packet = req.data
+            # Opcode=2 is not a standard query response.
+            return Reply(packet[:2] + struct.pack("!5H", 0x9180, 1, 0, 0, 0) + packet[12:])
+        with patch.object(probe.urllib.request, "urlopen", side_effect=respond):
+            result = probe.measure(probe.dns_probe, "https://example.com/ech", "example.com", 1, 1)
+        self.assertIn("error", result)
+
     def test_missing_route_and_cache_are_unknown(self):
         def respond(req, timeout):
             packet = req.data
@@ -136,7 +146,7 @@ class ProbeTests(unittest.TestCase):
             result = probe.dns_probe("https://example.com/ech", "example.com", 1, 1)
         self.assertIsNone(result["cache"])
         self.assertIsNone(result["route"])
-        self.assertEqual(result["outcome"], "noerror")
+        self.assertEqual(result["outcome"], "nodata")
 
     def test_addresses(self):
         for kind, raw, expected in ((1, bytes([203, 0, 113, 7]), "203.0.113.7"),

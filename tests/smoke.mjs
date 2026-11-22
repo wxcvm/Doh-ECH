@@ -1002,6 +1002,29 @@ const ecsRaceAfter=(await monitor()).ecs;
 assert.equal(ecsRaceAfter.wireAccepted-ecsRaceBefore.wireAccepted,1);
 assert.equal(ecsRaceAfter.wireRetries-ecsRaceBefore.wireRetries,0);
 binaryReplyOverride=null;
+// Upstreams must echo DNS-0x20 question casing exactly, including on the ECS path.
+// The first resolver rewrites one label's case: it cannot win merely because
+// its case-folded name and answer type are otherwise valid.
+for(const [name,params] of [
+  ['MiXeD-Case.qa.example.cn',daily+'&cnEcs=on&clientIp=192.0.2.123'],
+  ['MiXeD-Case.qa.example.com',daily]
+]) {
+  const mixed=question(name,1);
+  let caseAttempts=0;
+  binaryReplyOverride=q=>{
+    const reply=addressReply(q,mixed.length);
+    if(caseAttempts++===0)reply[13]='m'.charCodeAt(0);
+    return reply;
+  };
+  const outcome=await cacheReq(params,mixed);
+  assert.equal(caseAttempts,2,'retry a case-changing resolver before accepting the answer');
+  assert.equal(outcome.packet.readUInt16BE(0),mixed.readUInt16BE(0));
+  assert.deepEqual(outcome.packet.subarray(12,mixed.length),mixed.subarray(12),
+    'upstream reply must preserve the original DNS-0x20 question');
+  assert.equal(outcome.packet.readUInt16BE(6),1);
+  assert.equal(outcome.packet.readUInt16BE(10),0,'injected ECS OPT is not leaked');
+}
+binaryReplyOverride=null;
 // Extended RCODE failures must retry for uncached TXT/MX as well as A records.
 // A healthy second upstream must win without changing EDNS bytes or transaction ID.
 for (const type of [16,15]) {

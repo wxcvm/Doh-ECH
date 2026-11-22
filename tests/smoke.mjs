@@ -901,7 +901,8 @@ Date.now=realNow;
 assert.equal(intlHit.hit,'INTERNATIONAL_HIT');
 assert.equal(wireBodies.length,intlStart);
 assert.equal(intlHit.packet.readUInt16BE(0),0x4567);
-assert.equal(intlHit.packet.readUInt32BE(intlBase.length+6),55);
+assert.ok([54,55].includes(intlHit.packet.readUInt32BE(intlBase.length+6)),
+  'cache TTL must age conservatively across the 5-second offset and subsecond execution time');
 assert.deepEqual(intlHit.packet.subarray(-11),intlQuery.subarray(-11));
 Date.now=()=>realNow()-120000;
 const rollbackInternational=await cacheReq(daily+'&cnEcs=on&clientIp=198.51.100.123',intlId);

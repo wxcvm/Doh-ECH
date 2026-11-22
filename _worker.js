@@ -2412,13 +2412,13 @@ async function forwardQuery(body, upstreams = UPSTREAM_DNS_LIST, preferRecord = 
                     question.qclass !== parsedQuery.questions[i].qclass)) {
                 throw new Error('invalid DNS reply or SERVFAIL');
             }
-            // A partial packet or an EDNS extended error is not a usable address
-            // answer. Mark it failed so the normal resolver/fallback path can recover.
+            // A truncated packet or extended DNS RCODE is not a usable reply for
+            // any type (including TXT/MX). Retry another resolver instead.
             const code=(reply.flags&15)|((reply.opt?.ttl>>>24)<<4);
             // DoH uses reliable transport: a truncated DNS response is never
             // a complete answer, including TXT/MX/DNSSEC and other uncached types.
             // Retry another upstream rather than returning TC=1 to AdGuard.
-            if((reply.flags&0x0200) || (preferRecord && ![0,3].includes(code))) {
+            if((reply.flags&0x0200) || ![0,3].includes(code)) {
                 throw new Error('incomplete or erroneous DNS record reply');
             }
             // Validate injected ECS before selecting a winner; an incompatible

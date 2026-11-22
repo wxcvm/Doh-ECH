@@ -942,21 +942,44 @@ const ecsRaceAfter=(await monitor()).ecs;
 assert.equal(ecsRaceAfter.wireAccepted-ecsRaceBefore.wireAccepted,1);
 assert.equal(ecsRaceAfter.wireRetries-ecsRaceBefore.wireRetries,0);
 binaryReplyOverride=null;
-// Pure forwarding preserves extended RCODEs; monitoring must not count BADVERS as NOERROR.
-const monitorBase=question('monitor-badvers.example.com',1);
+// Extended RCODE failures must retry for uncached TXT/MX as well as A records.
+// A healthy second upstream must win without changing EDNS bytes or transaction ID.
+for (const type of [16,15]) {
+  const base=question('badvers-retry-'+type+'.example.com',type);
+  const query=Buffer.concat([base,ednsPlain.subarray(-11)]);
+  query.writeUInt16BE(1,10);
+  let seen=0;
+  binaryReplyOverride=q=>{
+    const p=Buffer.from(q);
+    p.writeUInt16BE(0x8180,2);
+    if(seen++===0)p.writeUInt32BE(0x01000000,p.length-6);
+    return p;
+  };
+  const result=await request('/doh',{method:'POST',headers:{'Content-Type':'application/dns-message'},body:query});
+  const packet=Buffer.from(await result.arrayBuffer());
+  assert.equal(seen,2,'extended RCODE must trigger a second upstream');
+  assert.equal(packet.readUInt16BE(0),query.readUInt16BE(0));
+  assert.equal(packet.readUInt16BE(2)&15,0);
+  assert.equal(packet.readUInt16BE(10),1);
+  assert.deepEqual(packet.subarray(12),query.subarray(12));
+}
+// When every upstream returns BADVERS, reply SERVFAIL rather than accepting BADVERS.
+const monitorBase=question('monitor-badvers.example.com',16);
 const monitorQuery=Buffer.concat([monitorBase,ednsPlain.subarray(-11)]);
 monitorQuery.writeUInt16BE(1,10);
 const monitorBefore=(await monitor()).wire.rcode;
 binaryReplyOverride=q=>{
-  const p=addressReply(q,monitorBase.length,0,false);
+  const p=Buffer.from(q);
+  p.writeUInt16BE(0x8180,2);
   p.writeUInt32BE(0x01000000,p.length-6);
   return p;
 };
 const monitorReply=await request('/doh',{method:'POST',headers:{'Content-Type':'application/dns-message'},body:monitorQuery});
-assert.equal(Buffer.from(await monitorReply.arrayBuffer()).readUInt32BE(monitorQuery.length-6),0x01000000);
+const monitorPacket=Buffer.from(await monitorReply.arrayBuffer());
+assert.equal(monitorPacket.readUInt16BE(0),monitorQuery.readUInt16BE(0));
+assert.equal(monitorPacket.readUInt16BE(2)&15,2);
 const monitorAfter=(await monitor()).wire.rcode;
-assert.equal((monitorAfter['16']||0)-(monitorBefore['16']||0),1);
-assert.equal((monitorAfter['0']||0)-(monitorBefore['0']||0),0);
+assert.equal((monitorAfter['16']||0)-(monitorBefore['16']||0),0);
 binaryReplyOverride=null;
 // Keep hot entries through capacity pressure without extending their original TTL.
 const lruHot=question('lru-hot.example.com',1);

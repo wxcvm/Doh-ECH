@@ -24,5 +24,7 @@ jobs:
         run: node --experimental-default-type=module --check _worker.js
       - name: Run no-network DoH smoke tests
         run: node --experimental-default-type=module tests/smoke.mjs
+      - name: Validate Balanced benchmark CLI
+        run: node tests/benchmark-cli.mjs
       - name: Test local direct probe
         run: python3 tests/test_direct_probe.py

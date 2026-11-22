@@ -2422,6 +2422,17 @@ async function forwardQuery(body, upstreams = UPSTREAM_DNS_LIST, preferRecord = 
                     question.qclass !== parsedQuery.questions[i].qclass)) {
                 throw new Error('invalid DNS reply or SERVFAIL');
             }
+            // DNS-0x20 clients validate the exact question casing. A resolver that
+            // rewrites the question to lowercase must not win even though DNS
+            // name matching is case-insensitive; try another upstream instead.
+            // Only the one-question, uncompressed form can be compared byte-for-byte.
+            if(parsedQuery.questions.length===1 && !parsedQuery.questions[0].compressed) {
+                const originalQuestion=query.subarray(12,parsedQuery.questionEnd);
+                const echoedQuestion=new Uint8Array(packet).subarray(12,reply.questionEnd);
+                if(reply.questions[0].compressed || echoedQuestion.length!==originalQuestion.length ||
+                   !originalQuestion.every((b,i)=>b===echoedQuestion[i]))
+                    throw new Error('upstream changed DNS question casing or bytes');
+            }
             // A truncated packet or extended DNS RCODE is not a usable reply for
             // any type (including TXT/MX). Retry another resolver instead.
             const code=(reply.flags&15)|((reply.opt?.ttl>>>24)<<4);

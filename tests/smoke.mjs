@@ -862,6 +862,13 @@ assert.ok(wireBodies.length>intlStart);
 assert.ok(wireBodies.slice(intlStart).every(x=>['cloudflare-dns.com','dns.google'].includes(x.host)&&x.body.equals(intlQuery)));
 intlStart=wireBodies.length;
 const intlId=Buffer.from(intlQuery);intlId.writeUInt16BE(0x4567,0);
+// Subsecond cache hits must not return the full original TTL to downstream caches.
+Date.now=()=>realNow()+900;
+const intlSubsecond=await cacheReq(daily,intlId);
+Date.now=realNow;
+assert.equal(intlSubsecond.hit,'INTERNATIONAL_HIT');
+assert.equal(intlSubsecond.packet.readUInt32BE(intlBase.length+6),59);
+assert.equal(wireBodies.length,intlStart);
 Date.now=()=>realNow()+5000;
 const intlHit=await cacheReq(daily+'&cnEcs=on&clientIp=198.51.100.123',intlId);
 Date.now=realNow;
@@ -881,7 +888,7 @@ const intlDo=Buffer.from(intlQuery);intlDo.writeUInt16BE(0x8000,intlQuery.length
 assert.equal((await cacheReq(daily,intlDo)).hit,null);
 assert.equal((await cacheReq(daily,intlDo)).hit,null);
 const intlMetricsAfter=(await monitor()).cache.international;
-assert.equal(intlMetricsAfter.hits-intlMetricsBefore.hits,2);
+assert.equal(intlMetricsAfter.hits-intlMetricsBefore.hits,3);
 assert.equal(intlMetricsAfter.misses-intlMetricsBefore.misses,2);
 assert.equal(intlMetricsAfter.bypasses-intlMetricsBefore.bypasses,2);
 const intlNegative=question('cache-negative.example.com',1);

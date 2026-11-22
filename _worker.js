@@ -2468,8 +2468,10 @@ async function forwardQuery(body, upstreams = UPSTREAM_DNS_LIST, preferRecord = 
         const output = preserveQuestion ? query.slice(0, parsedQuery.questionEnd) : new Uint8Array(12);
         if (!preserveQuestion) output.set(query.subarray(0, Math.min(2, query.byteLength)), 0);
         const view = new DataView(output.buffer);
-        const requestedRd = query.byteLength > 3 && (query[2] & 1) ? 0x0100 : 0;
-        view.setUint16(2, 0x8082 | requestedRd);
+        // Preserve the caller's RD and DNSSEC Checking Disabled (CD) flags.
+        // A locally synthesized SERVFAIL must not silently change CD semantics.
+        const requestFlags = query.byteLength >= 4 ? new DataView(query.buffer,query.byteOffset,query.byteLength).getUint16(2) : 0;
+        view.setUint16(2, 0x8082 | (requestFlags & 0x0110));
         view.setUint16(4, preserveQuestion ? 1 : 0);
         view.setUint16(6, 0); view.setUint16(8, 0); view.setUint16(10, 0);
         return new Response(output.buffer, {

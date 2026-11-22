@@ -746,7 +746,7 @@ const ednsHit=await cacheReq(daily,ednsId);
 Date.now=realNow;
 assert.equal(ednsHit.hit,'DOMESTIC_HIT');
 assert.equal(ednsHit.packet.readUInt16BE(0),0x5678);
-assert.equal(ednsHit.packet.readUInt32BE(ednsBase.length+6),55);
+assert.ok([54,55].includes(ednsHit.packet.readUInt32BE(ednsBase.length+6)), 'EDNS cached TTL accounts for fractional elapsed time');
 assert.deepEqual(ednsHit.packet.subarray(-11),ednsPlain.subarray(-11));
 assert.equal((await cacheReq(daily,ednsBase)).hit,null,'plain query separate from EDNS');
 const otherPayload=Buffer.from(ednsPlain);otherPayload.writeUInt16BE(4096,ednsBase.length+3);

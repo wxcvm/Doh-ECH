@@ -496,6 +496,15 @@ assert.equal((await apiAnswer('www.google.com','HTTPS',xh3)).policy,'native-dire
 assert.equal((await apiAnswer('x.com','HTTPS','enhance=direct')).policy,'native-direct');
 assert.equal((await apiAnswer('x.com','HTTPS','enhance=direct&xh3=bad')).policy,'native-direct');
 assert.equal((await apiAnswer('x.com','HTTPS','enhance=off&xh3=172.66.0.227')).policy,undefined);
+// Only Internet-class questions may enter the Balanced positive cache.
+// Other DNS classes must retain their original wire semantics and never reuse a positive IN cache.
+const nonInternetQuery = question('non-in-class.example',1,{qclass:3});
+for(let i=0;i<2;i++) {
+  const nonInternetReply=await request('/ech?enhance=balanced',{
+    method:'POST',headers:{'Content-Type':'application/dns-message'},body:nonInternetQuery
+  });
+  assert.equal(nonInternetReply.headers.get('X-Cache'),null,'non-IN question must bypass positive cache');
+}
 // Balanced daily mode preserves complete native responses and routing.
 const daily='enhance=balanced';
 const wireCalls = () => calls.filter(u=>u.endsWith('/dns-query'));

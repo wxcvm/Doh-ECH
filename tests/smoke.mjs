@@ -904,19 +904,21 @@ assert.equal(intlHit.packet.readUInt16BE(0),0x4567);
 assert.ok([54,55].includes(intlHit.packet.readUInt32BE(intlBase.length+6)),
   'cache TTL must age conservatively across the 5-second offset and subsecond execution time');
 assert.deepEqual(intlHit.packet.subarray(-11),intlQuery.subarray(-11));
+// A clock rollback must invalidate the entry, not restore its original TTL.
+// The next request re-resolves and a subsequent normal-clock request can hit.
 Date.now=()=>realNow()-120000;
 const rollbackInternational=await cacheReq(daily+'&cnEcs=on&clientIp=198.51.100.123',intlId);
 Date.now=realNow;
-assert.equal(rollbackInternational.hit,'INTERNATIONAL_HIT');
-assert.equal(rollbackInternational.packet.readUInt32BE(intlBase.length+6),60);
+assert.equal(rollbackInternational.hit,null);
 assert.equal(rollbackInternational.packet.readUInt16BE(0),0x4567);
+assert.equal((await cacheReq(daily,intlId)).hit,null);
 assert.equal((await cacheReq(daily,intlBase)).hit,null);
 const intlDo=Buffer.from(intlQuery);intlDo.writeUInt16BE(0x8000,intlQuery.length-4);
 assert.equal((await cacheReq(daily,intlDo)).hit,null);
 assert.equal((await cacheReq(daily,intlDo)).hit,null);
 const intlMetricsAfter=(await monitor()).cache.international;
-assert.equal(intlMetricsAfter.hits-intlMetricsBefore.hits,3);
-assert.equal(intlMetricsAfter.misses-intlMetricsBefore.misses,2);
+assert.equal(intlMetricsAfter.hits-intlMetricsBefore.hits,2);
+assert.equal(intlMetricsAfter.misses-intlMetricsBefore.misses,4);
 assert.equal(intlMetricsAfter.bypasses-intlMetricsBefore.bypasses,2);
 const intlNegative=question('cache-negative.example.com',1);
 binaryReplyOverride=q=>addressReply(q,intlNegative.length,3,false);

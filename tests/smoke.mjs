@@ -653,7 +653,8 @@ Date.now=realNow;
 assert.equal(hitCache.hit,'DOMESTIC_HIT');
 assert.equal(wireBodies.length,cacheStart);
 assert.equal(hitCache.packet.readUInt16BE(0),0x9876);
-assert.equal(hitCache.packet.readUInt32BE(cacheQuestion.length+6),55);
+// The mocked 5s advance plus real elapsed milliseconds conservatively ages TTL by 5–6s.
+assert.ok([54,55].includes(hitCache.packet.readUInt32BE(cacheQuestion.length+6)));
 // Clock rollback must never increase the DNS TTL beyond the upstream value.
 Date.now=()=>realNow()-120000;
 const rollbackDomestic=await cacheReq(daily,changedId);

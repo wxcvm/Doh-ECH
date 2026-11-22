@@ -197,11 +197,11 @@ function balancedCacheKey(raw, prefix, p, types=[1,28]) {
 function balancedCacheRead(cache,key,id) {
     const entry=cache.get(key);
     if(!entry)return null;
-    // Isolate clocks can move backwards after a time correction. Never add
-    // seconds to upstream TTLs: a rollback is not extra DNS cache lifetime.
-    // Never round elapsed time down: returning an unaged TTL during the
-    // first partial second would extend downstream cache lifetime.
-    const elapsed=Math.max(0,Date.now()-entry.stored);
+    // A clock rollback makes the entry's age unknowable. Evict rather than
+    // granting a fresh TTL to a potentially stale upstream answer.
+    const elapsed=Date.now()-entry.stored;
+    if(elapsed<0){cache.delete(key);return null;}
+    // Round partial seconds up to avoid extending downstream cache lifetime.
     const age=Math.ceil(elapsed/1000);
     if(age>=entry.ttl){cache.delete(key);return null;}
     // Refresh recency without extending the DNS TTL.

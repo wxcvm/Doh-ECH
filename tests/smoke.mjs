@@ -925,6 +925,7 @@ releaseFirst();
 const firstFinished=await firstPending;
 assert.equal(firstFinished.packet.readUInt16BE(2)&15,3);
 const thirdPending=cacheReq(daily,pendingRaceThird);
+await new Promise(resolve=>setTimeout(resolve,5));
 releaseSecond();
 const [secondFinished,thirdFinished]=await Promise.all([secondPending,thirdPending]);
 assert.equal(secondFinished.packet.readUInt16BE(0),0x9876);

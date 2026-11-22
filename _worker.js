@@ -258,8 +258,9 @@ async function forwardBalancedCore(rawBuffer, domain, config, clientIP, domestic
     const c=runtimeMetrics.cache[domestic?'domestic':'international'];
     if(!key)c.bypasses++;else if(hit)c.hits++;else c.misses++;
     if(hit)return dnsResponse(hit,{'X-Cache':domestic?'DOMESTIC_HIT':'INTERNATIONAL_HIT'});
-    const owner=pendingKey && !balancedPending.has(pendingKey);
-    if(owner)balancedPending.set(pendingKey,true);
+    // Track every active upstream attempt, including callers that timed out waiting.
+    // Otherwise the first caller can clear the marker while a second is still fetching.
+    if(pendingKey)balancedPending.set(pendingKey,(balancedPending.get(pendingKey)||0)+1);
     try {
     // Native HTTPS records need complete replies; only ordinary international queries are cacheable.
     const preferRecord=!!key || !!balancedCacheKey(rawBuffer,'none',parsed,[65]);
@@ -286,7 +287,13 @@ async function forwardBalancedCore(rawBuffer, domain, config, clientIP, domestic
     // Do not cache a no-ECS retry under a personalized ECS key, or an international fallback.
     if(!ecs)balancedCacheWrite(cache,key,packet,type,clientOpt);
     return dnsResponse(packet);
-    } finally {if(owner)balancedPending.delete(pendingKey);}
+    } finally {
+        if(pendingKey) {
+            const remaining=balancedPending.get(pendingKey)-1;
+            if(remaining>0)balancedPending.set(pendingKey,remaining);
+            else balancedPending.delete(pendingKey);
+        }
+    }
 }
 const DIRECT_JSON = ["https://cloudflare-dns.com/dns-query"];
 const DIRECT_WIRE = ["https://cloudflare-dns.com/dns-query"];

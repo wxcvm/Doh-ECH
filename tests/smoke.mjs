@@ -860,6 +860,22 @@ const txtFailure=await cacheReq(daily,allTxtTruncated);
 assert.equal(attempts,2);
 assert.equal(txtFailure.packet.readUInt16BE(2)&15,2);
 assert.equal(txtFailure.packet.readUInt16BE(2)&0x0200,0);
+// When both resolvers fail, a synthetic SERVFAIL must retain the DNSSEC CD bit
+// as well as RD, without copying upstream AD/TC or changing the transaction ID.
+const cdFailureQuery=question('quality-cd-servfail.example.com',16);
+cdFailureQuery.writeUInt16BE(cdFailureQuery.readUInt16BE(2)|0x0010,2);
+attempts=0;
+binaryReplyOverride=q=>{
+  attempts++;
+  const p=Buffer.from(q);p.writeUInt16BE(0x8380,2);return p;
+};
+const cdFailure=await cacheReq(daily,cdFailureQuery);
+assert.equal(attempts,2);
+assert.equal(cdFailure.packet.readUInt16BE(0),cdFailureQuery.readUInt16BE(0));
+assert.equal(cdFailure.packet.readUInt16BE(2)&0x011f,0x0112,
+  'synthetic SERVFAIL retains RD and CD while reporting RCODE=2');
+assert.equal(cdFailure.packet.readUInt16BE(2)&0x0220,0,
+  'synthetic SERVFAIL must not claim TC or AD');
 // International balanced A/AAAA uses a separate native positive cache without ECS injection.
 const intlBase=question('cache-international.example.com',1);
 const intlQuery=Buffer.concat([intlBase,ednsPlain.subarray(-11)]);intlQuery.writeUInt16BE(1,10);

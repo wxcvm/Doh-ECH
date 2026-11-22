@@ -84,4 +84,4 @@ for(const name of domains) {
   output.results.push({domain:name,dnsByType,...(dns?{dnsFirstObserved:dns.firstObserved,dnsSubsequent:dns.subsequent}:{}),tls:tlsSamples,ttfb:ttfbSamples});
 }
 console.log(JSON.stringify(output,null,2));
-if(output.results.some(r=>Object.values(r.dnsByType).some(t=>t.firstObserved.error)))process.exitCode=1;
+if(output.results.some(r=>Object.values(r.dnsByType).some(t=>[t.firstObserved,...t.subsequent].some(sample=>sample.error))))process.exitCode=1;

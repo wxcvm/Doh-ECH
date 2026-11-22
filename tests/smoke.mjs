@@ -10,6 +10,7 @@ let domesticWireOutage = false;
 const wireBodies = [];
 let ecsReject = false;
 let ecsMismatch = false;
+let pendingRaceGate = null;
 globalThis.caches = {
   default: {
     async match(key) { return cache.get(key instanceof Request ? key.url : String(key))?.clone() || undefined; },
@@ -32,6 +33,19 @@ globalThis.fetch = async (input, init = {}) => {
     if(ecsReject && hasInjected) return new Response('no ECS',{status:503});
     if(ecsMismatch && hasInjected) {const reply=Buffer.from(incoming);reply.writeUInt16BE(0x8180,2);reply[reply.length-1]^=1;return new Response(reply,{headers:{'Content-Type':'application/dns-message'}});}
     if (simulateBinaryOutage || (domesticWireOutage && ['dns.alidns.com','doh.pub'].includes(url.hostname))) return new Response('temporarily unavailable', { status: 503 });
+    if (pendingRaceGate && incoming.includes(Buffer.from('pending-race'))) {
+      const id=incoming.readUInt16BE(0);
+      if(id===0x1234) {
+        await pendingRaceGate.first;
+        return new Response(addressReply(incoming,incoming.length,3,false),{headers:{'Content-Type':'application/dns-message'}});
+      }
+      if(id===0x9876) {
+        pendingRaceGate.secondStarted();
+        await pendingRaceGate.second;
+        return new Response(addressReply(incoming,incoming.length),{headers:{'Content-Type':'application/dns-message'}});
+      }
+      throw new Error('Third equivalent request must reuse the pending positive cache');
+    }
     if (binaryReplyOverride) {
       return new Response(binaryReplyOverride(Buffer.from(incoming)), {
         headers: { 'Content-Type': 'application/dns-message' }
@@ -892,6 +906,31 @@ const negativeStart=wireBodies.length;
 const negativePair=await Promise.all([cacheReq(daily,coalesceNegative),cacheReq(daily,coalesceNegativeOther)]);
 assert.ok(negativePair.every(x=>x.hit===null && (x.packet.readUInt16BE(2)&15)===3));
 assert.ok(wireBodies.slice(negativeStart).some(x=>x.body.readUInt16BE(0)===0x9876));
+// A timed-out waiter remains an active upstream owner after the original finishes.
+// A third caller must wait for its positive cache instead of launching another fetch.
+const pendingRaceBase=question('pending-race.example.com',1);
+const pendingRaceSecond=Buffer.from(pendingRaceBase);pendingRaceSecond.writeUInt16BE(0x9876,0);
+const pendingRaceThird=Buffer.from(pendingRaceBase);pendingRaceThird.writeUInt16BE(0xabcd,0);
+let releaseFirst,releaseSecond,notifySecond;
+const secondStarted=new Promise(resolve=>{notifySecond=resolve;});
+pendingRaceGate={
+  first:new Promise(resolve=>{releaseFirst=resolve;}),
+  second:new Promise(resolve=>{releaseSecond=resolve;}),
+  secondStarted:notifySecond
+};
+const firstPending=cacheReq(daily,pendingRaceBase);
+const secondPending=cacheReq(daily,pendingRaceSecond);
+await secondStarted;
+releaseFirst();
+const firstFinished=await firstPending;
+assert.equal(firstFinished.packet.readUInt16BE(2)&15,3);
+const thirdPending=cacheReq(daily,pendingRaceThird);
+releaseSecond();
+const [secondFinished,thirdFinished]=await Promise.all([secondPending,thirdPending]);
+assert.equal(secondFinished.packet.readUInt16BE(0),0x9876);
+assert.equal(thirdFinished.packet.readUInt16BE(0),0xabcd);
+assert.equal(thirdFinished.hit,'INTERNATIONAL_HIT');
+pendingRaceGate=null;
 // Native HTTPS replies retain their original wire records and recover from NODATA/TC.
 const nativeHttps=question('native-quality.example.com',65);
 const nativeRR=Buffer.from([0xc0,0x0c,0,65,0,1,0,0,0,60,0,3,0,1,0]);

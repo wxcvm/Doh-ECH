@@ -184,7 +184,7 @@ async function monitoredDoH(req,injectEch,ctx,clientIP,env){
 }
 function balancedCacheKey(raw, prefix, p, types=[1,28]) {
     const v=new DataView(raw);
-    if(!p || p.questions.length!==1 || p.questions[0].compressed || !types.includes(p.questions[0].type) ||
+    if(!p || p.questions.length!==1 || p.questions[0].compressed || p.questions[0].qclass!==1 || !types.includes(p.questions[0].type) ||
         v.getUint16(2)!==0x0100 || v.getUint16(6) || v.getUint16(8)) return '';
     const ar=v.getUint16(10),opt=p.opt;
     // Empty EDNS0 is common in DNS clients. Keep its exact payload size and bytes

@@ -1865,7 +1865,7 @@ function isUsableDnsJson(data, type, requestedName) {
     if (data.Answer?.some(a => !a || !Number.isInteger(a.type) || typeof a.data !== 'string' || typeof a.name !== 'string')) return false;
     // A response may contain a CNAME chain, but never unrelated owners. Validate
     // the whole chain before accepting a fast upstream reply or caching it.
-    const normalize = name => name.toLowerCase().replace(/\\.$/, '');
+    const normalize = name => name.toLowerCase().replace(/\.$/, '');
     const allowed = new Set([normalize(requestedName)]);
     const answers = data.Answer || [];
     for (let i = 0; i < answers.length; i++) {
@@ -1873,7 +1873,7 @@ function isUsableDnsJson(data, type, requestedName) {
         for (const answer of answers) {
             if (answer.type !== 5 || !allowed.has(normalize(answer.name))) continue;
             const target = normalize(answer.data);
-            if (!target || !/^[a-z0-9_.*-]+(?:\\.[a-z0-9_*-]+)*$/.test(target)) return false;
+            if (!target || target === normalize(answer.name)) return false;
             if (!allowed.has(target)) { allowed.add(target); changed = true; }
         }
         if (!changed) break;

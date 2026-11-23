@@ -2436,10 +2436,16 @@ async function forwardQuery(body, upstreams = UPSTREAM_DNS_LIST, preferRecord = 
             // A truncated packet or extended DNS RCODE is not a usable reply for
             // any type (including TXT/MX). Retry another resolver instead.
             const code=(reply.flags&15)|((reply.opt?.ttl>>>24)<<4);
+            // Only one OPT pseudo-record with EDNS version 0 is valid.
+            // A resolver returning a future EDNS version or duplicate OPT can
+            // break strict DoH clients even when the answer section looks usable.
+            // Treat it as an upstream failure and try the other resolver.
+            const ednsVersion=reply.opt?(reply.opt.ttl>>>16)&0xff:0;
             // DoH uses reliable transport: a truncated DNS response is never
             // a complete answer, including TXT/MX/DNSSEC and other uncached types.
             // Retry another upstream rather than returning TC=1 to AdGuard.
-            if((reply.flags&0x0200) || ![0,3].includes(code)) {
+            if((reply.flags&0x0200) || ![0,3].includes(code) ||
+               reply.optCount>1 || ednsVersion!==0) {
                 throw new Error('incomplete or erroneous DNS record reply');
             }
             // Validate injected ECS before selecting a winner; an incompatible

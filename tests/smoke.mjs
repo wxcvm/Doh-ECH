@@ -823,6 +823,42 @@ binaryReplyOverride=q=>{
 quality=await cacheReq(daily,badversQuery);
 assert.equal(quality.packet.readUInt32BE(quality.packet.length-6),0);
 assert.equal(attempts,2);
+// A nonzero EDNS version or duplicate OPT must not win the upstream race.
+// Test with both the ECS-injected domestic request and the native international
+// request; the second resolver gives a normal EDNS0 answer.
+for (const malformed of ['version','duplicate']) {
+  for (const [suffix,params] of [
+    ['example.cn',daily+'&cnEcs=on&clientIp=192.0.2.123'],
+    ['example.com',daily]
+  ]) {
+    const ednsBase=question('quality-'+malformed+'-opt.'+suffix,1);
+    const ednsQuery=Buffer.concat([ednsBase,ednsPlain.subarray(-11)]);
+    ednsQuery.writeUInt16BE(1,10);
+    let ednsAttempts=0;
+    binaryReplyOverride=q=>{
+      let packet=addressReply(q,ednsBase.length);
+      if(ednsAttempts++===0) {
+        if(malformed==='version') {
+          // A/IN answer is 16 bytes; OPT TTL begins five bytes into OPT.
+          packet.writeUInt32BE(0x00010000,ednsBase.length+16+5);
+        } else {
+          packet=Buffer.concat([packet,ednsPlain.subarray(-11)]);
+          packet.writeUInt16BE(2,10);
+        }
+      }
+      return packet;
+    };
+    const result=await cacheReq(params,ednsQuery);
+    assert.equal(ednsAttempts,2,'retry '+malformed+' OPT on '+suffix);
+    assert.equal(result.packet.readUInt16BE(0),ednsQuery.readUInt16BE(0));
+    assert.equal(result.packet.readUInt16BE(6),1);
+    assert.equal(result.packet.readUInt16BE(10),1);
+    assert.equal(result.packet.readUInt32BE(ednsBase.length+16+5),0,
+      'only the healthy EDNS0 version may reach the client');
+    assert.deepEqual(result.packet.subarray(12,ednsBase.length),ednsBase.subarray(12));
+  }
+}
+binaryReplyOverride=null;
 const fallbackDomain=question('quality-truncated-fallback.example.cn',1);attempts=0;
 const routingBefore=(await monitor()).routing.fallback;
 binaryReplyOverride=q=>{

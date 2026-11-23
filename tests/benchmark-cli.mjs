@@ -30,3 +30,20 @@ assert.equal(laterFailure.status,1,laterFailure.stderr||laterFailure.stdout);
 const report=JSON.parse(laterFailure.stdout);
 assert.equal(report.results[0].dnsByType.A.firstObserved.rcode,0);
 assert.match(report.results[0].dnsByType.A.subsequent[0].error,/simulated subsequent DNS outage/);
+
+// DNS can succeed while the independent TLS/TTFB probes fail. Report that
+// failure to automation callers rather than returning a misleading success.
+const dnsSuccessPreload=`globalThis.fetch=async (_url,init)=>{
+  const p=Buffer.from(init.body);
+  p.writeUInt16BE(0x8180,2);
+  return new Response(p,{headers:{'Content-Type':'application/dns-message'}});
+};`;
+const networkFailure=spawnSync(process.execPath,[
+  '--import','data:text/javascript,'+encodeURIComponent(dnsSuccessPreload),
+  'scripts/benchmark-balanced.mjs','--resolver','https://example.com/ech?enhance=balanced&cnEcs=auto',
+  '--domains','localhost','--types','A','--samples','1','--timeout-ms','500'
+],{encoding:'utf8',timeout:8000});
+assert.equal(networkFailure.status,1,networkFailure.stderr||networkFailure.stdout);
+const networkReport=JSON.parse(networkFailure.stdout);
+assert.equal(networkReport.results[0].dnsByType.A.firstObserved.rcode,0);
+assert.ok([...networkReport.results[0].tls,...networkReport.results[0].ttfb].some(s=>Object.hasOwn(s,'error')));

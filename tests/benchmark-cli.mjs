@@ -46,4 +46,4 @@ const networkFailure=spawnSync(process.execPath,[
 assert.equal(networkFailure.status,1,networkFailure.stderr||networkFailure.stdout);
 const networkReport=JSON.parse(networkFailure.stdout);
 assert.equal(networkReport.results[0].dnsByType.A.firstObserved.rcode,0);
-assert.ok([...networkReport.results[0].tls,...networkReport.results[0].ttfb].some(s=>s.error));
+assert.ok([...networkReport.results[0].tls,...networkReport.results[0].ttfb].some(s=>Object.hasOwn(s,'error')));

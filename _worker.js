@@ -1805,8 +1805,13 @@ async function queryUpstreamDNS(name, type, clientIP = '', upstreamUrl = null, p
             if (cachedRes) {
                 const stored = Number(cachedRes.headers.get('X-DNS-Stored-At'));
                 const data = await cachedRes.json();
-                const age = Math.max(0, Math.floor((Date.now() - stored) / 1000));
-                if (stored > 0 && isUsableDnsJson(data, type, name) && upstreamAnswerTtl(data, type === 65 ? 600 : 300) > age) {
+                // Do not resurrect a response after the isolate clock rolls back.
+                // Age partial seconds conservatively, as in the balanced wire cache,
+                // so a downstream TTL never exceeds the remaining upstream lifetime.
+                const elapsed = Date.now() - stored;
+                const age = Math.ceil(elapsed / 1000);
+                if (stored > 0 && elapsed >= 0 && isUsableDnsJson(data, type, name) &&
+                    upstreamAnswerTtl(data, type === 65 ? 600 : 300) > age) {
                     runtimeMetrics.cache.json.hits++;
                     return { ...data, Answer: data.Answer.map(r => ({ ...r, TTL: Math.max(0, r.TTL - age) })) };
                 }

@@ -374,6 +374,20 @@ const cached = await apiAnswer('ttl.example', 'A', 'enhance=off');
 assert.ok(cached.ttl <= 7 && cached.ttl > 0, 'cache hit must age TTL');
 const wireTtl = await wireAnswer('ttl.example', 1, 'enhance=off');
 assert.ok(wireTtl.readUInt32BE(question('ttl.example').length + 6) <= 7, 'wire TTL must age too');
+// JSON cached TTL must not round 900ms of elapsed time back to zero.
+// An entry timestamp from the future must be discarded, not given a fresh TTL.
+headers.set('X-DNS-Stored-At', String(Date.now() - 900));
+cache.set(ttlKey, new Response(await old.clone().text(), { headers }));
+count = ecsCalls('ttl.example').length;
+const fractionalJson = await apiAnswer('ttl.example', 'A', 'enhance=off');
+assert.equal(ecsCalls('ttl.example').length, count, 'subsecond JSON cache should still be reusable');
+assert.ok(fractionalJson.ttl > 0 && fractionalJson.ttl <= 11,
+  'subsecond JSON cache hit must conservatively age the TTL');
+headers.set('X-DNS-Stored-At', String(Date.now() + 120000));
+cache.set(ttlKey, new Response(await old.clone().text(), { headers }));
+count = ecsCalls('ttl.example').length;
+await apiAnswer('ttl.example', 'A', 'enhance=off');
+assert.ok(ecsCalls('ttl.example').length > count, 'clock-rollback JSON cache must refetch');
 headers.set('X-DNS-Stored-At', String(Date.now() - 20000));
 cache.set(ttlKey, new Response(await old.clone().text(), { headers }));
 count = ecsCalls('ttl.example').length;

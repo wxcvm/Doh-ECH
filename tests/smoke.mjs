@@ -379,6 +379,15 @@ cache.set(ttlKey, new Response(await old.clone().text(), { headers }));
 count = ecsCalls('ttl.example').length;
 await apiAnswer('ttl.example', 'A', 'enhance=off');
 assert.ok(ecsCalls('ttl.example').length > count, 'expired cache must refetch');
+// An isolate clock rollback must not make a future-dated JSON cache entry
+// appear fresh or grant it a full TTL again.
+const futureHeaders = new Headers(old.headers);
+futureHeaders.set('X-DNS-Stored-At', String(Date.now() + 60000));
+cache.set(ttlKey, new Response(await old.clone().text(), { headers: futureHeaders }));
+count = ecsCalls('ttl.example').length;
+await apiAnswer('ttl.example', 'A', 'enhance=off');
+assert.ok(ecsCalls('ttl.example').length > count, 'future-dated cache must refetch');
+
 await apiAnswer('zero.example', 'A', 'enhance=off');
 count = ecsCalls('zero.example').length;
 await apiAnswer('zero.example', 'A', 'enhance=off');

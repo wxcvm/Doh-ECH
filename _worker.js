@@ -1806,7 +1806,7 @@ async function queryUpstreamDNS(name, type, clientIP = '', upstreamUrl = null, p
                 const stored = Number(cachedRes.headers.get('X-DNS-Stored-At'));
                 const data = await cachedRes.json();
                 const age = Math.max(0, Math.floor((Date.now() - stored) / 1000));
-                if (stored > 0 && isUsableDnsJson(data, type, name) && upstreamAnswerTtl(data, type === 65 ? 600 : 300) > age) {
+                if (Number.isFinite(stored) && stored > 0 && stored <= Date.now() && isUsableDnsJson(data, type, name) && upstreamAnswerTtl(data, type === 65 ? 600 : 300) > age) {
                     runtimeMetrics.cache.json.hits++;
                     return { ...data, Answer: data.Answer.map(r => ({ ...r, TTL: Math.max(0, r.TTL - age) })) };
                 }

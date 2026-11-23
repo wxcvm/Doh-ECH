@@ -2,6 +2,7 @@
 // Real-network probe: DNS timings use the supplied DoH endpoint; TLS and TTFB
 // use the machine's normal network stack (NOT resolved through that DoH endpoint).
 import { randomInt } from 'node:crypto';
+import { isDnsProbeFailure } from './dns-benchmark-status.mjs';
 import tls from 'node:tls';
 import https from 'node:https';
 import { performance } from 'node:perf_hooks';
@@ -84,5 +85,5 @@ for(const name of domains) {
   output.results.push({domain:name,dnsByType,...(dns?{dnsFirstObserved:dns.firstObserved,dnsSubsequent:dns.subsequent}:{}),tls:tlsSamples,ttfb:ttfbSamples});
 }
 console.log(JSON.stringify(output,null,2));
-if(output.results.some(r=>Object.values(r.dnsByType).some(t=>[t.firstObserved,...t.subsequent].some(sample=>sample.error)) ||
+if(output.results.some(r=>Object.values(r.dnsByType).some(t=>[t.firstObserved,...t.subsequent].some(sample=>isDnsProbeFailure(sample))) ||
   [...r.tls,...r.ttfb].some(sample=>Object.hasOwn(sample,'error'))))process.exitCode=1;

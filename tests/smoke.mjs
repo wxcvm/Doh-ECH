@@ -686,6 +686,9 @@ async function monitor(){const r=await request('/log',auth,admin);assert.equal(r
 assert.equal((await request('/log',{},admin)).status,404);
 assert.equal((await request('/log',auth,{})).status,404);
 const shell=await request('/monitor');assert.equal(shell.status,200);assert.equal(shell.headers.get('Cache-Control'),'no-store');
+// The preceding expiry and rollback tests evicted the entry; warm it before
+// asserting a subsequent cache hit in the metrics test.
+await cacheReq();
 const beforeMetrics=await monitor();
 await cacheReq();
 simulateBinaryOutage=true;

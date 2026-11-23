@@ -85,4 +85,4 @@ for(const name of domains) {
 }
 console.log(JSON.stringify(output,null,2));
 if(output.results.some(r=>Object.values(r.dnsByType).some(t=>[t.firstObserved,...t.subsequent].some(sample=>sample.error)) ||
-  [...r.tls,...r.ttfb].some(sample=>sample.error)))process.exitCode=1;
+  [...r.tls,...r.ttfb].some(sample=>Object.hasOwn(sample,'error'))))process.exitCode=1;

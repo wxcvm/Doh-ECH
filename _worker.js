@@ -1862,7 +1862,23 @@ function isUsableDnsJson(data, type, requestedName) {
         if (!question || typeof question !== 'object' || String(question.name || '').toLowerCase().replace(/\.$/, '') !==
             requestedName.toLowerCase().replace(/\.$/, '') || Number(question.type) !== Number(type)) return false;
     }
-    if (data.Answer?.some(a => !a || !Number.isInteger(a.type) || typeof a.data !== 'string')) return false;
+    if (data.Answer?.some(a => !a || !Number.isInteger(a.type) || typeof a.data !== 'string' || typeof a.name !== 'string')) return false;
+    // A response may contain a CNAME chain, but never unrelated owners. Validate
+    // the whole chain before accepting a fast upstream reply or caching it.
+    const normalize = name => name.toLowerCase().replace(/\.$/, '');
+    const allowed = new Set([normalize(requestedName)]);
+    const answers = data.Answer || [];
+    for (let i = 0; i < answers.length; i++) {
+        let changed = false;
+        for (const answer of answers) {
+            if (answer.type !== 5 || !allowed.has(normalize(answer.name))) continue;
+            const target = normalize(answer.data);
+            if (!target || target === normalize(answer.name)) return false;
+            if (!allowed.has(target)) { allowed.add(target); changed = true; }
+        }
+        if (!changed) break;
+    }
+    if (answers.some(a => !allowed.has(normalize(a.name)))) return false;
     return true;
 }
 

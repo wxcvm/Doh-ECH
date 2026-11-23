@@ -30,5 +30,7 @@ jobs:
         run: node tests/benchmark-cli.mjs
       - name: Validate DNS benchmark response classification
         run: node tests/benchmark-dns-status.mjs
+      - name: Validate DNS JSON answer ownership
+        run: node tests/json-answer-ownership.mjs
       - name: Test local direct probe
         run: python3 tests/test_direct_probe.py

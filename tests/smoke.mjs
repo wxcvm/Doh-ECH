@@ -664,12 +664,11 @@ assert.equal(wireBodies.length,cacheStart);
 assert.equal(hitCache.packet.readUInt16BE(0),0x9876);
 // The mocked 5s advance plus real elapsed milliseconds conservatively ages TTL by 5–6s.
 assert.ok([54,55].includes(hitCache.packet.readUInt32BE(cacheQuestion.length+6)));
-// Clock rollback must never increase the DNS TTL beyond the upstream value.
+// Clock rollback invalidates domestic cache instead of restoring a full TTL.
 Date.now=()=>realNow()-120000;
 const rollbackDomestic=await cacheReq(daily,changedId);
 Date.now=realNow;
-assert.equal(rollbackDomestic.hit,'DOMESTIC_HIT');
-assert.equal(rollbackDomestic.packet.readUInt32BE(cacheQuestion.length+6),60);
+assert.equal(rollbackDomestic.hit,null);
 assert.equal(rollbackDomestic.packet.readUInt16BE(0),0x9876);
 assert.equal((await cacheReq(daily+'&cnEcs=on&clientIp=192.0.2.123')).hit,null);
 assert.equal((await cacheReq(daily+'&cnEcs=on&clientIp=192.0.2.222')).hit,'DOMESTIC_HIT');
@@ -679,6 +678,7 @@ assert.equal((await cacheReq(daily,upper)).hit,null);
 Date.now=()=>realNow()+61000;
 assert.equal((await cacheReq()).hit,null);
 Date.now=realNow;
+const domesticCacheReplyOverride=binaryReplyOverride;
 binaryReplyOverride=null;
 // Administrator-only metrics reflect actual final responses and cache events.
 const auth={headers:{Authorization:'Bearer testsecret'}};
@@ -687,8 +687,14 @@ async function monitor(){const r=await request('/log',auth,admin);assert.equal(r
 assert.equal((await request('/log',{},admin)).status,404);
 assert.equal((await request('/log',auth,{})).status,404);
 const shell=await request('/monitor');assert.equal(shell.status,200);assert.equal(shell.headers.get('Cache-Control'),'no-store');
+// The preceding expiry and rollback tests evicted the entry; warm it before
+// asserting a subsequent cache hit in the metrics test. Restore the
+// deterministic positive upstream response before warming the cache.
+binaryReplyOverride=domesticCacheReplyOverride;
+await cacheReq();
 const beforeMetrics=await monitor();
 await cacheReq();
+binaryReplyOverride=null;
 simulateBinaryOutage=true;
 await request('/doh',{method:'POST',headers:{'Content-Type':'application/dns-message'},body:question('outage.example')});
 simulateBinaryOutage=false;
@@ -904,19 +910,21 @@ assert.equal(intlHit.packet.readUInt16BE(0),0x4567);
 assert.ok([54,55].includes(intlHit.packet.readUInt32BE(intlBase.length+6)),
   'cache TTL must age conservatively across the 5-second offset and subsecond execution time');
 assert.deepEqual(intlHit.packet.subarray(-11),intlQuery.subarray(-11));
+// A clock rollback must invalidate the entry, not restore its original TTL.
+// The next request re-resolves and a subsequent normal-clock request can hit.
 Date.now=()=>realNow()-120000;
 const rollbackInternational=await cacheReq(daily+'&cnEcs=on&clientIp=198.51.100.123',intlId);
 Date.now=realNow;
-assert.equal(rollbackInternational.hit,'INTERNATIONAL_HIT');
-assert.equal(rollbackInternational.packet.readUInt32BE(intlBase.length+6),60);
+assert.equal(rollbackInternational.hit,null);
 assert.equal(rollbackInternational.packet.readUInt16BE(0),0x4567);
+assert.equal((await cacheReq(daily,intlId)).hit,null);
 assert.equal((await cacheReq(daily,intlBase)).hit,null);
 const intlDo=Buffer.from(intlQuery);intlDo.writeUInt16BE(0x8000,intlQuery.length-4);
 assert.equal((await cacheReq(daily,intlDo)).hit,null);
 assert.equal((await cacheReq(daily,intlDo)).hit,null);
 const intlMetricsAfter=(await monitor()).cache.international;
-assert.equal(intlMetricsAfter.hits-intlMetricsBefore.hits,3);
-assert.equal(intlMetricsAfter.misses-intlMetricsBefore.misses,2);
+assert.equal(intlMetricsAfter.hits-intlMetricsBefore.hits,2);
+assert.equal(intlMetricsAfter.misses-intlMetricsBefore.misses,4);
 assert.equal(intlMetricsAfter.bypasses-intlMetricsBefore.bypasses,2);
 const intlNegative=question('cache-negative.example.com',1);
 binaryReplyOverride=q=>addressReply(q,intlNegative.length,3,false);

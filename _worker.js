@@ -2014,7 +2014,14 @@ function parseSvcParamsFromData(dataStr) {
     if (parts[0] === '\\#' || parts[0] === '#') {
         try {
             const hex = parts.slice(2).join('');
-            const bytes = new Uint8Array(Math.floor(hex.length / 2));
+            // RFC3597's declared RDATA length must match complete hex octets.
+            // Otherwise a truncated HTTPS/SVCB record can supply a partial ECH
+            // key that clients cannot use.
+            const declaredLength = Number(parts[1]);
+            if (!Number.isInteger(declaredLength) || declaredLength < 0 ||
+                declaredLength > 65535 || hex.length !== declaredLength * 2 ||
+                !/^[0-9a-f]*$/i.test(hex)) return [];
+            const bytes = new Uint8Array(declaredLength);
             for (let i = 0; i < bytes.length; i++) bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
             if (bytes.length < 3) return [];
             const dv = new DataView(bytes.buffer);

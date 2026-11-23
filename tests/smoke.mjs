@@ -100,6 +100,14 @@ globalThis.fetch = async (input, init = {}) => {
       return Response.json({ Status: status, Question: [{ name: name + '.', type }],
         Answer: status === 0 ? [{ name, type, TTL: name === 'zero.example' ? 0 : 12, data: '203.0.113.42' }] : [] });
     }
+    if (name.startsWith('rfc3597-') && name.endsWith('.example') && type === 65) {
+      // 10 octets: priority=1, root target, ech param with 3 octets.
+      const hex='00010000050003010203';
+      const declared=name==='rfc3597-valid.example' ? 10 : 11;
+      const encoded=name==='rfc3597-badhex.example' ? '0001000005000301020z' : hex;
+      return Response.json({Status:0,Question:[{name:name+'.',type}],
+        Answer:[{name,type,TTL:45,data:'\\# '+declared+' '+encoded}]});
+    }
     if (name === 'ech-race.example' && type === 65) {
       return Response.json({ Status: 0, Question: [{ name: name + '.', type }],
         Answer: [{ name, type, TTL: 60, data: url.hostname === 'cloudflare-dns.com' ? '1 . alpn=h2 ech=AAECAw==' : '1 . alpn=h2' }] });
@@ -373,6 +381,14 @@ for (const [name, rcode] of [['missing.example.cn',3], ['failure.example.cn',2]]
 }
 const ech = await apiAnswer('cloudflare.com', 'HTTPS', 'enhance=off&ech=ech-race.example');
 assert.equal(ech.ech, 'AAECAw==', 'ECH lookup must prefer a record that actually contains ECH');
+// RFC3597 HTTPS RDATA must have the declared number of complete hex octets.
+// Never manufacture an ECH key from truncated or non-hex bytes.
+assert.equal((await apiAnswer('cloudflare.com','HTTPS',
+  'enhance=off&ech=rfc3597-valid.example')).ech,'AQID');
+for(const host of ['rfc3597-truncated.example','rfc3597-badhex.example']) {
+  const value=await apiAnswer('cloudflare.com','HTTPS','enhance=off&ech='+host);
+  assert.ok(!value.ech,'invalid RFC3597 ECH must not be offered: '+host);
+}
 const json = await request('/api/query?domain=ecs.example&type=A&clientIp=192.0.2.1');
 assert.equal(json.headers.get('Cache-Control'), 'no-store');
 // ECH RR lifetime must not outlive its actual configuration; fake aliases follow it too.

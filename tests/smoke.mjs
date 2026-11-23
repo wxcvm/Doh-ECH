@@ -103,8 +103,17 @@ globalThis.fetch = async (input, init = {}) => {
     if (name.startsWith('rfc3597-') && name.endsWith('.example') && type === 65) {
       // 10 octets: priority=1, root target, ech param with 3 octets.
       const hex='00010000050003010203';
-      const declared=name==='rfc3597-valid.example' ? 10 : 11;
-      const encoded=name==='rfc3597-badhex.example' ? '0001000005000301020z' : hex;
+      const invalid={
+        'rfc3597-badhex.example':'0001000005000301020z',
+        // TargetName label extends beyond the available RDATA.
+        'rfc3597-badtarget.example':'00010300050003010203',
+        // A complete ECH param followed by a dangling SvcParam key byte.
+        'rfc3597-trailing.example':hex+'00',
+        // ECH param declares four bytes but supplies only three.
+        'rfc3597-shortparam.example':'00010000050004010203'
+      };
+      const encoded=invalid[name]||hex;
+      const declared=name==='rfc3597-truncated.example' ? 11 : encoded.length/2;
       return Response.json({Status:0,Question:[{name:name+'.',type}],
         Answer:[{name,type,TTL:45,data:'\\# '+declared+' '+encoded}]});
     }
@@ -385,7 +394,8 @@ assert.equal(ech.ech, 'AAECAw==', 'ECH lookup must prefer a record that actually
 // Never manufacture an ECH key from truncated or non-hex bytes.
 assert.equal((await apiAnswer('cloudflare.com','HTTPS',
   'enhance=off&ech=rfc3597-valid.example')).ech,'AQID');
-for(const host of ['rfc3597-truncated.example','rfc3597-badhex.example']) {
+for(const host of ['rfc3597-truncated.example','rfc3597-badhex.example',
+  'rfc3597-badtarget.example','rfc3597-trailing.example','rfc3597-shortparam.example']) {
   const value=await apiAnswer('cloudflare.com','HTTPS','enhance=off&ech='+host);
   assert.ok(!value.ech,'invalid RFC3597 ECH must not be offered: '+host);
 }

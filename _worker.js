@@ -2026,19 +2026,22 @@ function parseSvcParamsFromData(dataStr) {
             if (bytes.length < 3) return [];
             const dv = new DataView(bytes.buffer);
             let off = 2;
-            // 跳过 TargetName（0=根，或标签序列）
+            // TargetName must terminate within RDATA before SvcParams begin.
+            // Do not interpret malformed labels or an unterminated name as keys.
+            let terminated = false;
             while (off < bytes.length) {
-                const len = bytes[off];
-                if (len === 0) { off++; break; }
-                if (len > 63) break;
-                off += 1 + len;
+                const len = bytes[off++];
+                if (len === 0) { terminated = true; break; }
+                if (len > 63 || off + len > bytes.length) return [];
+                off += len;
             }
+            if (!terminated) return [];
             const params = [];
             while (off + 4 <= bytes.length) {
                 const key = dv.getUint16(off);
                 const len = dv.getUint16(off + 2);
                 off += 4;
-                if (off + len > bytes.length) break;
+                if (off + len > bytes.length) return [];
                 const valBytes = bytes.slice(off, off + len);
                 off += len;
                 const keyName = Object.keys(SVC_PARAM_IDS).find(k => SVC_PARAM_IDS[k] === key) || ('key' + key);
@@ -2068,7 +2071,8 @@ function parseSvcParamsFromData(dataStr) {
                 }
                 params.push({ key: keyName, val });
             }
-            return params;
+            // Reject dangling SvcParam bytes, including partial key/length fields.
+            return off === bytes.length ? params : [];
         } catch (e) {
             return [];
         }

@@ -678,6 +678,7 @@ assert.equal((await cacheReq(daily,upper)).hit,null);
 Date.now=()=>realNow()+61000;
 assert.equal((await cacheReq()).hit,null);
 Date.now=realNow;
+const domesticCacheReplyOverride=binaryReplyOverride;
 binaryReplyOverride=null;
 // Administrator-only metrics reflect actual final responses and cache events.
 const auth={headers:{Authorization:'Bearer testsecret'}};
@@ -687,10 +688,13 @@ assert.equal((await request('/log',{},admin)).status,404);
 assert.equal((await request('/log',auth,{})).status,404);
 const shell=await request('/monitor');assert.equal(shell.status,200);assert.equal(shell.headers.get('Cache-Control'),'no-store');
 // The preceding expiry and rollback tests evicted the entry; warm it before
-// asserting a subsequent cache hit in the metrics test.
+// asserting a subsequent cache hit in the metrics test. Restore the
+// deterministic positive upstream response before warming the cache.
+binaryReplyOverride=domesticCacheReplyOverride;
 await cacheReq();
 const beforeMetrics=await monitor();
 await cacheReq();
+binaryReplyOverride=null;
 simulateBinaryOutage=true;
 await request('/doh',{method:'POST',headers:{'Content-Type':'application/dns-message'},body:question('outage.example')});
 simulateBinaryOutage=false;

@@ -223,7 +223,8 @@ function balancedCacheWrite(cache,key,packet,type,clientOpt) {
         opt.rdlength!==0 || opt.ttl!==0)))return;
     const records=p.records.slice(0,v.getUint16(6));
     if(!records.some(r=>r.type===type) || records.some(r=>!(type===65?[5,65]:[1,5,28]).includes(r.type)))return;
-    const ttl=Math.min(300,...records.map(r=>r.ttl));
+    // RFC 2181 section 8: TTLs with the high bit set are treated as zero.
+    const ttl=Math.min(300,...records.map(r=>r.ttl>=0x80000000?0:r.ttl));
     if(!ttl)return;
     // Replacing an existing entry must not evict an unrelated hot name.
     cache.delete(key);

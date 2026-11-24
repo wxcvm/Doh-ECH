@@ -1006,6 +1006,15 @@ const intlNegative=question('cache-negative.example.com',1);
 binaryReplyOverride=q=>addressReply(q,intlNegative.length,3,false);
 assert.equal((await cacheReq(daily,intlNegative)).hit,null);
 assert.equal((await cacheReq(daily,intlNegative)).hit,null);
+// RFC 2181: a high-bit TTL must not enter the positive cache.
+const invalidTtlQuery=question('cache-invalid-ttl.example.com',1);
+binaryReplyOverride=q=>{
+  const reply=Buffer.from(addressReply(q,invalidTtlQuery.length));
+  reply.writeUInt32BE(0x80000000,invalidTtlQuery.length+6);
+  return reply;
+};
+assert.equal((await cacheReq(daily,invalidTtlQuery)).hit,null);
+assert.equal((await cacheReq(daily,invalidTtlQuery)).hit,null);
 // Concurrent equivalent misses reuse only a validated positive cache entry.
 const coalesceBase=question('coalesce.example.com',1);
 const coalesceOther=Buffer.from(coalesceBase);coalesceOther.writeUInt16BE(0x9876,0);

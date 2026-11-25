@@ -182,15 +182,18 @@ def main():
                     if args.baseline_url:
                         row["endpoint"] = endpoint
                     rows.append(row)
-                    if endpoint == "target" and sample.get("addresses"):
-                        addresses.setdefault(kind, sample["addresses"][0])
+                    if sample.get("addresses"):
+                        addresses.setdefault((endpoint, kind), sample["addresses"][0])
         if args.doh_connect and not args.dns_only:
-            for kind, address in addresses.items():
-                rows.append({"host": host, "type": "doh_https", "family": kind, "address": address,
-                             **measure(https_probe, host, args.timeout, address)})
+            for (endpoint, kind), address in addresses.items():
+                row = {"host": host, "type": "doh_https", "family": kind, "address": address,
+                       **measure(https_probe, host, args.timeout, address)}
+                if args.baseline_url:
+                    row["endpoint"] = endpoint
+                rows.append(row)
         if not args.dns_only:
             rows.append({"host": host, "type": "system_https", **measure(https_probe, host, args.timeout)})
-    print(json.dumps({"method": args.method, "note": "First query is not guaranteed cold; X-Cache identifies observed hits. DNS latency alone is not proof of DNS success: inspect outcome (including nodata for NOERROR with no answer), rcode_low4 and truncated, and treat missing cache/route headers as unknown rather than misses. Optional baseline queries are interleaved, not identical cache or network conditions, and may differ in ECS/ECH policy. HTTPS uses system DNS, not necessarily tested DoH. Optional doh_https connects to a target-returned address with original hostname/SNI and certificate verification; no ECH verification.", "samples": rows}, indent=2))
+    print(json.dumps({"method": args.method, "note": "First query is not guaranteed cold; X-Cache identifies observed hits. DNS latency alone is not proof of DNS success: inspect outcome (including nodata for NOERROR with no answer), rcode_low4 and truncated, and treat missing cache/route headers as unknown rather than misses. Optional baseline queries are interleaved, not identical cache or network conditions, and may differ in ECS/ECH policy. HTTPS uses system DNS, not necessarily tested DoH. Optional doh_https connects to an address returned by each tested endpoint with original hostname/SNI and certificate verification; no ECH verification.", "samples": rows}, indent=2))
 
 
 if __name__ == "__main__":

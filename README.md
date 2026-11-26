@@ -47,13 +47,14 @@
 > **注意**：增强模式规则**不会影响**静态列表中的 Cloudflare/Meta 域名，这些站点的 ECH 注入和优选 IP 逻辑独立运行，仅在规则列表里**特意添加CF/Meta域名规则**时才会生效(优先级:`ips[不为空]`>`cf/meta优选结果`>`ips[空]`)。
 
 ### 模式状态
-增强模式通过 `enhance` 参数控制，共有三种状态：
+增强模式通过 `enhance` 参数控制，支持以下常用状态：
 
 | 状态 | 值 | 行为 |
 |------|----|------|
 | **关闭** | `off` (默认) | 不进行任何增强，普通域名保持上游原始记录。 |
 | **规则模式** | `rule` | 仅对匹配**规则**的域名生效，未匹配域名保持原样。 |
 | **全局模式** | `full` | 对所有普通域名生效。规则匹配的域名优先使用规则 IP，未匹配的从上游获取。 |
+| **均衡模式** | `balanced` | 国内外分组原生解析，不强制 ECH、IP 或协议；见下文日常均衡配置。 |
 
 ### 增强内容
 开启增强模式后，匹配到的域名将获得以下优化：
@@ -129,7 +130,7 @@ hosts文件支持两种格式：
 | `exclude` | 返回记录排除指定ip/domain |（`1.1.1.1`/ `cf.cf` ） |``|
 | `shuffle` |  乱序返回记录 |默认`true`（`false`/`true` ） |`false`|
 | `area` |  指定ip区域 |留空`不过滤`（`area=hk,sg,jp` ） |``|
-| `enhance` |  增强模式 |可选`off` `rule` `full`  默认`off`  |``|
+| `enhance` |  增强模式 |可选`off` `rule` `full` `direct` `balanced`  默认`off`  |``|
 | `rules` |  增强模式域名ip匹配规则 |格式`*.domain1,*.domain2:ip1,ip2-noA-noAAAA`（`-noA/AAAA`屏蔽且不返回A/AAAA记录 ） |``|
 | `alpn` |  alpn列表 |默认 `h3,h2`     |``|
 | `no6` |  全局屏蔽AAAA记录 |默认 `false`     |``|
@@ -250,7 +251,7 @@ DOH_ALLOWED_SUB_HOSTS = "feeds.example.com"
 
 ### 日常均衡配置（推荐给 AdGuard 和支持 DoH 的浏览器）
 
-使用 `https://你的域名/ech?enhance=balanced`：国内域名优先阿里 DNS / DNSPod，国际域名使用 Cloudflare DNS / Google Public DNS，组内继续使用已有的自适应上游选择。国内组全部失败（SERVFAIL）才回退国际组；真实 NXDOMAIN 或无该类型记录不因此改写。Google/X 已知国际域名优先于国内列表分类。
+使用 `https://你的域名/ech?enhance=balanced&cnEcs=auto`：国内域名优先阿里 DNS / DNSPod，国际域名使用 Cloudflare DNS / Google Public DNS，组内继续使用已有的自适应上游选择。国内组全部失败（SERVFAIL）才回退国际组；真实 NXDOMAIN 或无该类型记录不因此改写。Google/X 已知国际域名优先于国内列表分类。
 
 本模式按原始 DNS 二进制报文转发单问题 IN 查询，包括 A、AAAA、HTTPS/SVCB、CNAME、TXT 与 DNSSEC 请求；不生成随机 IPv6，不固定 CDN 地址，不注入 ECH、不屏蔽 IPv6、不强制协议，也不读取高级地址覆盖或订阅。上游原生 ECH/HTTP3 元数据原样保留。查询台 JSON 与二进制路径使用相同上游分组，但因查询方式不同不保证逐字节/逐记录相同；国内 A/AAAA/HTTPS 查询默认仅在 Cloudflare 判断连接来自中国大陆时，尝试附加 IPv4 /24 或 IPv6 /56 ECS，以改善 CDN 就近调度。`cnEcs=on` 显式开启（也支持境外连接），`cnEcs=off` 关闭额外注入；代理出口可能改变检测到的位置。已有 EDNS 选项（包括 ECS）、DO、签名及复杂报文不改写。对无 OPT 或空 EDNS0 OPT 的普通查询注入 ECS；上游回包校验并移除新增 ECS/OPT，兼容性失败先用原始请求重试国内组，再按原策略回退国际组。国际上游不会收到本服务新注入的 ECS。均衡模式新增国内普通 A/AAAA 正向 DNS 报文的边缘 isolate 内存缓存（最多 512 条、最长 300 秒且不超过最短记录 TTL），按原始问题及 ECS 网段隔离，命中扣减各记录 TTL 并回写当前事务 ID。复杂 EDNS、负应答、国际回退及 ECS 失败后的未个性化应答不缓存；JSON 正向缓存仍按 ECS 网段和上游组隔离。
 
@@ -361,6 +362,14 @@ python scripts/balanced-probe.py --url 'https://你的域名/ech?enhance=balance
 输出国内外 A/AAAA/HTTPS 二进制 DoH 往返时间、基础 RCODE、截断标志、`outcome`（`noerror`、`nxdomain`、`servfail`、`truncated` 或 `dns_error`）、X-Cache 和 X-DNS-Route（如有），以及当前系统网络的 TCP 连接、TLS 和首字节时间。HTTP 成功但 DNS 返回 SERVFAIL、NXDOMAIN 或截断时，不能算作成功解析；缺少 X-Cache/X-DNS-Route 只代表未观察到该响应头，不能推断缓存未命中或实际分流。首轮不保证冷缓存；只有 X-Cache 明确命中才视为已观察到命中。HTTPS 使用系统 DNS 和当前路由，不保证使用被测 DoH；若要比较 AdGuard 实际体验，先自行确认系统 DNS 路径，保持网络和代理状态一致。脚本不修改配置、不上传报告、不证明 ECH 握手。错误保留在报告中，不计为成功测速。
 
 测速工具可加 `--doh-connect`，额外使用被测 DoH 返回的每种地址族首个地址连接网站，保留原域名 SNI、Host 和证书验证，分别输出 TLS/TTFB 与系统 DNS 基线。此为直接 TCP/TLS 测试，不代表浏览器 QUIC/ECH 或代理路径，也不保证选中最佳 CDN 地址。
+
+可在同一网络交错对照纯转发端点（不修改设备 DNS）：
+
+```bash
+python scripts/balanced-probe.py --url 'https://你的域名/ech?enhance=balanced&cnEcs=auto' --baseline-url 'https://你的域名/doh' --rounds 3 --doh-connect
+```
+
+`--baseline-url` 交错测量两个 DoH 端点；结合 `--doh-connect` 时分别使用双方返回的 IPv4/IPv6 地址验证 TLS 和 TTFB，而非只比较系统 DNS。只测 DNS 时使用 `--dns-only`，自定义域名使用 `--hosts`（逗号分隔）。两端缓存状态及 ECS 策略可能不同，首轮不是保证冷查询；NODATA 与失败应单独统计，不将其计为成功地址解析。大陆网络与境外网络应分别保存报告，并记录代理状态；AdGuard 实机仍需独立验证。
 
 
 ### 跨实例 DNS 统计（可选）

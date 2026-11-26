@@ -54,6 +54,30 @@ class ProbeTests(unittest.TestCase):
                          ["target", "baseline", "baseline", "target"] * 3)
         self.assertEqual({r["host"] for r in rows}, {"www.jd.com"})
 
+    def test_doh_connect_compares_both_endpoints(self):
+        argv = ["probe", "--url", "https://target.example/ech", "--baseline-url",
+                "https://baseline.example/dns-query", "--hosts", "www.jd.com",
+                "--rounds", "1", "--doh-connect"]
+        def fake_dns(url, host, kind, timeout, method):
+            addresses = {
+                ("https://target.example/ech", 1): ["203.0.113.1"],
+                ("https://baseline.example/dns-query", 1): ["198.51.100.2"],
+                ("https://baseline.example/dns-query", 28): ["2001:db8::2"],
+            }
+            return {"addresses": addresses.get((url, kind), [])}
+        with patch.object(sys, "argv", argv), \
+             patch.object(probe, "dns_probe", side_effect=fake_dns), \
+             patch.object(probe, "https_probe", return_value={"tls_ms": 1}) as https, \
+             patch("sys.stdout", new_callable=io.StringIO) as out:
+            probe.main()
+        rows = json.loads(out.getvalue())["samples"]
+        self.assertEqual({(r["endpoint"], r["family"], r["address"])
+                          for r in rows if r["type"] == "doh_https"},
+                         {("target", 1, "203.0.113.1"),
+                          ("baseline", 1, "198.51.100.2"),
+                          ("baseline", 28, "2001:db8::2")})
+        self.assertEqual(https.call_count, 4)
+
     def test_reject_non_https_baseline(self):
         with patch.object(sys, "argv", ["probe", "--url", "https://example.com/ech",
                                         "--baseline-url", "http://insecure.example/dns-query"]):

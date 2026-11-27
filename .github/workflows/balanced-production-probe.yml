@@ -15,7 +15,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Measure public DoH and website connections
         run: |
-          python3 scripts/balanced-probe.py --url 'https://dohech.dpdns.org/ech?enhance=balanced&cnEcs=auto' --rounds 3 --timeout 5 --doh-connect | tee balanced-production.json
+          python3 scripts/balanced-probe.py --url 'https://dohech.dpdns.org/ech?enhance=balanced&cnEcs=auto' --baseline-url 'https://cloudflare-dns.com/dns-query' --rounds 3 --timeout 5 --doh-connect | tee balanced-production.json
       - name: Compare GET transport
         if: ${{ always() }}
         run: |
@@ -47,7 +47,7 @@ jobs:
               try:
                   with open(path) as source:
                       rows = json.load(source)['samples']
-                  dns = [r for r in rows if isinstance(r['type'], int)]
+                  dns = [r for r in rows if isinstance(r['type'], int) and r.get('endpoint', 'target') == 'target']
                   failures = [r for r in dns if 'error' in r or r.get('rcode_low4') != 0 or r.get('truncated')]
                   print(f'{label}: DNS samples={len(dns)}, failures={len(failures)}')
                   if failures:

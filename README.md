@@ -341,6 +341,34 @@ A/AAAA/HTTPS 并行查询，各自独立显示等待、正常记录、无记录�
 
 此优化仅对遵循 HTTP 缓存的 GET 客户端有效；Worker 内部缓存命中仍计入调用次数。优先使用客户端本地 DNS 缓存并避免重复配置多个相同的上游。实际请求降幅应通过 Cloudflare Workers Analytics 的 UTC 日请求量验证，不以内部缓存命中率替代。
 
+### AdGuard Android：减少实际 DNS 请求次数
+
+优先在客户端复用 DNS 响应，而非单纯增加 Worker 内部缓存。建议在设置 → 常规 → 高级 → 低级设置 → DNS 保护中进行单变量对照测试：
+
+| 设置 | 建议起点 |
+| --- | --- |
+| DNS 缓存大小 | 由默认 1000 增至 4096；如有容量压力再试 8192 |
+| DNS 请求超时 | 保持默认 5000 ms，避免盲目缩短导致备用解析与重试 |
+| 已拦截响应 TTL | 保留默认 3600 秒；不人为延长上游正常 DNS TTL |
+| ECH 拦截 | 关闭（需要 ECH 时） |
+| HTTP/3 DoH | 保留当前设置；有实际网络测试后再调整 |
+| 备用 DNS | 保留可用且信任的备用解析；不要把同一个 Worker 同时配置为主备 |
+
+避免并行配置多个指向同一 Worker 的地址。若浏览器自行发送 DoH，先核对 AdGuard 的安全 DNS 过滤模式，再决定是否统一交给本地 DNS 代理；不要为减少请求关闭广告过滤、HTTPS 过滤或 ECH。备用 DNS 可能没有相同的 ECH、地域解析和隐私策略，须自行验证。
+
+按相近使用强度对比两个完整 UTC 日的 `worker-quota.py` 统计，并记录 AdGuard DNS 错误、客户端体验与内存变化。4096/8192 是建议测试值，不是实测最佳值。不同版本的菜单可能变化。参考 [AdGuard Android 官方低级设置](https://adguard.com/kb/adguard-for-android/features/low-level-settings/)。
+
+### 公网入口与防滥用
+
+真正保护 Worker 请求额度需要在 Worker 执行前限制异常请求，而不是仅在 Worker 内返回 403/429。Cloudflare Free zone 提供一条速率限制规则和五条自定义规则；先核对已有规则，不要覆盖既有安全策略。DNS 客户端不能处理浏览器验证码，不建议对 DoH 使用 Challenge。
+
+- 确认所有客户端、探测脚本、预览和备用入口的依赖后，才考虑禁用不需要的 `workers.dev` 入口。
+- 在自定义域名的边缘规则上先确认 DNS 真实峰值、共享 NAT、重试行为；避免低阈值误伤正常查询。
+- 若唯一免费速率限制规则已被占用，保留原规则，优先考虑客户端缓存及可验证的自定义过滤规则。不自动升级付费套餐。
+- 不将令牌写进 URL、仓库或日志。需要鉴权时，先验证客户端支持相应请求头或边缘认证；不要默认要求 AdGuard 发送自定义头。
+
+参考 [Cloudflare WAF 规则额度](https://developers.cloudflare.com/waf/) 与 [workers.dev 配置](https://developers.cloudflare.com/workers/configuration/routing/workers-dev/)。本项目不自动修改 WAF、禁用域名或新增收费资源。
+
 ### 每日 Worker 免费额度检查
 
 使用已有的只读 Account Analytics API Token 和环境变量 `CF_ACCOUNT_ID`、`CF_ANALYTICS_TOKEN`，从 Cloudflare GraphQL 查询账户级 UTC 当日 Worker 调用量，无需调用 DoH 端点：

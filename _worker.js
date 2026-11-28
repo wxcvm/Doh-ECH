@@ -793,7 +793,35 @@ function dnsResponseFromResult(id, qName, qType, result, echoEdns = false) {
 // ===================== JSON API =====================
 // 预计算静态域名的标准响应（避免重复 JSON 序列化）
 const STATIC_RESPONSE_CACHE = new Map();
-const STATIC_RESPONSE_TTL = 300000; // 5分钟
+// Only positive fixed-address responses may enter this shared cache.
+function staticJsonEntry(result, stored = Date.now()) {
+    const ttl = result?.ttl ?? 300;
+    if (!result || result.error || result.blocked || (result.rcode ?? 0) !== 0 ||
+        !Array.isArray(result.answers) || !result.answers.length ||
+        !Number.isSafeInteger(ttl) || ttl <= 0 || ttl >= 0x80000000 ||
+        !Number.isSafeInteger(stored) || stored <= 0 || stored > Date.now()) return null;
+    return { result, stored, ttl: Math.min(300, ttl) };
+}
+function staticJsonRemember(key, entry) {
+    STATIC_RESPONSE_CACHE.delete(key);
+    if (STATIC_RESPONSE_CACHE.size >= 512) STATIC_RESPONSE_CACHE.delete(STATIC_RESPONSE_CACHE.keys().next().value);
+    STATIC_RESPONSE_CACHE.set(key, entry);
+}
+function staticJsonHit(key, entry) {
+    if (!entry) return null;
+    const age = Math.ceil((Date.now() - entry.stored) / 1000);
+    if (Date.now() < entry.stored || age >= entry.ttl) {
+        STATIC_RESPONSE_CACHE.delete(key);
+        return null;
+    }
+    staticJsonRemember(key, entry);
+    const ttl = entry.ttl - age;
+    return new Response(JSON.stringify({...entry.result, ttl}), {
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*',
+            'Cache-Control': `public, max-age=${ttl}, s-maxage=${ttl}`,
+            'Vary': 'Accept-Encoding', 'X-Cache': 'STATIC_HIT' }
+    });
+}
 
 // 判定是否可安全缓存：静态域名(CF/META)返回固定优选IP，不依赖客户端位置(ECS)，
 // 因此无需 clientIp 参与；但任何自定义覆盖参数都会改变响应内容，必须排除。
@@ -837,39 +865,20 @@ async function handleApiQuery(url, clientIP, env, clientCountry = '') {
     // 静态域名 + 默认参数 = 可缓存预计算响应（结果不依赖 clientIp/ECS）
     const cacheable = isCacheableStaticRequest(domain, config, type);
     
-    // 提前声明 cacheKey，避免作用域问题
-    const cacheKey = cacheable ? `v2:${domain}:${type}` : null;
+    const cacheKey = cacheable ? `v3:${domain}:${type}` : null;
 
-    if (cacheable) {
-        const cached = STATIC_RESPONSE_CACHE.get(cacheKey);
-        if (cached && Date.now() < cached.expire) {
-            return new Response(cached.body, {
-                status: 200,
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Access-Control-Allow-Origin': '*',
-                    'Cache-Control': `public, max-age=${type === 'HTTPS' ? 600 : 300}, s-maxage=${type === 'HTTPS' ? 600 : 300}`,
-                    'Vary': 'Accept-Encoding',
-                    'X-Cache': 'STATIC_HIT'
-                }
-            });
-        }
-        // 二级回退：跨 isolate 共享缓存 (Cache API)，其他 isolate 已算过则直接复用
+    if (cacheKey) {
+        const hit = staticJsonHit(cacheKey, STATIC_RESPONSE_CACHE.get(cacheKey));
+        if (hit) return hit;
         try {
             const sharedRes = await caches.default.match(`https://dns-cache/static/${cacheKey}`);
             if (sharedRes) {
-                const sharedBody = await sharedRes.text();
-                STATIC_RESPONSE_CACHE.set(cacheKey, { body: sharedBody, expire: Date.now() + STATIC_RESPONSE_TTL });
-                return new Response(sharedBody, {
-                    status: 200,
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'Access-Control-Allow-Origin': '*',
-                        'Cache-Control': `public, max-age=${type === 'HTTPS' ? 600 : 300}, s-maxage=${type === 'HTTPS' ? 600 : 300}`,
-                        'Vary': 'Accept-Encoding',
-                        'X-Cache': 'STATIC_HIT'
-                    }
-                });
+                const storedHeader = sharedRes.headers.get('X-DNS-Stored-At');
+                const shared = await sharedRes.json();
+                const entry = storedHeader && shared.domain === domain && shared.type === type
+                    ? staticJsonEntry(shared, Number(storedHeader)) : null;
+                const sharedHit = staticJsonHit(cacheKey, entry);
+                if (sharedHit) return sharedHit;
             }
         } catch (e) {}
     }
@@ -877,24 +886,23 @@ async function handleApiQuery(url, clientIP, env, clientCountry = '') {
     try {
         const result = await resolveDNS(domain, type, config, config.clientIp);
         if (result.httpsRecord) delete result.httpsRecord;
-        const maxAge = result.ttl ?? ((type === 'HTTPS') ? 600 : 300);
-        const body = JSON.stringify(result);
-        
-        if (cacheable) {
-            STATIC_RESPONSE_CACHE.set(cacheKey, { body, expire: Date.now() + STATIC_RESPONSE_TTL });
+        const entry = cacheKey ? staticJsonEntry(result) : null;
+        if (entry) {
+            staticJsonRemember(cacheKey, entry);
             try {
-                await caches.default.put(`https://dns-cache/static/${cacheKey}`, new Response(body, {
-                    headers: { 'Cache-Control': `public, max-age=${maxAge}, s-maxage=${maxAge}` }
+                await caches.default.put(`https://dns-cache/static/${cacheKey}`, new Response(JSON.stringify(result), {
+                    headers: { 'Cache-Control': `public, max-age=${entry.ttl}, s-maxage=${entry.ttl}`,
+                        'X-DNS-Stored-At': String(entry.stored) }
                 }));
             } catch (e) {}
         }
-        
-        return new Response(body, {
+        const ttl = entry ? Math.max(0, entry.ttl - Math.ceil((Date.now() - entry.stored) / 1000)) : 0;
+        return new Response(JSON.stringify(entry ? {...result, ttl} : result), {
             status: 200,
             headers: {
                 'Content-Type': 'application/json',
                 'Access-Control-Allow-Origin': '*',
-                'Cache-Control': cacheable ? `public, max-age=${maxAge}, s-maxage=${maxAge}` : 'no-store',
+                'Cache-Control': entry && ttl > 0 ? `public, max-age=${ttl}, s-maxage=${ttl}` : 'no-store',
                 'Vary': 'Accept-Encoding'
             }
         });

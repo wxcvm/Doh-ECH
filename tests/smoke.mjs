@@ -457,6 +457,48 @@ try {
 } finally {
   Date.now = staticClock;
 }
+// Static JSON cache must retain the original age even when promoted from Cache API.
+const jsonClock = Date.now;
+const jsonStart = jsonClock();
+const jsonDomain = 'ttl-regression.cloudflare.com';
+const jsonPath = '/api/query?domain=' + jsonDomain + '&type=A';
+const jsonKey = 'https://dns-cache/static/v3:' + jsonDomain + ':A';
+try {
+  Date.now = () => jsonStart;
+  const first = await request(jsonPath);
+  const firstBody = await first.json();
+  assert.equal(firstBody.ttl, 300);
+  assert.equal(first.headers.get('Cache-Control'), 'public, max-age=300, s-maxage=300');
+  assert.ok(cache.get(jsonKey));
+  Date.now = () => jsonStart + 5000;
+  const aged = await request(jsonPath);
+  assert.equal(aged.headers.get('X-Cache'), 'STATIC_HIT');
+  assert.equal((await aged.json()).ttl, 295);
+  assert.equal(aged.headers.get('Cache-Control'), 'public, max-age=295, s-maxage=295');
+  Date.now = () => jsonStart + 300000;
+  const expired = await request(jsonPath);
+  assert.equal(expired.headers.get('X-Cache'), null, 'expired shared JSON must not renew local lifetime');
+  const sharedDomain = 'shared-ttl.cloudflare.com';
+  const sharedKey = 'https://dns-cache/static/v3:' + sharedDomain + ':A';
+  cache.set(sharedKey, Response.json({domain:sharedDomain,type:'A',answers:['192.0.2.1'],ttl:30}, {
+    headers:{'X-DNS-Stored-At':String(Date.now()-10000)}
+  }));
+  const shared = await request('/api/query?domain='+sharedDomain+'&type=A');
+  assert.equal(shared.headers.get('X-Cache'), 'STATIC_HIT');
+  assert.equal((await shared.json()).ttl, 20);
+  Date.now = () => jsonStart + 320000;
+  const expiredShared = await request('/api/query?domain='+sharedDomain+'&type=A');
+  assert.equal(expiredShared.headers.get('X-Cache'), null);
+  const invalidDomain = 'invalid-ttl.cloudflare.com';
+  cache.set('https://dns-cache/static/v3:'+invalidDomain+':A', Response.json({
+    domain:invalidDomain,type:'A',answers:[],rcode:2,ttl:300
+  }, {headers:{'X-DNS-Stored-At':String(Date.now())}}));
+  const invalid = await request('/api/query?domain='+invalidDomain+'&type=A');
+  assert.equal(invalid.headers.get('X-Cache'), null, 'failed responses cannot enter the positive cache');
+  assert.ok((await invalid.json()).answers.length);
+} finally {
+  Date.now = jsonClock;
+}
 const txt = await request('/api/query?domain=cloudflare.com&type=TXT');
 assert.equal(txt.headers.get('Cache-Control'), 'no-store', 'dynamic TXT must not use fixed-address cache');
 count = ecsCalls('ech-race.example').length;

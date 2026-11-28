@@ -154,6 +154,19 @@ function metricsSnapshot(){
         upstreams:Object.entries(m.upstreams).map(([key,v])=>({key,...v,validRate:rate(v.valid,v.completed),avgMs:mean(v.ms,v.completed)}))};
 }
 // Observe final client DNS replies once, not internal upstream attempts or the JSON console.
+// RFC 8484: cache only ordinary GET responses whose complete positive DNS
+// answer has a known minimum TTL. No shared HTTP caches or personalized requests.
+const PRIVATE_DOH_VARY = ['Accept','Authorization','Cookie','X-Ip4','X-Ip6','X-MetaIp4','X-MetaIp6','X-CF','X-Meta','X-ECH','X-Best','X-Sub','X-Exclude','X-Shuffle','X-Area','X-Enhance','X-Pins','X-XH3','X-CN-ECS','X-Rules','X-Alpn','X-ClientIP','X-No6','X-Mandatory','X-NoCF6'];
+function privateDoHMaxAge(req, packet, body, hit) {
+    if(req.method!=='GET' || !['DOH_HIT','DOH_MISS'].includes(hit) || !packet) return 0;
+    const url=new URL(req.url);
+    if(!['/ech','/dns-query'].includes(url.pathname) || [...url.searchParams.keys()].length!==1 || !url.searchParams.has('dns')) return 0;
+    if(PRIVATE_DOH_VARY.slice(1).some(name=>req.headers.has(name))) return 0;
+    const v=new DataView(body);
+    if(!(packet.flags&0x8000) || (packet.flags&0x022f) || packet.questions.length!==1 ||
+       ![1,28].includes(packet.questions[0].type) || !v.getUint16(6) || v.getUint16(8) || v.getUint16(10)) return 0;
+    return Math.min(300,...packet.records.map(r=>r.ttl>=0x80000000?0:r.ttl));
+}
 async function monitoredDoH(req,injectEch,ctx,clientIP,env){
     const m=runtimeMetrics.wire,start=Date.now();m.requests++;
     let outcome='other',cache='none',route='other';
@@ -171,7 +184,13 @@ async function monitoredDoH(req,injectEch,ctx,clientIP,env){
             outcome=String(code);
             const hit=response.headers.get('X-Cache');
             if(['DOMESTIC_HIT','INTERNATIONAL_HIT','DOH_HIT'].includes(hit))cache=hit;
-            return new Response(body,{status:response.status,headers:response.headers});
+            const headers=new Headers(response.headers);
+            const maxAge=privateDoHMaxAge(req,packet,body,hit);
+            if(maxAge>0){
+                headers.set('Cache-Control',`private, max-age=${maxAge}`);
+                headers.set('Vary',PRIVATE_DOH_VARY.join(', '));
+            }
+            return new Response(body,{status:response.status,headers});
         }
         return response;
     }catch(e){m.exceptions++;outcome='exception';throw e;}

@@ -186,7 +186,7 @@ try {
     await route.fulfill({json:{metrics:{scope:'isolate',startedAt:'start',updatedAt:'now',
       wire:{requests:3,completed:3,rcode:{'0':2,'2':1},httpErrors:0,exceptions:0,avgMs:12},
       routing:{domestic:2,international:1,domesticAvgMs:10,internationalAvgMs:16,fallback:0},
-      cache:{domestic:{hits:1,misses:1,bypasses:0,hitRate:50,entries:1},json:{hits:0,misses:0,hitRate:null}},
+      cache:{domestic:{hits:1,misses:1,bypasses:0,hitRate:50,entries:1},international:{hits:2,misses:1,bypasses:0,hitRate:66.67,entries:2},json:{hits:0,misses:0,hitRate:null}},
       ecs:{wireAttempts:1,wireAccepted:1,wireRetries:0,jsonRetries:0},upstreams:[]},
       cnList:{domainCount:42,lastFetch:null},caches:{memory:{echCache:'warm'}}}});
   });
@@ -194,6 +194,7 @@ try {
   await page.locator('#refresh').click();
   await page.locator('#stats').waitFor();
   assert.match(await page.locator('#cache').textContent(),/50%/);
+  assert.match(await page.locator('#internationalCache').textContent(),/66\.67%/);
   assert.match(await page.locator('#jsonCache').textContent(),/—/);
   assert.match(await page.locator('#wire').textContent(),/SERVFAIL1/);
   await page.locator('#lock').click();

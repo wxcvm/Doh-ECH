@@ -335,6 +335,12 @@ HTTP/3 专项需要能启动且 `curl --version` 的 Features 行包含 HTTP3 �
 
 A/AAAA/HTTPS 并行查询，各自独立显示等待、正常记录、无记录、策略屏蔽或失败。HTTPS 结果包含全部原生记录文本（包括 AliasMode），即使没有 ECH 也可查看；查询台不会伪造缺失记录。国内均衡普通 A/AAAA 缓存命中时返回 `X-Cache: DOMESTIC_HIT`，仅在同一 Worker isolate 中复用；不同节点、复杂查询或过期记录仍按原路径请求上游。缓存不是对客户端实测性能的承诺。
 
+### DoH 客户端缓存与免费请求额度
+
+默认参数的 `/ech`、`/dns-query` GET 固定地址正响应可获得 `Cache-Control: private, max-age=N`，其中 N 不超过 DNS 最短剩余 TTL，且最多 300 秒。POST、个性化参数或请求头、错误响应、非固定地址响应及携带附加记录的响应仍为 `no-store`。不允许共享 HTTP 缓存复用这些 DoH 响应。
+
+此优化仅对遵循 HTTP 缓存的 GET 客户端有效；Worker 内部缓存命中仍计入调用次数。优先使用客户端本地 DNS 缓存并避免重复配置多个相同的上游。实际请求降幅应通过 Cloudflare Workers Analytics 的 UTC 日请求量验证，不以内部缓存命中率替代。
+
 ### 私有运行监控
 
 访问 `/monitor`，输入 Worker 已配置的 `DOH_ADMIN_TOKEN`，读取 `/log` 的统计。未配置或令牌不匹配时 `/log` 返回 404；监控页面本身不包含统计或令牌，令牌不存储、不进入 URL，锁定后清空。通过 Cloudflare Worker 的变量与密钥设置添加同名 Secret（不要写入仓库），无需新数据库。

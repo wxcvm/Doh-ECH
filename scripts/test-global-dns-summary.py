@@ -19,6 +19,14 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(result["avg_ms"], 17.5)
         self.assertEqual(result["routes"], {"domestic": 9, "domestic_fallback": 1, "other": 2})
 
+    def test_static_wire_hits(self):
+        result = summary.summarize([
+            {"outcome":"0","cache":"DOH_HIT","route":"other","requests":4,"total_ms":8},
+            {"outcome":"0","cache":"INTERNATIONAL_HIT","route":"international","requests":2,"total_ms":6},
+            {"outcome":"0","cache":"none","route":"other","requests":2,"total_ms":10},
+        ])
+        self.assertEqual(result["cache_hit_rate"], .75)
+
     def test_empty(self):
         result = summary.summarize([])
         self.assertIsNone(result["avg_ms"])

@@ -369,6 +369,12 @@ A/AAAA/HTTPS 并行查询，各自独立显示等待、正常记录、无记录�
 
 参考 [Cloudflare WAF 规则额度](https://developers.cloudflare.com/waf/) 与 [workers.dev 配置](https://developers.cloudflare.com/workers/configuration/routing/workers-dev/)。本项目不自动修改 WAF、禁用域名或新增收费资源。
 
+### 部署隔离与上线检查
+
+Cloudflare Workers Builds 的非生产分支构建命令必须是 `npx wrangler versions upload`，不能使用 `npx wrangler deploy`；后者会直接切换正式流量。PR 草稿或未合并状态并不能阻止错误配置的自动部署。默认分支的自动部署策略单独管理，不因修改预览构建而改变。
+
+发布前记录正式 Worker 当前活动版本 ID、测试 Worker 版本 ID 及 Git commit。非生产分支构建完成后，核对正式活动版本未改变，再运行真实 DNS 测试。仅上传版本并不等于已部署到测试 Worker；测试 Worker 应独立发布。全量部署前确认现有 Secret 和绑定保留、回滚版本可用，并比较 DNS RCODE、延迟和实际日请求量。
+
 ### 每日 Worker 免费额度检查
 
 使用已有的只读 Account Analytics API Token 和环境变量 `CF_ACCOUNT_ID`、`CF_ANALYTICS_TOKEN`，从 Cloudflare GraphQL 查询账户级 UTC 当日 Worker 调用量，无需调用 DoH 端点：

@@ -198,7 +198,13 @@ async function monitoredDoH(req,injectEch,ctx,clientIP,env){
         const elapsed=Math.max(0,Date.now()-start);
         m.completed++;m.ms+=elapsed;
         // Optional native Analytics Engine binding: no network await or query identifiers.
-        try{env?.DOH_ANALYTICS?.writeDataPoint({indexes:['doh'],blobs:[outcome,cache,route],doubles:[elapsed]});}catch{}
+        try{
+            // Fixed categories only: never record URLs, query strings, headers or client IDs.
+            const path=new URL(req.url).pathname;
+            const endpoint=['/ech','/dns-query','/doh'].includes(path)?path.slice(1):'compat';
+            const method=['GET','POST'].includes(req.method)?req.method:'other';
+            env?.DOH_ANALYTICS?.writeDataPoint({indexes:['doh'],blobs:[outcome,cache,route,method,endpoint],doubles:[elapsed]});
+        }catch{}
     }
 }
 function balancedCacheKey(raw, prefix, p, types=[1,28]) {

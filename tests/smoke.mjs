@@ -841,6 +841,11 @@ assert.equal(points.length,5);
 assert.deepEqual(points.slice(2).map(p=>p.blobs[2]),['domestic','international','domestic_fallback']);
 assert.ok(points.every(p=>p.blobs.length===3));
 assert.ok(!JSON.stringify(points).includes('analytics-domestic.example.cn'));
+const staticMetricBody=question('analytics-static.cloudflare.com',1);
+await request('/ech',{...metricOpts,body:staticMetricBody},analyticsEnv);
+const staticMetric=await request('/ech',{...metricOpts,body:staticMetricBody},analyticsEnv);
+assert.equal(staticMetric.headers.get('X-Cache'),'DOH_HIT');
+assert.deepEqual(points.at(-1).blobs,['0','DOH_HIT','other']);
 const failedAnalytics={...admin,DOH_ANALYTICS:{writeDataPoint(){throw new Error('analytics unavailable');}}};
 assert.equal((await request('/doh',{method:'POST',headers:{'Content-Type':'application/dns-message'},body:question('analytics.example')},failedAnalytics)).status,200);
 // Empty EDNS0 queries get a distinct cache entry; OPT flags are never aged.

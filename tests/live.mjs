@@ -183,4 +183,39 @@ await check('domestic empty EDNS0 A queries and cache observations', async()=>{
   }
   console.log('Domestic EDNS observed cache hits: '+hits+'/3 (isolate-local; not a guaranteed hit rate)');
 });
+await check('static A GET private cache and POST/custom bypass', async () => {
+  const body=question('cloudflare.com',1);
+  const dns=body.toString('base64url');
+  const cases=[
+    ['/ech?dns='+dns, {headers:{Accept:'application/dns-message'}}, true],
+    ['/ech', {method:'POST',headers:{'Content-Type':'application/dns-message'},body}, false],
+    ['/ech?dns='+dns+'&shuffle=false', {}, false],
+    ['/ech?dns='+dns, {headers:{'X-Shuffle':'false'}}, false]
+  ];
+  for(const [path,init,cacheable] of cases){
+    const response=await fetchEndpoint(path,init);
+    assert.equal(response.status,200);
+    const data=Buffer.from(await response.arrayBuffer());
+    assert.equal(data.readUInt16BE(0),0x6a41);
+    assert.equal(data.readUInt16BE(2)&15,0);
+    assert.ok(data.readUInt16BE(6)>0);
+    const policy=response.headers.get('cache-control');
+    if(cacheable){
+      assert.match(policy,/^private, max-age=\d+$/);
+      const age=Number(policy.split('=')[1]);
+      assert.ok(age>0&&age<=300&&age<=data.readUInt32BE(body.length+6));
+      assert.match(response.headers.get('vary')||'',/X-Shuffle/i);
+    }else assert.equal(policy,'no-store');
+  }
+});
+await check('static JSON TTL bounded by HTTP freshness',async()=>{
+  const response=await fetchEndpoint('/api/query?domain=cloudflare.com&type=A');
+  assert.equal(response.status,200);
+  const result=await response.json();
+  assert.ok(result.answers.length>0);
+  assert.ok(Number.isInteger(result.ttl)&&result.ttl>=0&&result.ttl<=300);
+  const cc=response.headers.get('cache-control')||'';
+  if(result.ttl>0) assert.equal(cc,`public, max-age=${result.ttl}, s-maxage=${result.ttl}`);
+  else assert.equal(cc,'no-store');
+});
 console.log('All ' + passed + ' live Worker checks passed; this verifies DNS behavior, not end-to-end ECH/TLS connectivity.');

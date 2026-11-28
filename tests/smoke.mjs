@@ -457,6 +457,7 @@ try {
 } finally {
   Date.now = staticClock;
 }
+{
 // Static JSON cache must retain the original age even when promoted from Cache API.
 const jsonClock = Date.now;
 const jsonStart = jsonClock();
@@ -498,6 +499,7 @@ try {
   assert.ok((await invalid.json()).answers.length);
 } finally {
   Date.now = jsonClock;
+}
 }
 const txt = await request('/api/query?domain=cloudflare.com&type=TXT');
 assert.equal(txt.headers.get('Cache-Control'), 'no-store', 'dynamic TXT must not use fixed-address cache');

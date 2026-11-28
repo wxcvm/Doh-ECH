@@ -443,6 +443,15 @@ try {
   assert.deepEqual(staticOriginal, Buffer.from(await staticGet.arrayBuffer()), 'GET and POST use the same static answer path');
   assert.equal(staticGet.headers.get('X-Cache'), 'DOH_HIT');
   const originalTTL = staticOriginal.readUInt32BE(staticBody.length + 6);
+  assert.equal(staticPost.headers.get('Cache-Control'),'no-store');
+  assert.equal(staticGet.headers.get('Cache-Control'),`private, max-age=${Math.min(originalTTL,300)}`);
+  assert.ok(staticGet.headers.get('Vary').includes('X-Enhance'));
+  const personalized = await request('/ech?dns='+staticBody.toString('base64url')+'&shuffle=false');
+  assert.equal(personalized.headers.get('Cache-Control'),'no-store');
+  const headerPersonalized = await request('/ech?dns='+staticBody.toString('base64url'),{headers:{'X-Shuffle':'false'}});
+  assert.equal(headerPersonalized.headers.get('Cache-Control'),'no-store');
+  const authorized = await request('/ech?dns='+staticBody.toString('base64url'),{headers:{Authorization:'Bearer test'}});
+  assert.equal(authorized.headers.get('Cache-Control'),'no-store');
   const sharedStatic = cache.get('https://dns-cache/ech-v3/cloudflare.com:1');
   assert.ok(sharedStatic, 'positive response should be shared');
   assert.equal(sharedStatic.headers.get('X-DNS-Stored-At'), String(staticStart));
@@ -451,6 +460,7 @@ try {
   const aged = await request('/ech?dns=' + staticBody.toString('base64url'));
   assert.equal(aged.headers.get('X-Cache'), 'DOH_HIT');
   assert.equal(Buffer.from(await aged.arrayBuffer()).readUInt32BE(staticBody.length + 6), originalTTL - 5);
+  assert.equal(aged.headers.get('Cache-Control'),`private, max-age=${Math.min(originalTTL-5,300)}`);
   Date.now = () => staticStart + Math.min(originalTTL, 300)*1000;
   const expired = await request('/ech?dns=' + staticBody.toString('base64url'));
   assert.equal(expired.headers.get('X-Cache'), 'DOH_MISS', 'expired shared entries must not renew the local TTL');

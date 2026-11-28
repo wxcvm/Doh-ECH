@@ -5,6 +5,7 @@ on:
     paths:
       - '.github/workflows/balanced-production-probe.yml'
       - 'scripts/balanced-probe.py'
+      - 'scripts/benchmark-summary.py'
 permissions:
   contents: read
 jobs:
@@ -24,6 +25,16 @@ jobs:
         if: ${{ always() }}
         run: |
           python3 scripts/balanced-probe.py --url 'https://doh-ech.shizuku2023.workers.dev/ech?enhance=balanced&cnEcs=auto' --rounds 1 --timeout 5 | tee balanced-worker-direct.json
+      - name: Summarize DNS latency without additional requests
+        if: ${{ always() }}
+        run: |
+          for f in balanced-production.json balanced-production-get.json balanced-worker-direct.json; do
+            if [ -s "$f" ]; then
+              echo "### $f" >> "$GITHUB_STEP_SUMMARY"
+              python3 scripts/benchmark-summary.py "$f" --markdown >> "$GITHUB_STEP_SUMMARY"
+              python3 scripts/benchmark-summary.py "$f" > "${f%.json}-summary.json"
+            fi
+          done
       - name: Upload raw measurements
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
@@ -34,6 +45,7 @@ jobs:
             balanced-production.json
             balanced-production-get.json
             balanced-worker-direct.json
+            balanced-*-summary.json
       - name: Verify DNS responses
         run: |
           python3 - <<'PY'

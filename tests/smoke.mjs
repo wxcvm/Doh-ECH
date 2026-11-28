@@ -433,10 +433,30 @@ for (const name of ['cloudflare.com', 'cf.ech']) {
 const unavailable = await request('/ech?ech=no-ech.example', { method: 'POST', headers: {'Content-Type':'application/dns-message'}, body: question('cf.ech', 65) });
 assert.equal(Buffer.from(await unavailable.arrayBuffer()).readUInt16BE(2) & 15, 2, 'missing ECH config must not masquerade as successful fake ECH');
 const staticBody = question('cloudflare.com', 1);
-const staticPost = await request('/ech', { method:'POST', headers:{'Content-Type':'application/dns-message'}, body:staticBody });
-const staticGet = await request('/ech?dns=' + staticBody.toString('base64url'));
-assert.deepEqual(Buffer.from(await staticPost.arrayBuffer()), Buffer.from(await staticGet.arrayBuffer()), 'GET and POST use the same static answer path');
-assert.equal(staticGet.headers.get('X-Cache'), 'DOH_HIT');
+const staticClock = Date.now;
+const staticStart = staticClock();
+try {
+  Date.now = () => staticStart;
+  const staticPost = await request('/ech', { method:'POST', headers:{'Content-Type':'application/dns-message'}, body:staticBody });
+  const staticGet = await request('/ech?dns=' + staticBody.toString('base64url'));
+  const staticOriginal = Buffer.from(await staticPost.arrayBuffer());
+  assert.deepEqual(staticOriginal, Buffer.from(await staticGet.arrayBuffer()), 'GET and POST use the same static answer path');
+  assert.equal(staticGet.headers.get('X-Cache'), 'DOH_HIT');
+  const originalTTL = staticOriginal.readUInt32BE(staticBody.length + 6);
+  const sharedStatic = cache.get('https://dns-cache/ech-v3/cloudflare.com:1');
+  assert.ok(sharedStatic, 'positive response should be shared');
+  assert.equal(sharedStatic.headers.get('X-DNS-Stored-At'), String(staticStart));
+  assert.equal(sharedStatic.headers.get('Cache-Control'), `public, max-age=${Math.min(originalTTL, 300)}, s-maxage=${Math.min(originalTTL, 300)}`);
+  Date.now = () => staticStart + 5000;
+  const aged = await request('/ech?dns=' + staticBody.toString('base64url'));
+  assert.equal(aged.headers.get('X-Cache'), 'DOH_HIT');
+  assert.equal(Buffer.from(await aged.arrayBuffer()).readUInt32BE(staticBody.length + 6), originalTTL - 5);
+  Date.now = () => staticStart + Math.min(originalTTL, 300)*1000;
+  const expired = await request('/ech?dns=' + staticBody.toString('base64url'));
+  assert.equal(expired.headers.get('X-Cache'), 'DOH_MISS', 'expired shared entries must not renew the local TTL');
+} finally {
+  Date.now = staticClock;
+}
 const txt = await request('/api/query?domain=cloudflare.com&type=TXT');
 assert.equal(txt.headers.get('Cache-Control'), 'no-store', 'dynamic TXT must not use fixed-address cache');
 count = ecsCalls('ech-race.example').length;

@@ -27,6 +27,15 @@ class SummaryTests(unittest.TestCase):
         ])
         self.assertEqual(result["cache_hit_rate"], .75)
 
+    def test_transport_breakdown(self):
+        result = summary.summarize([
+            {"outcome":"0","cache":"none","route":"other","method":"POST","endpoint":"ech","requests":7,"total_ms":14},
+            {"outcome":"0","cache":"DOH_HIT","route":"other","method":"GET","endpoint":"dns-query","requests":2,"total_ms":4},
+            {"outcome":"0","cache":"none","requests":1,"total_ms":2},
+        ])
+        self.assertEqual(result["methods"], {"POST":7,"GET":2,"unclassified":1})
+        self.assertEqual(result["endpoints"], {"ech":7,"dns-query":2,"unclassified":1})
+
     def test_empty(self):
         result = summary.summarize([])
         self.assertIsNone(result["avg_ms"])

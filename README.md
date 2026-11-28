@@ -341,6 +341,17 @@ A/AAAA/HTTPS 并行查询，各自独立显示等待、正常记录、无记录�
 
 此优化仅对遵循 HTTP 缓存的 GET 客户端有效；Worker 内部缓存命中仍计入调用次数。优先使用客户端本地 DNS 缓存并避免重复配置多个相同的上游。实际请求降幅应通过 Cloudflare Workers Analytics 的 UTC 日请求量验证，不以内部缓存命中率替代。
 
+### 每日 Worker 免费额度检查
+
+使用已有的只读 Account Analytics API Token 和环境变量 `CF_ACCOUNT_ID`、`CF_ANALYTICS_TOKEN`，从 Cloudflare GraphQL 查询账户级 UTC 当日 Worker 调用量，无需调用 DoH 端点：
+
+```bash
+python scripts/worker-quota.py
+python scripts/worker-quota.py --warn 80 --critical 95 --fail-on-warning
+```
+
+默认免费额度为 100000 次/UTC 日，80% 告警、95% 严重、100% 耗尽。支持 `--limit` 自定义额度；输出包含预计剩余量、UTC 重置时间及各 Worker 的调用量。数据是 Analytics 估计值（可能采样、延迟，且不等同于完整计费记录）；最终额度以 Cloudflare Dashboard 为准。API 失败退出码为 2，启用 `--fail-on-warning` 时达到告警阈值退出码为 1。脚本不写入 Cloudflare、不生成 DNS 请求、不保存令牌。未配置自动执行或通知时，仅在手动运行时检查。
+
 ### 私有运行监控
 
 访问 `/monitor`，输入 Worker 已配置的 `DOH_ADMIN_TOKEN`，读取 `/log` 的统计。未配置或令牌不匹配时 `/log` 返回 404；监控页面本身不包含统计或令牌，令牌不存储、不进入 URL，锁定后清空。通过 Cloudflare Worker 的变量与密钥设置添加同名 Secret（不要写入仓库），无需新数据库。

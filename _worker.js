@@ -1938,6 +1938,17 @@ function raceUpstreams(endpoints, kind, run, preferred, betterFallback = (a, b) 
         return h.latency + h.failures * 250;
     };
     const ordered = [...endpoints].sort((a, b) => score(a) - score(b));
+    // Domestic wire latency varies substantially by edge and record type.
+    // Hedge earlier when the observed primary is slow or unhealthy, without
+    // changing resolver membership, reply validation, or per-attempt timeouts.
+    const domesticWire = kind === 'wire' && endpoints === BALANCED_CN_WIRE;
+    const hedgeDelay = url => {
+        if (!domesticWire) return 100;
+        const h = upstreamHealth.get(key(url));
+        if (!h || now < h.updated || now - h.updated > 60_000) return 50;
+        if (h.failures) return 25;
+        return Math.max(25, Math.min(100, Math.round(100 - h.latency / 2)));
+    };
     return new Promise((resolve, reject) => {
         let next = 0, pending = 0, timer = null, done = false, fallback = null;
         function finish(value, error) {
@@ -1979,7 +1990,7 @@ function raceUpstreams(endpoints, kind, run, preferred, betterFallback = (a, b) 
                 if (next < ordered.length) launch();
                 else if (!pending) finish(fallback, fallback ? null : new Error('all upstreams failed'));
             });
-            if (next < ordered.length) timer = setTimeout(launch, 100);
+            if (next < ordered.length) timer = setTimeout(launch, hedgeDelay(url));
         }
         if (!ordered.length) finish(null, new Error('no upstreams'));
         else launch();

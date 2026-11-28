@@ -212,7 +212,7 @@ function balancedCacheRead(cache,key,id) {
     for(const offset of entry.offsets)v.setUint32(offset,v.getUint32(offset)-age);
     return out;
 }
-function balancedCacheWrite(cache,key,packet,type,clientOpt) {
+function balancedCacheWrite(cache,key,packet,type,clientOpt,stored=Date.now()) {
     if(!key || packet.byteLength>4096)return;
     const p=inspectDnsWire(packet),v=new DataView(packet);
     if(!p || (p.flags&0x022f) || !v.getUint16(6) || v.getUint16(8))return;
@@ -229,7 +229,7 @@ function balancedCacheWrite(cache,key,packet,type,clientOpt) {
     // Replacing an existing entry must not evict an unrelated hot name.
     cache.delete(key);
     if(cache.size>=512)cache.delete(cache.keys().next().value);
-    cache.set(key,{packet:packet.slice(0),stored:Date.now(),ttl,offsets:records.map(r=>r.ttlOffset)});
+    cache.set(key,{packet:packet.slice(0),stored,ttl,offsets:records.map(r=>r.ttlOffset)});
 }
 async function forwardBalanced(rawBuffer, domain, config, clientIP) {
     const domestic=balancedDomestic(domain),group=domestic?'domestic':'international',start=Date.now(),m=runtimeMetrics.routing;
@@ -597,7 +597,7 @@ async function readLimitedDnsBody(req, maxBytes) {
 
 // DoH GET 请求缓存（仅缓存静态域名 + 固定参数）
 const DOH_GET_CACHE = new Map();
-const DOH_GET_TTL = 300000; // 5分钟
+// Fixed-address wire responses use the same bounded, TTL-aware positive cache as Balanced.
 
 async function handleDoHRequest(req, injectEch, ctx, clientIP, env) {
     const url = new URL(req.url);
@@ -723,20 +723,21 @@ async function handleDnsQuery(rawBuffer, config, ctx, clientIP) {
             // 否则带 ip4/ip6/no6/enhance/rules/alpn 的请求会污染全站缓存（或反过来被默认结果屏蔽）。
             // 缓存体固定为 ID=0、不含 OPT 的规范形式：读取时再回写事务 ID、按需追加 OPT。
             const cacheable = caseNeutral && isCacheableStaticRequest(qName, config, qType === 28 ? 'AAAA' : qType === 1 ? 'A' : 'HTTPS');
-            const cKey = cacheable ? `ech-v2:${qName}:${qType}` : null;
+            const cKey = cacheable ? `ech-v3:${qName}:${qType}` : null;
             if (cKey) {
-                const cachedIt = DOH_GET_CACHE.get(cKey);
-                if (cachedIt && Date.now() < cachedIt.expire) {
-                    const body = withDnsId(cachedIt.body, id);
-                    return dnsResponse(echoEdns ? appendOpt(body) : body, { 'X-Cache': 'DOH_HIT' });
-                }
+                const cached = balancedCacheRead(DOH_GET_CACHE, cKey, id);
+                if (cached) return dnsResponse(echoEdns ? appendOpt(cached) : cached, { 'X-Cache': 'DOH_HIT' });
                 try {
-                    const sharedRes = await caches.default.match(`https://dns-cache/ech-v2/${qName}:${qType}`);
+                    const sharedRes = await caches.default.match(`https://dns-cache/ech-v3/${qName}:${qType}`);
                     if (sharedRes) {
-                        const sBody = await sharedRes.arrayBuffer();
-                        DOH_GET_CACHE.set(cKey, { body: sBody, expire: Date.now() + DOH_GET_TTL });
-                        const body = withDnsId(sBody, id);
-                        return dnsResponse(echoEdns ? appendOpt(body) : body, { 'X-Cache': 'DOH_HIT' });
+                        const storedHeader = sharedRes.headers.get('X-DNS-Stored-At');
+                        const stored = Number(storedHeader);
+                        if (storedHeader && Number.isSafeInteger(stored) && stored > 0 && stored <= Date.now()) {
+                            const sBody = await sharedRes.arrayBuffer();
+                            balancedCacheWrite(DOH_GET_CACHE, cKey, sBody, qType, false, stored);
+                            const body = balancedCacheRead(DOH_GET_CACHE, cKey, id);
+                            if (body) return dnsResponse(echoEdns ? appendOpt(body) : body, { 'X-Cache': 'DOH_HIT' });
+                        }
                     }
                 } catch (e) {}
             }
@@ -744,12 +745,15 @@ async function handleDnsQuery(rawBuffer, config, ctx, clientIP) {
             if (!cKey) return dnsResponseFromResult(id, rawQName, qType, result, echoEdns);
             const canonical = buildDnsResponseBody(0, rawQName, qType, result, false);
             if (cKey) {
-                DOH_GET_CACHE.set(cKey, { body: canonical, expire: Date.now() + DOH_GET_TTL });
-                try {
-                    await caches.default.put(`https://dns-cache/ech-v2/${qName}:${qType}`, new Response(canonical, {
-                        headers: { 'Cache-Control': 'public, max-age=300, s-maxage=300' }
-                    }));
-                } catch (e) {}
+                balancedCacheWrite(DOH_GET_CACHE, cKey, canonical, qType, false);
+                const entry = DOH_GET_CACHE.get(cKey);
+                if (entry) {
+                    try {
+                        await caches.default.put(`https://dns-cache/ech-v3/${qName}:${qType}`, new Response(canonical, {
+                            headers: { 'Cache-Control': `public, max-age=${entry.ttl}, s-maxage=${entry.ttl}`, 'X-DNS-Stored-At': String(entry.stored) }
+                        }));
+                    } catch (e) {}
+                }
             }
             const outBody = withDnsId(canonical, id);
             return dnsResponse(echoEdns ? appendOpt(outBody) : outBody, cacheable ? { 'X-Cache': 'DOH_MISS' } : null);

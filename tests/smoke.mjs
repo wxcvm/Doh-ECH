@@ -832,8 +832,8 @@ await request('/doh',{method:'POST',headers:{'Content-Type':'application/dns-mes
 await request('/doh?dns=AA',{},analyticsEnv);
 assert.equal(points.length,2);
 assert.deepEqual(points[0].indexes,['doh']);
-assert.deepEqual(points[0].blobs,['0','none','other']);
-assert.deepEqual(points[1].blobs,['http_error','none','other']);
+assert.deepEqual(points[0].blobs,['0','none','other','POST','doh']);
+assert.deepEqual(points[1].blobs,['http_error','none','other','GET','doh']);
 assert.ok(points.every(p=>p.doubles.length===1&&p.doubles[0]>=0));
 assert.ok(!JSON.stringify(points).includes('analytics.example'));
 // The optional global write records routes, including safe international fallback.
@@ -851,13 +851,13 @@ domesticWireOutage=false;
 assert.equal(fallbackMetric.headers.get('X-DNS-Route'),'domestic_fallback');
 assert.equal(points.length,5);
 assert.deepEqual(points.slice(2).map(p=>p.blobs[2]),['domestic','international','domestic_fallback']);
-assert.ok(points.every(p=>p.blobs.length===3));
+assert.ok(points.every(p=>p.blobs.length===5));
 assert.ok(!JSON.stringify(points).includes('analytics-domestic.example.cn'));
 const staticMetricBody=question('analytics-static.cloudflare.com',1);
 await request('/ech',{...metricOpts,body:staticMetricBody},analyticsEnv);
 const staticMetric=await request('/ech',{...metricOpts,body:staticMetricBody},analyticsEnv);
 assert.equal(staticMetric.headers.get('X-Cache'),'DOH_HIT');
-assert.deepEqual(points.at(-1).blobs,['0','DOH_HIT','other']);
+assert.deepEqual(points.at(-1).blobs,['0','DOH_HIT','other','POST','ech']);
 const failedAnalytics={...admin,DOH_ANALYTICS:{writeDataPoint(){throw new Error('analytics unavailable');}}};
 assert.equal((await request('/doh',{method:'POST',headers:{'Content-Type':'application/dns-message'},body:question('analytics.example')},failedAnalytics)).status,200);
 // Empty EDNS0 queries get a distinct cache entry; OPT flags are never aged.

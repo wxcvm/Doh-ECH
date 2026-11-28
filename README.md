@@ -335,6 +335,57 @@ HTTP/3 专项需要能启动且 `curl --version` 的 Features 行包含 HTTP3 �
 
 A/AAAA/HTTPS 并行查询，各自独立显示等待、正常记录、无记录、策略屏蔽或失败。HTTPS 结果包含全部原生记录文本（包括 AliasMode），即使没有 ECH 也可查看；查询台不会伪造缺失记录。国内均衡普通 A/AAAA 缓存命中时返回 `X-Cache: DOMESTIC_HIT`，仅在同一 Worker isolate 中复用；不同节点、复杂查询或过期记录仍按原路径请求上游。缓存不是对客户端实测性能的承诺。
 
+### DoH 客户端缓存与免费请求额度
+
+默认参数的 `/ech`、`/dns-query` GET 固定地址正响应可获得 `Cache-Control: private, max-age=N`，其中 N 不超过 DNS 最短剩余 TTL，且最多 300 秒。POST、个性化参数或请求头、错误响应、非固定地址响应及携带附加记录的响应仍为 `no-store`。不允许共享 HTTP 缓存复用这些 DoH 响应。
+
+此优化仅对遵循 HTTP 缓存的 GET 客户端有效；Worker 内部缓存命中仍计入调用次数。优先使用客户端本地 DNS 缓存并避免重复配置多个相同的上游。实际请求降幅应通过 Cloudflare Workers Analytics 的 UTC 日请求量验证，不以内部缓存命中率替代。
+
+### AdGuard Android：减少实际 DNS 请求次数
+
+优先在客户端复用 DNS 响应，而非单纯增加 Worker 内部缓存。建议在设置 → 常规 → 高级 → 低级设置 → DNS 保护中进行单变量对照测试：
+
+| 设置 | 建议起点 |
+| --- | --- |
+| DNS 缓存大小 | 由默认 1000 增至 4096；如有容量压力再试 8192 |
+| DNS 请求超时 | 保持默认 5000 ms，避免盲目缩短导致备用解析与重试 |
+| 已拦截响应 TTL | 保留默认 3600 秒；不人为延长上游正常 DNS TTL |
+| ECH 拦截 | 关闭（需要 ECH 时） |
+| HTTP/3 DoH | 保留当前设置；有实际网络测试后再调整 |
+| 备用 DNS | 保留可用且信任的备用解析；不要把同一个 Worker 同时配置为主备 |
+
+避免并行配置多个指向同一 Worker 的地址。若浏览器自行发送 DoH，先核对 AdGuard 的安全 DNS 过滤模式，再决定是否统一交给本地 DNS 代理；不要为减少请求关闭广告过滤、HTTPS 过滤或 ECH。备用 DNS 可能没有相同的 ECH、地域解析和隐私策略，须自行验证。
+
+按相近使用强度对比两个完整 UTC 日的 `worker-quota.py` 统计，并记录 AdGuard DNS 错误、客户端体验与内存变化。4096/8192 是建议测试值，不是实测最佳值。不同版本的菜单可能变化。参考 [AdGuard Android 官方低级设置](https://adguard.com/kb/adguard-for-android/features/low-level-settings/)。
+
+### 公网入口与防滥用
+
+真正保护 Worker 请求额度需要在 Worker 执行前限制异常请求，而不是仅在 Worker 内返回 403/429。Cloudflare Free zone 提供一条速率限制规则和五条自定义规则；先核对已有规则，不要覆盖既有安全策略。DNS 客户端不能处理浏览器验证码，不建议对 DoH 使用 Challenge。
+
+- 确认所有客户端、探测脚本、预览和备用入口的依赖后，才考虑禁用不需要的 `workers.dev` 入口。
+- 在自定义域名的边缘规则上先确认 DNS 真实峰值、共享 NAT、重试行为；避免低阈值误伤正常查询。
+- 若唯一免费速率限制规则已被占用，保留原规则，优先考虑客户端缓存及可验证的自定义过滤规则。不自动升级付费套餐。
+- 不将令牌写进 URL、仓库或日志。需要鉴权时，先验证客户端支持相应请求头或边缘认证；不要默认要求 AdGuard 发送自定义头。
+
+参考 [Cloudflare WAF 规则额度](https://developers.cloudflare.com/waf/) 与 [workers.dev 配置](https://developers.cloudflare.com/workers/configuration/routing/workers-dev/)。本项目不自动修改 WAF、禁用域名或新增收费资源。
+
+### 部署隔离与上线检查
+
+Cloudflare Workers Builds 的非生产分支构建命令必须是 `npx wrangler versions upload`，不能使用 `npx wrangler deploy`；后者会直接切换正式流量。PR 草稿或未合并状态并不能阻止错误配置的自动部署。默认分支的自动部署策略单独管理，不因修改预览构建而改变。
+
+发布前记录正式 Worker 当前活动版本 ID、测试 Worker 版本 ID 及 Git commit。非生产分支构建完成后，核对正式活动版本未改变，再运行真实 DNS 测试。仅上传版本并不等于已部署到测试 Worker；测试 Worker 应独立发布。全量部署前确认现有 Secret 和绑定保留、回滚版本可用，并比较 DNS RCODE、延迟和实际日请求量。
+
+### 每日 Worker 免费额度检查
+
+使用已有的只读 Account Analytics API Token 和环境变量 `CF_ACCOUNT_ID`、`CF_ANALYTICS_TOKEN`，从 Cloudflare GraphQL 查询账户级 UTC 当日 Worker 调用量，无需调用 DoH 端点：
+
+```bash
+python scripts/worker-quota.py
+python scripts/worker-quota.py --warn 80 --critical 95 --fail-on-warning
+```
+
+默认免费额度为 100000 次/UTC 日，80% 告警、95% 严重、100% 耗尽。支持 `--limit` 自定义额度；输出包含预计剩余量、UTC 重置时间及各 Worker 的调用量。数据是 Analytics 估计值（可能采样、延迟，且不等同于完整计费记录）；最终额度以 Cloudflare Dashboard 为准。API 失败退出码为 2，启用 `--fail-on-warning` 时达到告警阈值退出码为 1。脚本不写入 Cloudflare、不生成 DNS 请求、不保存令牌。未配置自动执行或通知时，仅在手动运行时检查。
+
 ### 私有运行监控
 
 访问 `/monitor`，输入 Worker 已配置的 `DOH_ADMIN_TOKEN`，读取 `/log` 的统计。未配置或令牌不匹配时 `/log` 返回 404；监控页面本身不包含统计或令牌，令牌不存储、不进入 URL，锁定后清空。通过 Cloudflare Worker 的变量与密钥设置添加同名 Secret（不要写入仓库），无需新数据库。

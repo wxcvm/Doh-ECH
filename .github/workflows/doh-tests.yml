@@ -6,6 +6,8 @@ on:
       - '_worker.js'
       - 'tests/**'
       - 'scripts/direct-probe.py'
+      - 'scripts/*quota.py'
+      - 'scripts/*global-dns-summary.py'
       - 'scripts/benchmark-balanced.mjs'
       - 'scripts/dns-benchmark-status.mjs'
       - '.github/workflows/doh-tests.yml'
@@ -34,3 +36,8 @@ jobs:
         run: node tests/json-answer-ownership.mjs
       - name: Test local direct probe
         run: python3 tests/test_direct_probe.py
+
+      - name: Test global DNS summary and daily quota monitoring
+        run: |
+          python3 scripts/test-global-dns-summary.py
+          python3 scripts/test-worker-quota.py

@@ -433,10 +433,84 @@ for (const name of ['cloudflare.com', 'cf.ech']) {
 const unavailable = await request('/ech?ech=no-ech.example', { method: 'POST', headers: {'Content-Type':'application/dns-message'}, body: question('cf.ech', 65) });
 assert.equal(Buffer.from(await unavailable.arrayBuffer()).readUInt16BE(2) & 15, 2, 'missing ECH config must not masquerade as successful fake ECH');
 const staticBody = question('cloudflare.com', 1);
-const staticPost = await request('/ech', { method:'POST', headers:{'Content-Type':'application/dns-message'}, body:staticBody });
-const staticGet = await request('/ech?dns=' + staticBody.toString('base64url'));
-assert.deepEqual(Buffer.from(await staticPost.arrayBuffer()), Buffer.from(await staticGet.arrayBuffer()), 'GET and POST use the same static answer path');
-assert.equal(staticGet.headers.get('X-Cache'), 'DOH_HIT');
+const staticClock = Date.now;
+const staticStart = staticClock();
+try {
+  Date.now = () => staticStart;
+  const staticPost = await request('/ech', { method:'POST', headers:{'Content-Type':'application/dns-message'}, body:staticBody });
+  const staticGet = await request('/ech?dns=' + staticBody.toString('base64url'));
+  const staticOriginal = Buffer.from(await staticPost.arrayBuffer());
+  assert.deepEqual(staticOriginal, Buffer.from(await staticGet.arrayBuffer()), 'GET and POST use the same static answer path');
+  assert.equal(staticGet.headers.get('X-Cache'), 'DOH_HIT');
+  const originalTTL = staticOriginal.readUInt32BE(staticBody.length + 6);
+  assert.equal(staticPost.headers.get('Cache-Control'),'no-store');
+  assert.equal(staticGet.headers.get('Cache-Control'),`private, max-age=${Math.min(originalTTL,300)}`);
+  assert.ok(staticGet.headers.get('Vary').includes('X-Enhance'));
+  const personalized = await request('/ech?dns='+staticBody.toString('base64url')+'&shuffle=false');
+  assert.equal(personalized.headers.get('Cache-Control'),'no-store');
+  const headerPersonalized = await request('/ech?dns='+staticBody.toString('base64url'),{headers:{'X-Shuffle':'false'}});
+  assert.equal(headerPersonalized.headers.get('Cache-Control'),'no-store');
+  const authorized = await request('/ech?dns='+staticBody.toString('base64url'),{headers:{Authorization:'Bearer test'}});
+  assert.equal(authorized.headers.get('Cache-Control'),'no-store');
+  const sharedStatic = cache.get('https://dns-cache/ech-v3/cloudflare.com:1');
+  assert.ok(sharedStatic, 'positive response should be shared');
+  assert.equal(sharedStatic.headers.get('X-DNS-Stored-At'), String(staticStart));
+  assert.equal(sharedStatic.headers.get('Cache-Control'), `public, max-age=${Math.min(originalTTL, 300)}, s-maxage=${Math.min(originalTTL, 300)}`);
+  Date.now = () => staticStart + 5000;
+  const aged = await request('/ech?dns=' + staticBody.toString('base64url'));
+  assert.equal(aged.headers.get('X-Cache'), 'DOH_HIT');
+  assert.equal(Buffer.from(await aged.arrayBuffer()).readUInt32BE(staticBody.length + 6), originalTTL - 5);
+  assert.equal(aged.headers.get('Cache-Control'),`private, max-age=${Math.min(originalTTL-5,300)}`);
+  Date.now = () => staticStart + Math.min(originalTTL, 300)*1000;
+  const expired = await request('/ech?dns=' + staticBody.toString('base64url'));
+  assert.equal(expired.headers.get('X-Cache'), 'DOH_MISS', 'expired shared entries must not renew the local TTL');
+} finally {
+  Date.now = staticClock;
+}
+{
+// Static JSON cache must retain the original age even when promoted from Cache API.
+const jsonClock = Date.now;
+const jsonStart = jsonClock();
+const jsonDomain = 'ttl-regression.cloudflare.com';
+const jsonPath = '/api/query?domain=' + jsonDomain + '&type=A';
+const jsonKey = 'https://dns-cache/static/v3:' + jsonDomain + ':A';
+try {
+  Date.now = () => jsonStart;
+  const first = await request(jsonPath);
+  const firstBody = await first.json();
+  assert.equal(firstBody.ttl, 300);
+  assert.equal(first.headers.get('Cache-Control'), 'public, max-age=300, s-maxage=300');
+  assert.ok(cache.get(jsonKey));
+  Date.now = () => jsonStart + 5000;
+  const aged = await request(jsonPath);
+  assert.equal(aged.headers.get('X-Cache'), 'STATIC_HIT');
+  assert.equal((await aged.json()).ttl, 295);
+  assert.equal(aged.headers.get('Cache-Control'), 'public, max-age=295, s-maxage=295');
+  Date.now = () => jsonStart + 300000;
+  const expired = await request(jsonPath);
+  assert.equal(expired.headers.get('X-Cache'), null, 'expired shared JSON must not renew local lifetime');
+  const sharedDomain = 'shared-ttl.cloudflare.com';
+  const sharedKey = 'https://dns-cache/static/v3:' + sharedDomain + ':A';
+  cache.set(sharedKey, Response.json({domain:sharedDomain,type:'A',answers:['192.0.2.1'],ttl:30}, {
+    headers:{'X-DNS-Stored-At':String(Date.now()-10000)}
+  }));
+  const shared = await request('/api/query?domain='+sharedDomain+'&type=A');
+  assert.equal(shared.headers.get('X-Cache'), 'STATIC_HIT');
+  assert.equal((await shared.json()).ttl, 20);
+  Date.now = () => jsonStart + 320000;
+  const expiredShared = await request('/api/query?domain='+sharedDomain+'&type=A');
+  assert.equal(expiredShared.headers.get('X-Cache'), null);
+  const invalidDomain = 'invalid-ttl.cloudflare.com';
+  cache.set('https://dns-cache/static/v3:'+invalidDomain+':A', Response.json({
+    domain:invalidDomain,type:'A',answers:[],rcode:2,ttl:300
+  }, {headers:{'X-DNS-Stored-At':String(Date.now())}}));
+  const invalid = await request('/api/query?domain='+invalidDomain+'&type=A');
+  assert.equal(invalid.headers.get('X-Cache'), null, 'failed responses cannot enter the positive cache');
+  assert.ok((await invalid.json()).answers.length);
+} finally {
+  Date.now = jsonClock;
+}
+}
 const txt = await request('/api/query?domain=cloudflare.com&type=TXT');
 assert.equal(txt.headers.get('Cache-Control'), 'no-store', 'dynamic TXT must not use fixed-address cache');
 count = ecsCalls('ech-race.example').length;
@@ -758,8 +832,8 @@ await request('/doh',{method:'POST',headers:{'Content-Type':'application/dns-mes
 await request('/doh?dns=AA',{},analyticsEnv);
 assert.equal(points.length,2);
 assert.deepEqual(points[0].indexes,['doh']);
-assert.deepEqual(points[0].blobs,['0','none','other']);
-assert.deepEqual(points[1].blobs,['http_error','none','other']);
+assert.deepEqual(points[0].blobs,['0','none','other','POST','doh']);
+assert.deepEqual(points[1].blobs,['http_error','none','other','GET','doh']);
 assert.ok(points.every(p=>p.doubles.length===1&&p.doubles[0]>=0));
 assert.ok(!JSON.stringify(points).includes('analytics.example'));
 // The optional global write records routes, including safe international fallback.
@@ -777,8 +851,13 @@ domesticWireOutage=false;
 assert.equal(fallbackMetric.headers.get('X-DNS-Route'),'domestic_fallback');
 assert.equal(points.length,5);
 assert.deepEqual(points.slice(2).map(p=>p.blobs[2]),['domestic','international','domestic_fallback']);
-assert.ok(points.every(p=>p.blobs.length===3));
+assert.ok(points.every(p=>p.blobs.length===5));
 assert.ok(!JSON.stringify(points).includes('analytics-domestic.example.cn'));
+const staticMetricBody=question('analytics-static.cloudflare.com',1);
+await request('/ech',{...metricOpts,body:staticMetricBody},analyticsEnv);
+const staticMetric=await request('/ech',{...metricOpts,body:staticMetricBody},analyticsEnv);
+assert.equal(staticMetric.headers.get('X-Cache'),'DOH_HIT');
+assert.deepEqual(points.at(-1).blobs,['0','DOH_HIT','other','POST','ech']);
 const failedAnalytics={...admin,DOH_ANALYTICS:{writeDataPoint(){throw new Error('analytics unavailable');}}};
 assert.equal((await request('/doh',{method:'POST',headers:{'Content-Type':'application/dns-message'},body:question('analytics.example')},failedAnalytics)).status,200);
 // Empty EDNS0 queries get a distinct cache entry; OPT flags are never aged.

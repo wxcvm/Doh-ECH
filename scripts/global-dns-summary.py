@@ -11,16 +11,16 @@ def query(dataset, hours):
         raise ValueError("Invalid dataset name")
     if not 1 <= hours <= 720:
         raise ValueError("hours must be between 1 and 720")
-    return f"""SELECT blob1 AS outcome, blob2 AS cache, blob3 AS route,
+    return f"""SELECT blob1 AS outcome, blob2 AS cache, blob3 AS route, blob4 AS method, blob5 AS endpoint,
     SUM(_sample_interval) AS requests,
     SUM(double1 * _sample_interval) AS total_ms
 FROM {dataset}
 WHERE index1 = 'doh' AND timestamp >= NOW() - INTERVAL '{hours}' HOUR
-GROUP BY outcome, cache, route"""
+GROUP BY outcome, cache, route, method, endpoint"""
 
 def summarize(rows):
     total = sum(float(r["requests"]) for r in rows)
-    outcomes, caches, routes = {}, {}, {}
+    outcomes, caches, routes, methods, endpoints = {}, {}, {}, {}, {}
     for r in rows:
         n = float(r["requests"])
         outcomes[r["outcome"]] = outcomes.get(r["outcome"], 0) + n
@@ -28,8 +28,12 @@ def summarize(rows):
         # Old Analytics Engine data did not populate blob3.
         route = r.get("route") or "unclassified"
         routes[route] = routes.get(route, 0) + n
+        method = r.get("method") or "unclassified"
+        endpoint = r.get("endpoint") or "unclassified"
+        methods[method] = methods.get(method, 0) + n
+        endpoints[endpoint] = endpoints.get(endpoint, 0) + n
     dns = sum(n for k, n in outcomes.items() if k.isdecimal())
-    return {"estimated_requests": total, "outcomes": outcomes, "cache": caches, "routes": routes,
+    return {"estimated_requests": total, "outcomes": outcomes, "cache": caches, "routes": routes, "methods": methods, "endpoints": endpoints,
             "dns_responses": dns,
             "servfail_rate": outcomes.get("2", 0) / dns if dns else None,
             "cache_hit_rate": sum(caches.get(k, 0) for k in ("DOMESTIC_HIT", "INTERNATIONAL_HIT", "DOH_HIT")) / total if total else None,

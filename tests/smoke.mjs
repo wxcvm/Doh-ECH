@@ -1268,4 +1268,34 @@ Date.now=()=>realNow()+61000;
 assert.equal((await cacheReq(daily,lruHot)).hit,null);
 Date.now=realNow;
 binaryReplyOverride=null;
+// Cold domestic upstream health uses a 50ms hedge; a fast primary must
+// still return before launching another upstream. International stays at 100ms.
+{
+  const savedTimer=globalThis.setTimeout;
+  const savedNow=Date.now;
+  const delays=[];
+  try {
+    Date.now=()=>savedNow()+120000;
+    globalThis.setTimeout=(fn,ms,...args)=>{
+      delays.push(ms);
+      return savedTimer(fn,ms,...args);
+    };
+    binaryReplyOverride=q=>addressReply(q,q.length);
+    const start=wireBodies.length;
+    const result=await cacheReq(daily+'&cnEcs=off',question('adaptive-hedge.example.cn',1));
+    assert.equal(result.packet.readUInt16BE(6),1);
+    assert.equal(wireBodies.length-start,1,'fast domestic primary must not duplicate upstream fetch');
+    assert.ok(delays.includes(50),'cold domestic hedge is scheduled at 50ms');
+    delays.length=0;
+    const intlStart=wireBodies.length;
+    const intl=await cacheReq(daily,question('adaptive-hedge.example.com',1));
+    assert.equal(intl.packet.readUInt16BE(6),1);
+    assert.equal(wireBodies.length-intlStart,1);
+    assert.ok(delays.includes(100),'international hedge remains unchanged');
+  } finally {
+    Date.now=savedNow;
+    globalThis.setTimeout=savedTimer;
+    binaryReplyOverride=null;
+  }
+}
 console.log('Doh-ECH smoke tests passed (including adaptive upstreams, Meta ECH, owner TTL and ECS)');

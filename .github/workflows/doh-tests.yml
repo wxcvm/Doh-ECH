@@ -7,6 +7,7 @@ on:
       - 'tests/**'
       - 'scripts/direct-probe.py'
       - 'scripts/*quota.py'
+      - 'scripts/*benchmark-summary.py'
       - 'scripts/*global-dns-summary.py'
       - 'scripts/benchmark-balanced.mjs'
       - 'scripts/dns-benchmark-status.mjs'
@@ -41,3 +42,6 @@ jobs:
         run: |
           python3 scripts/test-global-dns-summary.py
           python3 scripts/test-worker-quota.py
+
+      - name: Test DNS latency summary
+        run: python3 scripts/test-benchmark-summary.py

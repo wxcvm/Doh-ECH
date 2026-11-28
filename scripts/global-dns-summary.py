@@ -32,7 +32,7 @@ def summarize(rows):
     return {"estimated_requests": total, "outcomes": outcomes, "cache": caches, "routes": routes,
             "dns_responses": dns,
             "servfail_rate": outcomes.get("2", 0) / dns if dns else None,
-            "cache_hit_rate": (caches.get("DOMESTIC_HIT", 0) + caches.get("INTERNATIONAL_HIT", 0)) / total if total else None,
+            "cache_hit_rate": sum(caches.get(k, 0) for k in ("DOMESTIC_HIT", "INTERNATIONAL_HIT", "DOH_HIT")) / total if total else None,
             "avg_ms": sum(float(r["total_ms"]) for r in rows) / total if total else None}
 
 def main():

@@ -170,7 +170,7 @@ async function monitoredDoH(req,injectEch,ctx,clientIP,env){
             m.rcode[code]=(m.rcode[code]||0)+1;
             outcome=String(code);
             const hit=response.headers.get('X-Cache');
-            if(hit==='DOMESTIC_HIT'||hit==='INTERNATIONAL_HIT')cache=hit;
+            if(['DOMESTIC_HIT','INTERNATIONAL_HIT','DOH_HIT'].includes(hit))cache=hit;
             return new Response(body,{status:response.status,headers:response.headers});
         }
         return response;
